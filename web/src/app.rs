@@ -155,7 +155,7 @@ pub fn app() -> impl IntoView {
                     return view! {
                         <div>
                             <h1 style="padding-top: 28px;">"snek 🐍"</h1>
-                            <p>"Before you slither: who are you?"</p>
+                            <p>"introduce yourself"</p>
                             {profile_form()}
                         </div>
                     }
