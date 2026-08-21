@@ -37,6 +37,7 @@ pub fn build_app(db_path: &Path) -> Router {
         .route("/api/sessions", get(session_list))
         .route("/api/history", get(history_list))
         .route("/api/history/{id}", get(history_game))
+        .route("/api/history/{id}/meta", get(history_meta))
         .fallback(static_handler)
         .with_state(state)
 }
@@ -88,6 +89,20 @@ async fn history_list(State(state): State<AppState>) -> Response {
     let db = state.db.clone();
     match tokio::task::spawn_blocking(move || db.list_games(100)).await {
         Ok(Ok(list)) => Json(list).into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Who/where/when for one stored game (JSON) — the replay page shows this
+/// alongside the postcard turn data.
+async fn history_meta(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.get_game_meta(id)).await {
+        Ok(Ok(Some(meta))) => Json(meta).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

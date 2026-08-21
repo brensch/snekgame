@@ -9,6 +9,39 @@ use leptos::task::spawn_local;
 use snek_shared::protocol::HistoryEntry;
 use snek_shared::GameRecord;
 
+/// Player chips ranked by placement + "game #N in <session>" line.
+fn replay_footer(id: i64, meta: &HistoryEntry) -> impl IntoView {
+    // Winners are stored ranked best-first and cover every player.
+    let ranked: Vec<_> = meta
+        .winners
+        .iter()
+        .filter_map(|w| meta.players.iter().find(|p| p.id == w.player))
+        .collect();
+    let players = if ranked.len() == meta.players.len() {
+        ranked
+    } else {
+        meta.players.iter().collect()
+    };
+    let chips = players
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let medal = ["🥇", "🥈", "🥉"].get(i).copied().unwrap_or("💀");
+            view! {
+                <span class="player-chip" style=format!("background: {};", p.colour)>
+                    {medal} " " {p.emoji.clone()} " " {p.name.clone()}
+                </span>
+            }
+        })
+        .collect_view();
+    view! {
+        <div class="chip-row">{chips}</div>
+        <p class="footnote" style="margin-top: 6px;">
+            "game #" {id} " in \u{201c}" {meta.session.clone()} "\u{201d}"
+        </p>
+    }
+}
+
 pub fn history_page() -> impl IntoView {
     let entries = RwSignal::new(Option::<Vec<HistoryEntry>>::None);
     let failed = RwSignal::new(false);
@@ -97,6 +130,7 @@ pub fn history_page() -> impl IntoView {
 pub fn replay_page(id: i64) -> impl IntoView {
     let store = Store::use_store();
     let record = RwSignal::new(Option::<GameRecord>::None);
+    let meta = RwSignal::new(Option::<HistoryEntry>::None);
     let failed = RwSignal::new(false);
     let frame = RwSignal::new(0usize);
     let playing = RwSignal::new(true);
@@ -115,6 +149,14 @@ pub fn replay_page(id: i64) -> impl IntoView {
                 Err(_) => failed.set(true),
             },
             _ => failed.set(true),
+        }
+    });
+    spawn_local(async move {
+        let url = format!("/api/history/{id}/meta");
+        if let Ok(resp) = gloo_net::http::Request::get(&url).send().await {
+            if let Ok(m) = resp.json::<HistoryEntry>().await {
+                meta.set(Some(m));
+            }
         }
     });
 
@@ -203,6 +245,7 @@ pub fn replay_page(id: i64) -> impl IntoView {
                                     .collect_view()}
                             </span>
                         </div>
+                        {move || meta.get().map(|m| replay_footer(id, &m))}
                     </div>
                 }
                     .into_any()

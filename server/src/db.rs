@@ -83,6 +83,32 @@ impl Db {
         rows.collect()
     }
 
+    pub fn get_game_meta(&self, id: i64) -> rusqlite::Result<Option<HistoryEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session, finished_at_ms, num_turns, players_json, winners_json
+             FROM games WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([id])?;
+        match rows.next()? {
+            Some(row) => {
+                let players_json: String = row.get(4)?;
+                let winners_json: String = row.get(5)?;
+                Ok(Some(HistoryEntry {
+                    id: row.get(0)?,
+                    session: row.get(1)?,
+                    finished_at_ms: row.get(2)?,
+                    num_turns: row.get::<_, i64>(3)? as u32,
+                    players: serde_json::from_str::<Vec<PlayerProfile>>(&players_json)
+                        .unwrap_or_default(),
+                    winners: serde_json::from_str::<Vec<Winner>>(&winners_json)
+                        .unwrap_or_default(),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn get_game_blob(&self, id: i64) -> rusqlite::Result<Option<Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT record_blob FROM games WHERE id = ?1")?;
