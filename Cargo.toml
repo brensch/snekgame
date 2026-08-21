@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["shared", "server", "web"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# Small wasm output for the web crate
+[profile.release.package.snek-web]
+opt-level = "s"
