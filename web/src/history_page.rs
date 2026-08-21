@@ -39,15 +39,8 @@ pub fn history_page() -> impl IntoView {
                     }
                     Some(list) => {
                         view! {
-                            <table>
-                                <thead>
-                                    <tr>
-                                        <th>"Session"</th>
-                                        <th>"Players"</th>
-                                        <th class="right">"Turns"</th>
-                                        <th class="right">"Watch"</th>
-                                    </tr>
-                                </thead>
+                            <p class="footnote">"Tap a game to watch the replay."</p>
+                            <table class="players">
                                 <tbody>
                                     {list
                                         .into_iter()
@@ -66,15 +59,23 @@ pub fn history_page() -> impl IntoView {
                                                 })
                                                 .map(|p| p.colour.clone())
                                                 .unwrap_or_default();
-                                            let href = format!("#/history/{}", e.id);
+                                            let id = e.id;
                                             view! {
-                                                <tr style=format!("background: {winner};")>
-                                                    <td>{e.session}</td>
-                                                    <td>{who}</td>
-                                                    <td class="right">{e.num_turns}</td>
-                                                    <td class="right">
-                                                        <a href=href>"▶"</a>
+                                                <tr
+                                                    class="clickable"
+                                                    style=format!("background: {winner};")
+                                                    on:click=move |_| {
+                                                        let _ = web_sys::window()
+                                                            .unwrap()
+                                                            .location()
+                                                            .set_hash(&format!("#/history/{id}"));
+                                                    }
+                                                >
+                                                    <td>
+                                                        <b>{e.session}</b>
                                                     </td>
+                                                    <td>{who}</td>
+                                                    <td class="right">{e.num_turns} " turns"</td>
                                                 </tr>
                                             }
                                         })
@@ -138,7 +139,7 @@ pub fn replay_page(id: i64) -> impl IntoView {
 
     view! {
         <div>
-            <h2>"Replay #" {id}</h2>
+            <h2 style="margin-top: 22px;">"Replay"</h2>
             {move || {
                 if failed.get() {
                     return view! { <div class="banner error">"Couldn't load this game."</div> }
@@ -152,12 +153,14 @@ pub fn replay_page(id: i64) -> impl IntoView {
                 let max = r.turns.len() - 1;
                 view! {
                     <div>
-                        <p>"Turn " {turn.turn_number} " / " {r.turns.len()}</p>
                         {board_view(r.config, r.players.clone(), &turn, String::new(), |_| {})}
-                        <div class="row" style="margin-top: 10px;">
-                            <button on:click=move |_| {
-                                playing.update(|p| *p = !*p);
-                            }>
+                        <div class="replay-controls">
+                            <button
+                                class="icon"
+                                on:click=move |_| {
+                                    playing.update(|p| *p = !*p);
+                                }
+                            >
                                 {move || if playing.get() { "⏸" } else { "▶" }}
                             </button>
                             <input
@@ -173,6 +176,9 @@ pub fn replay_page(id: i64) -> impl IntoView {
                                     }
                                 }
                             />
+                            <span class="footnote turn-count">
+                                {turn.turn_number} "/" {r.turns.len()}
+                            </span>
                         </div>
                     </div>
                 }

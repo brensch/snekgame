@@ -286,6 +286,38 @@ button.mini {
 
 .scrubber {
   width: 100%;
+  accent-color: #000;
+}
+
+/* replay: compact icon button + scrubber + turn counter */
+.replay-controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-top: 14px;
+}
+
+.replay-controls button.icon {
+  flex: 0 0 auto;
+  width: 46px;
+  height: 40px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.replay-controls .scrubber {
+  flex: 1;
+}
+
+.replay-controls .turn-count {
+  flex: 0 0 auto;
+  min-width: 52px;
+  text-align: right;
+}
+
+tr.clickable {
+  cursor: pointer;
 }
 
 .footnote {
