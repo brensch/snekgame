@@ -123,7 +123,7 @@ pub fn home_page() -> impl IntoView {
 
     view! {
         <div>
-            <h1 style="padding-top: 28px;">"Nokia snake, but violent*"</h1>
+            <h1 style="padding-top: 28px;">"Nokia snake,"<br />"but violent*"</h1>
 
             {move || {
                 match sessions.get() {
