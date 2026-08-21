@@ -30,6 +30,9 @@ a {
   color: #000;
 }
 
+/* --- neubrutalist controls: hard borders, hard offset shadows, tactile
+   press. No soft outlines anywhere. ---------------------------------- */
+
 button {
   font-family: inherit;
   border: 2px solid #000;
@@ -41,17 +44,35 @@ button {
   color: #000;
   /* everything reads left-aligned, buttons included */
   text-align: left;
+  box-shadow: 3px 3px 0 #000;
+  transition: transform 60ms ease, box-shadow 60ms ease;
+}
+
+button:active:not(:disabled) {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 #000;
 }
 
 button:disabled {
   opacity: 0.45;
   cursor: default;
+  box-shadow: none;
+}
+
+button:focus-visible {
+  outline: none;
+  box-shadow: 5px 5px 0 #000;
 }
 
 button.big {
   width: 100%;
   height: 70px;
   font-size: 30px;
+  box-shadow: 4px 4px 0 #000;
+}
+
+button.big:active:not(:disabled) {
+  box-shadow: 1px 1px 0 #000;
 }
 
 input, select {
@@ -62,10 +83,13 @@ input, select {
   padding: 10px;
   background: #fff;
   width: 100%;
+  box-shadow: 3px 3px 0 #000;
+  transition: box-shadow 60ms ease;
 }
 
 input:focus, select:focus {
-  outline: 3px solid #000;
+  outline: none;
+  box-shadow: 5px 5px 0 #000;
 }
 
 .topbar {
@@ -87,6 +111,12 @@ input:focus, select:focus {
   font-size: 18px;
   cursor: pointer;
   user-select: none;
+  box-shadow: 2px 2px 0 #000;
+}
+
+.profile-chip:active {
+  transform: translate(1px, 1px);
+  box-shadow: 1px 1px 0 #000;
 }
 
 .row {
@@ -104,11 +134,13 @@ input:focus, select:focus {
   padding: 10px;
   margin: 10px 0;
   font-size: 15px;
+  box-shadow: 4px 4px 0 #000;
 }
 
 .banner.error {
   border-color: #c00;
   color: #c00;
+  box-shadow: 4px 4px 0 #c00;
 }
 
 .banner.rainbow {
@@ -140,6 +172,7 @@ td.kick {
 /* players roster: one framed block, uniform 1px separators inside */
 table.players {
   border: 2px solid #000;
+  box-shadow: 4px 4px 0 #000;
 }
 
 table.players td {
@@ -212,11 +245,14 @@ button.mini {
   border: 2px solid #000;
   touch-action: manipulation;
   text-align: center;
+  box-shadow: 3px 3px 0 #000;
 }
 
 .dpad button:active {
   background: #000;
   color: #fff;
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 #000;
 }
 
 .d-up { grid-column: 2; grid-row: 1; }
@@ -255,6 +291,8 @@ button.mini {
 
 .emoji-grid .pick.selected {
   border-color: #000;
+  box-shadow: 2px 2px 0 #000;
+  background: #fff;
 }
 
 .swatches {
@@ -271,6 +309,7 @@ button.mini {
 
 .swatches .pick.selected {
   border-color: #000;
+  box-shadow: 2px 2px 0 #000;
 }
 
 .modal-back {
@@ -292,6 +331,7 @@ button.mini {
   padding: 16px;
   max-height: 90vh;
   overflow-y: auto;
+  box-shadow: 8px 8px 0 #000;
 }
 
 .scrubber {
@@ -340,6 +380,15 @@ button.mini {
   border-left-width: 1px;
   border-right-width: 1px;
   text-align: center;
+  box-shadow: none;
+}
+
+.speed-group {
+  box-shadow: 3px 3px 0 #000;
+}
+
+.speed-group button.speed:active {
+  transform: none;
 }
 
 .speed-group button.speed:first-child {
