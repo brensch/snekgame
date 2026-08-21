@@ -33,10 +33,16 @@ pub fn build_app(db_path: &Path) -> Router {
     };
     Router::new()
         .route("/ws", get(ws_route))
+        .route("/api/sessions", get(session_list))
         .route("/api/history", get(history_list))
         .route("/api/history/{id}", get(history_game))
         .fallback(static_handler)
         .with_state(state)
+}
+
+/// Active games (someone in the lobby or playing right now).
+async fn session_list(State(state): State<AppState>) -> Response {
+    Json(state.registry.active_sessions()).into_response()
 }
 
 async fn ws_route(

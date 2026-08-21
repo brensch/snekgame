@@ -186,6 +186,9 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
 
     view! {
         <div>
+            <h2 style="margin-top: 22px; margin-bottom: 14px;">
+                {lobby.display_name.clone()}
+            </h2>
             {ready_button}
             {(i_am_ready && !not_ready.is_empty())
                 .then(|| {
@@ -210,6 +213,26 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
 // ---------------------------------------------------------------------------
 // Live game
 // ---------------------------------------------------------------------------
+
+/// The winner's emoji rains down over the results, tac-style. Positions and
+/// timings are pseudo-random from the index so no timers are needed.
+fn emoji_rain(emoji: String) -> impl IntoView {
+    let drops = (0..36)
+        .map(|i| {
+            let left = (i * 37 + 13) % 100;
+            let delay_ms = (i * 211) % 2800;
+            let duration_ms = 2600 + (i * 137) % 2200;
+            let size = 20 + (i * 61) % 22;
+            view! {
+                <span style=format!(
+                    "left: {left}%; animation-delay: {delay_ms}ms; \
+                     animation-duration: {duration_ms}ms; font-size: {size}px;",
+                )>{emoji.clone()}</span>
+            }
+        })
+        .collect_view();
+    view! { <div class="emoji-rain">{drops}</div> }
+}
 
 /// On-screen d-pad — the primary controller on touch screens. The selected
 /// direction lights up in the player's colour.
@@ -282,8 +305,14 @@ fn game_view(game: GameView) -> impl IntoView {
     let i_died = !spectating && !over && !last_turn.alive.contains(&me);
     let show_dpad = !over && !spectating && !i_died;
 
-    // Results, ranked, once the game is over.
+    // Results, ranked, once the game is over — under a rain of the winner's
+    // emoji, as is tradition.
     let results = over.then(|| {
+        let rain = last_turn
+            .winners
+            .first()
+            .and_then(|w| game.players.iter().find(|p| p.id == w.player))
+            .map(|p| emoji_rain(p.emoji.clone()));
         let rows = last_turn
             .winners
             .iter()
@@ -322,6 +351,7 @@ fn game_view(game: GameView) -> impl IntoView {
 
         view! {
             <div>
+                {rain}
                 <h3>"Game over"</h3>
                 <table>
                     <tbody>{rows}</tbody>

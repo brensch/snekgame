@@ -139,6 +139,7 @@ fn open_socket(store: Store, session: String, backoff_ms: u32) {
                 session: session.clone(),
                 secret: crate::store::secret(),
                 profile: store.profile.get_untracked(),
+                display_name: store.pending_name.get_untracked(),
             });
             store.conn.set(ConnStatus::Connected);
             let mut n = 0u32;

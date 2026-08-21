@@ -35,13 +35,14 @@ async fn handle_socket(mut socket: WebSocket, registry: Registry) -> Result<(), 
         _ => return Err("expected binary join frame"),
     };
 
-    let (version, session, secret, info) = match msg {
+    let (version, session, secret, info, display_name) = match msg {
         ClientMsg::Join {
             version,
             session,
             secret,
             profile,
-        } => (version, session, secret, profile),
+            display_name,
+        } => (version, session, secret, profile, display_name),
         _ => return Err("first frame was not join"),
     };
 
@@ -77,7 +78,9 @@ async fn handle_socket(mut socket: WebSocket, registry: Registry) -> Result<(), 
     // Tell the client who it is before any lobby traffic.
     let _ = tx
         .try_send(encode(&ServerMsg::Welcome { your_id: profile.id.clone() }).into());
-    let actor = registry.connect(&session, conn_id, profile, tx).await;
+    let actor = registry
+        .connect(&session, conn_id, profile, display_name, tx)
+        .await;
 
     let (mut ws_tx, mut ws_rx) = {
         use futures_util::StreamExt;

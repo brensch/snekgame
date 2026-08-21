@@ -28,6 +28,7 @@ async fn connect(port: u16, session: &str, secret: &str, profile: ProfileInfo) -
         session: session.to_string(),
         secret: secret.to_string(),
         profile,
+        display_name: Some("e2e game".to_string()),
     })))
     .await
     .unwrap();
@@ -139,10 +140,15 @@ async fn two_players_play_a_full_game() {
     assert!(game_over, "game never ended");
     let saved_id = saved_id.expect("game was not saved");
 
-    // History API serves the finished game.
+    // History API serves the finished game (under its display name).
     let body = http_get(port, "/api/history").await;
-    assert!(body.contains("e2e-test"), "history list missing the game: {body}");
+    assert!(body.contains("e2e game"), "history list missing the game: {body}");
     assert!(body.contains("alice"), "history list missing players");
+
+    // Active-sessions API lists the lobby with its display name.
+    let body = http_get(port, "/api/sessions").await;
+    assert!(body.contains("e2e-test"), "sessions list missing id: {body}");
+    assert!(body.contains("e2e game"), "sessions list missing name: {body}");
 
     let blob = http_get_bytes(port, &format!("/api/history/{saved_id}")).await;
     let record: snek_shared::GameRecord = postcard::from_bytes(&blob).expect("decode record");

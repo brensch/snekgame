@@ -20,6 +20,9 @@ pub const COUNTDOWN_MS: u32 = 3000;
 const MAX_PLAYERS: usize = 8;
 /// Outbound frames buffered per connection before we call the client dead.
 const CONN_BUFFER: usize = 256;
+/// How long an empty session lingers (so a network blip or refresh doesn't
+/// wipe the lobby) before it is tidied away.
+const EMPTY_GRACE: Duration = Duration::from_secs(60);
 
 pub type Frame = Arc<[u8]>;
 
@@ -37,6 +40,8 @@ fn now_ms() -> i64 {
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<Mutex<HashMap<String, mpsc::Sender<Cmd>>>>,
+    /// Live snapshots for the active-games list, kept fresh by the actors.
+    infos: Arc<Mutex<HashMap<String, SessionSummary>>>,
     db: Arc<Db>,
     next_conn_id: Arc<AtomicU64>,
 }
@@ -45,6 +50,7 @@ impl Registry {
     pub fn new(db: Arc<Db>) -> Registry {
         Registry {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            infos: Arc::new(Mutex::new(HashMap::new())),
             db,
             next_conn_id: Arc::new(AtomicU64::new(1)),
         }
@@ -54,6 +60,24 @@ impl Registry {
         self.next_conn_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Sessions with someone actually in them, for the games list.
+    pub fn active_sessions(&self) -> Vec<SessionSummary> {
+        let mut list: Vec<SessionSummary> = self
+            .infos
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.players > 0)
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        list
+    }
+
+    fn publish(&self, info: SessionSummary) {
+        self.infos.lock().unwrap().insert(info.id.clone(), info);
+    }
+
     /// Get the actor for a session, spawning it if needed. Retries once if it
     /// races with an actor shutting down.
     pub async fn connect(
@@ -61,6 +85,7 @@ impl Registry {
         session: &str,
         conn_id: u64,
         profile: PlayerProfile,
+        display_name: Option<String>,
         tx: mpsc::Sender<Frame>,
     ) -> mpsc::Sender<Cmd> {
         loop {
@@ -75,6 +100,7 @@ impl Registry {
             let cmd = Cmd::Connect {
                 conn_id,
                 profile: profile.clone(),
+                display_name: display_name.clone(),
                 tx: tx.clone(),
             };
             match sender.send(cmd).await {
@@ -94,6 +120,7 @@ impl Registry {
                 map.remove(session);
             }
         }
+        self.infos.lock().unwrap().remove(session);
     }
 }
 
@@ -105,6 +132,7 @@ pub enum Cmd {
     Connect {
         conn_id: u64,
         profile: PlayerProfile,
+        display_name: Option<String>,
         tx: mpsc::Sender<Frame>,
     },
     Disconnect {
@@ -131,6 +159,7 @@ struct RunningGame {
 
 struct SessionActor {
     name: String,
+    display_name: Option<String>,
     registry: Registry,
     db: Arc<Db>,
     rx: mpsc::Receiver<Cmd>,
@@ -141,6 +170,9 @@ struct SessionActor {
     ready: HashSet<PlayerId>,
     game: Option<RunningGame>,
     next_tick: Option<Instant>,
+    /// Set when the last connection drops; the actor tidies itself away
+    /// after EMPTY_GRACE unless someone comes back.
+    empty_deadline: Option<Instant>,
     last_winners: Vec<Winner>,
     last_game_id: Option<i64>,
 }
@@ -150,6 +182,7 @@ impl SessionActor {
         let (tx, rx) = mpsc::channel(1024);
         let actor = SessionActor {
             name,
+            display_name: None,
             registry,
             db,
             rx,
@@ -160,11 +193,27 @@ impl SessionActor {
             ready: HashSet::new(),
             game: None,
             next_tick: None,
+            empty_deadline: None,
             last_winners: Vec::new(),
             last_game_id: None,
         };
         tokio::spawn(actor.run());
         tx
+    }
+
+    fn display_name(&self) -> String {
+        self.display_name
+            .clone()
+            .unwrap_or_else(|| "unnamed game".to_string())
+    }
+
+    fn publish_info(&self) {
+        self.registry.publish(SessionSummary {
+            id: self.name.clone(),
+            name: self.display_name(),
+            players: self.lobby.len() as u32,
+            playing: self.game.is_some(),
+        });
     }
 
     async fn run(mut self) {
@@ -176,17 +225,24 @@ impl SessionActor {
                     None => std::future::pending::<()>().await,
                 }
             };
+            let empty_sleep = async {
+                match self.empty_deadline {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
-                    Some(cmd) => {
-                        self.handle(cmd).await;
-                        if self.conns.is_empty() {
-                            break;
-                        }
-                    }
+                    Some(cmd) => self.handle(cmd).await,
                     None => break,
                 },
                 _ = tick_sleep => self.tick().await,
+                _ = empty_sleep => {
+                    if self.conns.is_empty() {
+                        break; // nobody came back — tidy up
+                    }
+                    self.empty_deadline = None;
+                }
             }
         }
         tracing::info!(session = %self.name, "session ended");
@@ -198,8 +254,19 @@ impl SessionActor {
             Cmd::Connect {
                 conn_id,
                 profile,
+                display_name,
                 tx,
             } => {
+                self.empty_deadline = None;
+                // First name offered wins; later joins can't rename.
+                if self.display_name.is_none() {
+                    if let Some(name) = display_name {
+                        let name = name.trim().chars().take(32).collect::<String>();
+                        if !name.is_empty() {
+                            self.display_name = Some(name);
+                        }
+                    }
+                }
                 self.conns.insert(
                     conn_id,
                     Conn {
@@ -229,6 +296,9 @@ impl SessionActor {
                         self.lobby.retain(|p| p.id != conn.player);
                         self.ready.remove(&conn.player);
                     }
+                }
+                if self.conns.is_empty() {
+                    self.empty_deadline = Some(Instant::now() + EMPTY_GRACE);
                 }
                 self.broadcast_lobby().await;
             }
@@ -344,6 +414,7 @@ impl SessionActor {
             started_at_ms: now_ms(),
         });
         self.ready.clear();
+        self.publish_info();
         self.next_tick =
             Some(Instant::now() + Duration::from_millis(COUNTDOWN_MS as u64));
     }
@@ -386,7 +457,7 @@ impl SessionActor {
             .unwrap_or_default();
 
         let db = self.db.clone();
-        let session = self.name.clone();
+        let session = self.display_name();
         let started = game.started_at_ms;
         let finished = now_ms();
         let saved = tokio::task::spawn_blocking(move || {
@@ -409,12 +480,14 @@ impl SessionActor {
     async fn broadcast_lobby(&mut self) {
         let state = LobbyState {
             session: self.name.clone(),
+            display_name: self.display_name(),
             config: self.config,
             players: self.lobby.clone(),
             ready: self.ready.iter().cloned().collect(),
             last_winners: self.last_winners.clone(),
             last_game_id: self.last_game_id,
         };
+        self.publish_info();
         self.broadcast(encode_frame(&ServerMsg::Lobby(state))).await;
     }
 

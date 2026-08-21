@@ -259,6 +259,30 @@ td.right, th.right {
   color: #333;
 }
 
+/* --- winner emoji rain -------------------------------------------------- */
+
+.emoji-rain {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 60;
+}
+
+.emoji-rain span {
+  position: absolute;
+  top: -8%;
+  animation-name: emoji-fall;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+@keyframes emoji-fall {
+  to {
+    transform: translateY(120vh) rotate(300deg);
+  }
+}
+
 @keyframes shake {
   0% { transform: translateX(0); }
   25% { transform: translateX(-4px); }

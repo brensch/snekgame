@@ -22,6 +22,7 @@ async fn main() {
             emoji: "🧪".to_string(),
             colour: "hsl(200, 85%, 60%)".to_string(),
         },
+        display_name: Some("probe game".to_string()),
     })))
     .await
     .unwrap();

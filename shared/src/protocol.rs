@@ -24,11 +24,14 @@ pub struct ProfileInfo {
 pub enum ClientMsg {
     /// First message on every (re)connection. `secret` never leaves the
     /// server; everyone else only ever sees the derived public id.
+    /// `display_name` names a session being created (ignored if the session
+    /// already has one) — session ids themselves are opaque.
     Join {
         version: u16,
         session: String,
         secret: String,
         profile: ProfileInfo,
+        display_name: Option<String>,
     },
     UpdateProfile(ProfileInfo),
     SetReady(bool),
@@ -43,6 +46,8 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LobbyState {
     pub session: String,
+    /// Human-readable session name, chosen at creation; ephemeral.
+    pub display_name: String,
     pub config: GameConfig,
     pub players: Vec<PlayerProfile>,
     pub ready: Vec<PlayerId>,
@@ -85,6 +90,15 @@ pub fn encode<T: Serialize>(msg: &T) -> Vec<u8> {
 
 pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Option<T> {
     postcard::from_bytes(bytes).ok()
+}
+
+/// One row of the active-games list (`GET /api/sessions`, JSON).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub name: String,
+    pub players: u32,
+    pub playing: bool,
 }
 
 /// Summary row for the history list API (this one travels as JSON over a

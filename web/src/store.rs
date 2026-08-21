@@ -7,6 +7,7 @@ use snek_shared::{Dir, GameConfig, PlayerId, PlayerProfile, Turn};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Route {
     Home,
+    Games,
     Session(String),
     History,
     Replay(i64),
@@ -44,6 +45,8 @@ pub struct Store {
     /// The direction we're currently steering (highlights the d-pad).
     /// Starts at the clockwise default; corrected from each resolved turn.
     pub selected_dir: RwSignal<Option<Dir>>,
+    /// Display name for a session we're about to create (sent with Join).
+    pub pending_name: RwSignal<Option<String>>,
     pub saved_id: RwSignal<Option<i64>>,
     /// performance-now ms when the pre-game countdown ends.
     pub countdown_ends: RwSignal<f64>,
@@ -64,6 +67,7 @@ impl Store {
             game: RwSignal::new(None),
             view_turn: RwSignal::new(None),
             selected_dir: RwSignal::new(None),
+            pending_name: RwSignal::new(None),
             saved_id: RwSignal::new(None),
             countdown_ends: RwSignal::new(0.0),
             now_ms: RwSignal::new(0.0),
@@ -93,20 +97,30 @@ pub fn secret() -> String {
     })
 }
 
-/// 128 random bits as hex. Uses `crypto.getRandomValues`, which (unlike
+/// Random hex string. Uses `crypto.getRandomValues`, which (unlike
 /// `crypto.randomUUID`) also works in non-secure contexts like plain-http
 /// LAN addresses; falls back to Math.random only if even that is missing.
-fn random_secret() -> String {
-    let mut buf = [0u8; 16];
+pub fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
     let ok = web_sys::window()
         .and_then(|w| w.crypto().ok())
         .map(|c| c.get_random_values_with_u8_array(&mut buf).is_ok())
         .unwrap_or(false);
-    if ok {
-        buf.iter().map(|b| format!("{b:02x}")).collect()
-    } else {
-        format!("anon-{}-{}", js_sys::Math::random(), js_sys::Date::now())
+    if !ok {
+        for b in buf.iter_mut() {
+            *b = (js_sys::Math::random() * 256.0) as u8;
+        }
     }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn random_secret() -> String {
+    random_hex(16)
+}
+
+/// Opaque id for a newly created session — this is what goes in the URL.
+pub fn new_session_id() -> String {
+    random_hex(8)
 }
 
 fn load_profile() -> ProfileInfo {

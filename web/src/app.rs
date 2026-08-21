@@ -1,6 +1,7 @@
 //! App shell: hash routing, home page, profile editor, global inputs
 //! (keyboard + swipe), and the websocket lifecycle tied to the route.
 
+use crate::games_page::games_page;
 use crate::history_page::{history_page, replay_page};
 use crate::net;
 use crate::palette;
@@ -139,6 +140,7 @@ pub fn app() -> impl IntoView {
             </div>
             {move || match store.route.get() {
                 Route::Home => home_page().into_any(),
+                Route::Games => games_page().into_any(),
                 Route::Session(name) => session_page(name).into_any(),
                 Route::History => history_page().into_any(),
                 Route::Replay(id) => replay_page(id).into_any(),
@@ -148,7 +150,9 @@ pub fn app() -> impl IntoView {
     }
 }
 
-/// Native share sheet where available (mobile); clipboard fallback elsewhere.
+/// Built-in browser share sheet where it exists (mobile / secure contexts);
+/// clipboard where that exists; a plain prompt as the everywhere-fallback.
+/// Feature-checked with Reflect so nothing here can throw on plain http.
 fn share_session(word: &str, copied: RwSignal<bool>) {
     let Some(window) = web_sys::window() else { return };
     let loc = window.location();
@@ -159,17 +163,23 @@ fn share_session(word: &str, copied: RwSignal<bool>) {
         word
     );
     let nav = window.navigator();
-    let has_share = js_sys::Reflect::has(nav.as_ref(), &"share".into()).unwrap_or(false);
-    if has_share {
+    let has = |name: &str| js_sys::Reflect::has(nav.as_ref(), &name.into()).unwrap_or(false);
+    if has("share") {
         let data = web_sys::ShareData::new();
         data.set_title("snek 🐍");
         data.set_text("come play snek with me");
         data.set_url(&url);
         let _ = nav.share_with_data(&data);
-    } else {
+    } else if has("clipboard")
+        && !js_sys::Reflect::get(nav.as_ref(), &"clipboard".into())
+            .map(|c| c.is_undefined())
+            .unwrap_or(true)
+    {
         let _ = nav.clipboard().write_text(&url);
         copied.set(true);
         gloo_timers::callback::Timeout::new(1500, move || copied.set(false)).forget();
+    } else {
+        let _ = window.prompt_with_message_and_default("Copy this link:", &url);
     }
 }
 
@@ -178,6 +188,7 @@ fn parse_hash(hash: &str) -> Route {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
         [] => Route::Home,
+        ["games"] => Route::Games,
         ["s", name] => Route::Session(normalize_word(name)),
         ["history"] => Route::History,
         ["history", id] => id
@@ -202,52 +213,28 @@ fn normalize_word(raw: &str) -> String {
 
 fn home_page() -> impl IntoView {
     let store = Store::use_store();
-    let word = RwSignal::new(String::new());
-    let error = RwSignal::new(String::new());
 
-    let play = move || {
-        let w = word.get_untracked();
-        if w.is_empty() {
-            error.set("Friend, you need a session name.".to_string());
-            return;
-        }
-        let _ = web_sys::window().unwrap().location().set_hash(&format!("#/s/{w}"));
+    // tac's RotatingEmoji, driven off the shared coarse clock.
+    let rotating = move || {
+        let i = (store.now_ms.get() / 400.0) as usize % palette::EMOJIS.len();
+        palette::EMOJIS[i]
     };
 
     view! {
         <div>
             <h1 style="padding-top: 40px;">"A game entirely unrelated to toes*"</h1>
-            <p>
-                "Pick a word for your session. If you want to play with someone, use the same word."
-            </p>
-            <input
-                type="text"
-                placeholder="sessionword"
-                prop:value=move || word.get()
-                on:input=move |ev| {
-                    word.set(normalize_word(&event_target_value(&ev)));
-                }
-                on:keydown=move |ev: web_sys::KeyboardEvent| {
-                    if ev.key() == "Enter" {
-                        play();
-                    }
-                }
-            />
+            <p>"Join a game that's on, or start your own and share it."</p>
             <button
                 class="big"
                 style=move || format!("margin-top: 12px; background: {};", store.profile.get().colour)
-                on:click=move |_| play()
+                on:click=move |_| {
+                    let _ = web_sys::window().unwrap().location().set_hash("#/games");
+                }
             >
-                "Play 🐍"
+                "Play\u{00A0}" {rotating}
             </button>
-            <p style="color: #c00;">{move || error.get()}</p>
 
-            <div class="banner rainbow">
-                <span style="font-size: 26px; margin-right: 10px;">"🕺"</span>
-                "Ugly colour? Uninspired emoji? Edit it in the top right."
-            </div>
-
-            <p>
+            <p style="margin-top: 24px;">
                 <a href="#/history">"Game history →"</a>
             </p>
 
