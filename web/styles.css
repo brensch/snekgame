@@ -397,7 +397,7 @@ tr.clickable {
 
 @keyframes emoji-fall {
   to {
-    transform: translateY(120vh) rotate(300deg);
+    transform: translateY(120vh) rotate(var(--spin, 300deg));
   }
 }
 

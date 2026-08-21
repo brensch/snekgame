@@ -247,10 +247,14 @@ fn emoji_rain(emoji: String) -> impl IntoView {
             let delay_ms = (i * 211) % 2800;
             let duration_ms = 2600 + (i * 137) % 2200;
             let size = 20 + (i * 61) % 22;
+            // Every drop spins its own way: random-ish amount, either
+            // direction.
+            let spin = (180 + (i * 97) % 420) as i32 * if (i * 7 + 3) % 2 == 0 { 1 } else { -1 };
             view! {
                 <span style=format!(
                     "left: {left}%; animation-delay: {delay_ms}ms; \
-                     animation-duration: {duration_ms}ms; font-size: {size}px;",
+                     animation-duration: {duration_ms}ms; font-size: {size}px; \
+                     --spin: {spin}deg;",
                 )>{emoji.clone()}</span>
             }
         })
