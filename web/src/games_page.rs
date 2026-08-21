@@ -1,20 +1,23 @@
-//! The active-games screen: every live session (lobby or mid-game), or an
-//! invitation to start one. Creating a game names it and drops you straight
-//! into its lobby — the URL carries only an opaque session id.
+//! The home screen: live games to join (paginated), or start your own —
+//! named in one flow, with the URL carrying only an opaque session id.
 
+use crate::palette;
 use crate::store::{new_session_id, Store};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use snek_shared::protocol::SessionSummary;
 use std::cell::Cell;
 
+const PAGE_SIZE: usize = 6;
+
 thread_local! {
     static LAST_FETCH: Cell<f64> = const { Cell::new(0.0) };
 }
 
-pub fn games_page() -> impl IntoView {
+pub fn home_page() -> impl IntoView {
     let store = Store::use_store();
     let sessions = RwSignal::new(Option::<Vec<SessionSummary>>::None);
+    let page = RwSignal::new(0usize);
     let new_name = RwSignal::new(String::new());
 
     // Poll the list every couple of seconds while this page is up, driven by
@@ -48,25 +51,39 @@ pub fn games_page() -> impl IntoView {
             .set_hash(&format!("#/s/{id}"));
     };
 
+    // tac's RotatingEmoji, driven off the shared coarse clock.
+    let rotating = move || {
+        let i = (store.now_ms.get() / 400.0) as usize % palette::EMOJIS.len();
+        palette::EMOJIS[i]
+    };
+
     view! {
         <div>
-            <h2 style="margin-top: 24px;">"Games on right now"</h2>
+            <h1 style="padding-top: 28px;">"A game entirely unrelated to toes*"</h1>
+
+            <h3>"Games on right now"</h3>
             {move || {
                 match sessions.get() {
                     None => view! { <div class="banner">"Looking for games…"</div> }.into_any(),
                     Some(list) if list.is_empty() => {
                         view! {
-                            <div class="banner">
-                                "Nothing going on. Start a game and share it!"
-                            </div>
+                            <div class="banner">"Nothing going on. Start one below!"</div>
                         }
                             .into_any()
                     }
                     Some(list) => {
+                        let pages = list.len().div_ceil(PAGE_SIZE).max(1);
+                        let p = page.get().min(pages - 1);
+                        let slice: Vec<SessionSummary> = list
+                            .iter()
+                            .skip(p * PAGE_SIZE)
+                            .take(PAGE_SIZE)
+                            .cloned()
+                            .collect();
                         view! {
                             <table>
                                 <tbody>
-                                    {list
+                                    {slice
                                         .into_iter()
                                         .map(|s| {
                                             let href = format!("#/s/{}", s.id);
@@ -93,6 +110,28 @@ pub fn games_page() -> impl IntoView {
                                         .collect_view()}
                                 </tbody>
                             </table>
+                            {(pages > 1)
+                                .then(|| {
+                                    view! {
+                                        <div class="row" style="margin-top: 8px;">
+                                            <button
+                                                disabled=p == 0
+                                                on:click=move |_| page.update(|v| *v = v.saturating_sub(1))
+                                            >
+                                                "‹ prev"
+                                            </button>
+                                            <span style="text-align: center;">
+                                                {format!("page {} / {}", p + 1, pages)}
+                                            </span>
+                                            <button
+                                                disabled=p + 1 >= pages
+                                                on:click=move |_| page.update(|v| *v += 1)
+                                            >
+                                                "next ›"
+                                            </button>
+                                        </div>
+                                    }
+                                })}
                         }
                             .into_any()
                     }
@@ -118,12 +157,17 @@ pub fn games_page() -> impl IntoView {
                 disabled=move || new_name.get().trim().is_empty()
                 on:click=move |_| create()
             >
-                "Create game"
+                "Create game\u{00A0}" {rotating}
             </button>
 
             <p style="margin-top: 24px;">
                 <a href="#/history">"Game history →"</a>
             </p>
+
+            <div style="margin-top: 40px;">
+                <p>"* Toes may be involved"</p>
+                <p>"A game by Brendo"</p>
+            </div>
         </div>
     }
 }

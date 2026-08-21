@@ -6,7 +6,7 @@ use crate::net;
 use crate::store::{ConnStatus, GameView, Store};
 use leptos::prelude::*;
 use snek_shared::protocol::{ClientMsg, LobbyState};
-use snek_shared::{Dir, GameConfig, Pos, Turn};
+use snek_shared::{is_bot, BotDifficulty, Dir, GameConfig, Pos, Turn};
 
 const BOARD_SIZES: &[(&str, u8)] = &[("Small", 11), ("Medium", 13), ("Large", 17)];
 const SPEEDS: &[(&str, u32)] = &[("Chill (2s)", 2000), ("Normal (1s)", 1000), ("Fast (0.5s)", 500)];
@@ -46,7 +46,13 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
     let store = Store::use_store();
     let me = store.me.get();
 
-    let humans: Vec<_> = lobby.players.clone();
+    // Bots are always ready; only humans gate the start.
+    let humans: Vec<_> = lobby
+        .players
+        .iter()
+        .filter(|p| !is_bot(&p.id))
+        .cloned()
+        .collect();
     let i_am_in = humans.iter().any(|p| p.id == me);
     let i_am_ready = lobby.ready.contains(&me);
     let all_ready = !humans.is_empty() && humans.iter().all(|p| lobby.ready.contains(&p.id));
@@ -160,10 +166,11 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                 </tr>
             </thead>
             <tbody>
-                {humans
+                {lobby
+                    .players
                     .iter()
                     .map(|p| {
-                        let ready = lobby.ready.contains(&p.id);
+                        let ready = is_bot(&p.id) || lobby.ready.contains(&p.id);
                         let id = p.id.clone();
                         view! {
                             <tr style=format!("background: {};", p.colour)>
@@ -198,6 +205,18 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                 })}
             {last_game}
             {config_row}
+            <div class="row" style="margin-top: 2px;">
+                <label style="flex: 0 0 auto; align-self: center;">"Add a bot:"</label>
+                <button on:click=move |_| net::send(&ClientMsg::AddBot(BotDifficulty::Easy))>
+                    "🐛 easy"
+                </button>
+                <button on:click=move |_| net::send(&ClientMsg::AddBot(BotDifficulty::Medium))>
+                    "🤖 medium"
+                </button>
+                <button on:click=move |_| net::send(&ClientMsg::AddBot(BotDifficulty::Hard))>
+                    "🐲 hard"
+                </button>
+            </div>
             <div class="banner">
                 <b>"Rules"</b>
                 <br />

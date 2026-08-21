@@ -8,7 +8,10 @@
 
 use crate::db::Db;
 use snek_shared::protocol::*;
-use snek_shared::{Dir, Engine, GameConfig, GameRecord, PlayerId, PlayerProfile, Turn, Winner};
+use snek_shared::{
+    bot, BotDifficulty, Dir, Engine, GameConfig, GameRecord, PlayerId, PlayerProfile, Turn,
+    Winner,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -167,6 +170,9 @@ struct SessionActor {
     conns: HashMap<u64, Conn>,
     config: GameConfig,
     lobby: Vec<PlayerProfile>,
+    /// Server-hosted bots in the lobby (kept across rematches until kicked).
+    bots: HashMap<PlayerId, BotDifficulty>,
+    bot_counter: u32,
     ready: HashSet<PlayerId>,
     game: Option<RunningGame>,
     next_tick: Option<Instant>,
@@ -190,6 +196,8 @@ impl SessionActor {
             conns: HashMap::new(),
             config: GameConfig::default(),
             lobby: Vec::new(),
+            bots: HashMap::new(),
+            bot_counter: 0,
             ready: HashSet::new(),
             game: None,
             next_tick: None,
@@ -359,9 +367,29 @@ impl SessionActor {
                     }
                 }
             }
+            ClientMsg::AddBot(difficulty) => {
+                if self.game.is_none() && self.lobby.len() < MAX_PLAYERS {
+                    self.bot_counter += 1;
+                    let (name, emoji, colour) = match difficulty {
+                        BotDifficulty::Easy => ("wormy (easy)", "🐛", "hsl(95, 45%, 65%)"),
+                        BotDifficulty::Medium => ("robo (medium)", "🤖", "hsl(210, 50%, 68%)"),
+                        BotDifficulty::Hard => ("draco (hard)", "🐲", "hsl(275, 45%, 68%)"),
+                    };
+                    let id = format!("bot-{}", self.bot_counter);
+                    self.bots.insert(id.clone(), difficulty);
+                    self.lobby.push(PlayerProfile {
+                        id,
+                        name: name.to_string(),
+                        emoji: emoji.to_string(),
+                        colour: colour.to_string(),
+                    });
+                    self.broadcast_lobby().await;
+                }
+            }
             ClientMsg::Kick(target) => {
                 if self.game.is_none() {
                     self.lobby.retain(|p| p.id != target);
+                    self.bots.remove(&target);
                     self.ready.remove(&target);
                     self.broadcast_lobby().await;
                 }
@@ -387,7 +415,12 @@ impl SessionActor {
         if self.game.is_some() || self.lobby.is_empty() {
             return;
         }
-        let all_ready = self.lobby.iter().all(|p| self.ready.contains(&p.id));
+        // Bots are always ready; every human must be.
+        let all_ready = self
+            .lobby
+            .iter()
+            .filter(|p| !self.bots.contains_key(&p.id))
+            .all(|p| self.ready.contains(&p.id));
         if !all_ready {
             return;
         }
@@ -424,6 +457,16 @@ impl SessionActor {
             self.next_tick = None;
             return;
         };
+
+        // Bots pick their moves right before the tick resolves.
+        let current = game.turns.last().unwrap();
+        for (bot_id, &difficulty) in &self.bots {
+            if current.alive.contains(bot_id) {
+                let seed = rand::random::<u64>();
+                let mv = bot::choose_move(&self.config, current, bot_id, difficulty, seed);
+                game.pending.insert(bot_id.clone(), mv);
+            }
+        }
 
         let moves = std::mem::take(&mut game.pending);
         let next = game.engine.next_turn(game.turns.last().unwrap(), &moves);

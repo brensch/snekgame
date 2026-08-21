@@ -1,7 +1,7 @@
 //! App shell: hash routing, home page, profile editor, global inputs
 //! (keyboard + swipe), and the websocket lifecycle tied to the route.
 
-use crate::games_page::games_page;
+use crate::games_page::home_page;
 use crate::history_page::{history_page, replay_page};
 use crate::net;
 use crate::palette;
@@ -140,7 +140,6 @@ pub fn app() -> impl IntoView {
             </div>
             {move || match store.route.get() {
                 Route::Home => home_page().into_any(),
-                Route::Games => games_page().into_any(),
                 Route::Session(name) => session_page(name).into_any(),
                 Route::History => history_page().into_any(),
                 Route::Replay(id) => replay_page(id).into_any(),
@@ -187,8 +186,7 @@ fn parse_hash(hash: &str) -> Route {
     let path = hash.trim_start_matches('#').trim_matches('/');
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
-        [] => Route::Home,
-        ["games"] => Route::Games,
+        [] | ["games"] => Route::Home,
         ["s", name] => Route::Session(normalize_word(name)),
         ["history"] => Route::History,
         ["history", id] => id
@@ -205,45 +203,6 @@ fn normalize_word(raw: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .take(24)
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Home page — a faithful cover of tac's HomePage
-// ---------------------------------------------------------------------------
-
-fn home_page() -> impl IntoView {
-    let store = Store::use_store();
-
-    // tac's RotatingEmoji, driven off the shared coarse clock.
-    let rotating = move || {
-        let i = (store.now_ms.get() / 400.0) as usize % palette::EMOJIS.len();
-        palette::EMOJIS[i]
-    };
-
-    view! {
-        <div>
-            <h1 style="padding-top: 40px;">"A game entirely unrelated to toes*"</h1>
-            <p>"Join a game that's on, or start your own and share it."</p>
-            <button
-                class="big"
-                style=move || format!("margin-top: 12px; background: {};", store.profile.get().colour)
-                on:click=move |_| {
-                    let _ = web_sys::window().unwrap().location().set_hash("#/games");
-                }
-            >
-                "Play\u{00A0}" {rotating}
-            </button>
-
-            <p style="margin-top: 24px;">
-                <a href="#/history">"Game history →"</a>
-            </p>
-
-            <div style="margin-top: 60px;">
-                <p>"* Toes may be involved"</p>
-                <p>"A game by Brendo"</p>
-            </div>
-        </div>
-    }
 }
 
 // ---------------------------------------------------------------------------

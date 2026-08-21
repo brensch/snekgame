@@ -7,7 +7,6 @@ use snek_shared::{Dir, GameConfig, PlayerId, PlayerProfile, Turn};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Route {
     Home,
-    Games,
     Session(String),
     History,
     Replay(i64),

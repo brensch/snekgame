@@ -68,6 +68,20 @@ impl GameConfig {
     }
 }
 
+/// House-bot strength: how many moves it looks ahead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BotDifficulty {
+    Easy,
+    Medium,
+    Hard,
+}
+
+/// Server bots get ids like `bot-1`. Human public ids are hex hashes, so the
+/// prefix can never collide — both ends use this to tell them apart.
+pub fn is_bot(player_id: &str) -> bool {
+    player_id.starts_with("bot-")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Dir {
     Up,

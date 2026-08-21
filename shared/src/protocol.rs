@@ -38,7 +38,9 @@ pub enum ClientMsg {
     Configure(GameConfig),
     Start,
     Move(Dir),
-    /// Remove a player from the lobby (anyone can kick, like tac).
+    /// Add a server-hosted bot to the lobby.
+    AddBot(BotDifficulty),
+    /// Remove a player (or bot) from the lobby (anyone can kick, like tac).
     Kick(PlayerId),
     Ping(u32),
 }
