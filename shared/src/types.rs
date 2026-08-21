@@ -45,7 +45,8 @@ impl GameConfig {
             && (250..=10_000).contains(&self.tick_ms)
     }
 
-    /// Perimeter wall cells. Walls are derived, not stored.
+    /// Perimeter wall cells. Walls are derived, not stored — and not drawn:
+    /// the UI crops the view to the interior so the screen edge is the wall.
     pub fn walls(&self) -> Vec<Pos> {
         let (w, h) = (self.board_width as u16, self.board_height as u16);
         let mut out = Vec::new();

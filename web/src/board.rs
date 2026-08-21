@@ -1,19 +1,17 @@
-//! The board, drawn as SVG in cell units (viewBox = board size), so
-//! everything scales crisply with zero gaps:
-//! - checkerboard field
-//! - brick-drawn perimeter walls
-//! - sneks as one continuous rounded path through cell centres, with a
-//!   proper head (eyes look where you're going); your own head gets a ring
-//! - apples for food, a starburst where someone died
+//! The board, drawn as SVG in cell units so everything scales crisply with
+//! zero gaps. The perimeter walls exist in the rules but are not drawn — the
+//! viewBox crops to the playable interior, so the screen edge IS the wall.
+//! - checkerboard field, full-bleed and square to maximise size on mobile
+//! - sneks as one continuous rounded path with the player's emoji as head,
+//!   health on the neck, stacked count on the tail (tac logic)
+//! - 🎃 food; deaths leave 💀 trails but keep the dead player's emoji head
 use leptos::prelude::*;
 use snek_shared::{GameConfig, PlayerId, PlayerProfile, Pos, Turn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wasm_bindgen::JsCast;
 
 const CHECKER_A: &str = "#dcedc8";
 const CHECKER_B: &str = "#cfe6b8";
-const BRICK: &str = "#a8503c";
-const MORTAR: &str = "#7c3a2b";
 
 fn emoji_text(x: f64, y: f64, size: f64, glyph: &str) -> String {
     format!(
@@ -59,27 +57,6 @@ pub fn board_view(
                 r##"<rect x="{x}" y="{y}" width="1" height="1" fill="{fill}"/>"##
             ));
         }
-    }
-
-    // --- brick walls ------------------------------------------------------
-    let mut walls = String::new();
-    for pos in config.walls() {
-        let (x, y) = (pos as usize % w, pos as usize / w);
-        walls.push_str(&format!(
-            r##"<rect x="{x}" y="{y}" width="1" height="1" fill="{BRICK}"/>"##
-        ));
-        // mortar: two horizontal courses + offset headers per course
-        let head_off = if (x + y) % 2 == 0 { 0.5 } else { 0.25 };
-        walls.push_str(&format!(
-            r##"<path d="M {x} {y1} h 1 M {x} {y2} h 1 M {hx} {y} v 0.34 M {hx2} {gy} v 0.32 M {hx3} {gy2} v 0.34" stroke="{MORTAR}" stroke-width="0.045" fill="none"/>"##,
-            y1 = y as f64 + 0.34,
-            y2 = y as f64 + 0.66,
-            hx = x as f64 + head_off,
-            hx2 = x as f64 + (1.0 - head_off),
-            gy = y as f64 + 0.34,
-            hx3 = x as f64 + head_off,
-            gy2 = y as f64 + 0.66,
-        ));
     }
 
     // --- food stays emoji, like tac --------------------------------------
@@ -155,25 +132,39 @@ pub fn board_view(
         sneks.push_str(&emoji_text(cx(head), cy(head), 0.8, emoji));
     }
 
-    // --- clashes stay emoji, like tac -------------------------------------
+    // --- clashes stay emoji, like tac. The dead snek's body becomes a 💀
+    // trail, but its head cell keeps the player's emoji so you can see who
+    // died. The engine puts the dead player first in `players` and their
+    // head first in their clash trail.
     let mut clashes = String::new();
+    let mut seen_dead_heads: HashSet<&str> = HashSet::new();
     for clash in &turn.clashes {
+        let owner = clash.players.first().map(String::as_str).unwrap_or("");
+        let is_head = seen_dead_heads.insert(owner);
         clashes.push_str(&format!(
             r##"<rect x="{x}" y="{y}" width="1" height="1" fill="#d3d3d3" opacity="0.8"/>"##,
             x = clash.pos as usize % w,
             y = clash.pos as usize / w,
         ));
-        clashes.push_str(&emoji_text(cx(clash.pos), cy(clash.pos), 0.8, "💀"));
+        let glyph = if is_head {
+            emoji_of.get(owner).copied().unwrap_or("💀")
+        } else {
+            "💀"
+        };
+        clashes.push_str(&emoji_text(cx(clash.pos), cy(clash.pos), 0.8, glyph));
     }
 
+    // Crop the view to the playable interior — the walls sit just off-screen.
     let svg = format!(
-        r##"<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg" style="display:block;width:100%;background:{CHECKER_A};border:3px solid #000;">
-            {field}{walls}{food}{sneks}{clashes}
-        </svg>"##
+        r##"<svg viewBox="1 1 {vw} {vh}" xmlns="http://www.w3.org/2000/svg" style="display:block;width:100%;background:{CHECKER_A};">
+            {field}{food}{sneks}{clashes}
+        </svg>"##,
+        vw = w - 2,
+        vh = h - 2,
     );
 
-    let width = w as f64;
-    let height = h as f64;
+    let vis_w = (w - 2) as f64;
+    let vis_h = (h - 2) as f64;
     view! {
         <div
             class="board-wrap"
@@ -187,9 +178,9 @@ pub fn board_view(
                 if rect.width() <= 0.0 || rect.height() <= 0.0 {
                     return;
                 }
-                let x = ((ev.client_x() as f64 - rect.left()) / rect.width() * width) as i32;
-                let y = ((ev.client_y() as f64 - rect.top()) / rect.height() * height) as i32;
-                if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < h {
+                let x = 1 + ((ev.client_x() as f64 - rect.left()) / rect.width() * vis_w) as i32;
+                let y = 1 + ((ev.client_y() as f64 - rect.top()) / rect.height() * vis_h) as i32;
+                if x >= 1 && y >= 1 && (x as usize) < w - 1 && (y as usize) < h - 1 {
                     on_cell((y as usize * w + x as usize) as Pos);
                 }
             }

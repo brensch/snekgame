@@ -129,13 +129,22 @@ td.right, th.right {
 
 /* --- board ------------------------------------------------------------- */
 
+/* Full-bleed and square: breaks out of the page padding so the board spans
+   the entire viewport width on mobile. */
 .board-wrap {
-  width: 100%;
-  max-width: 560px;
-  margin: 0 auto;
+  width: 100vw;
+  margin-left: calc(50% - 50vw);
   touch-action: none;
   user-select: none;
   cursor: pointer;
+}
+
+@media (min-width: 592px) {
+  .board-wrap {
+    width: 560px;
+    margin-left: auto;
+    margin-right: auto;
+  }
 }
 
 /* --- d-pad ------------------------------------------------------------- */

@@ -6,7 +6,8 @@
 //! - Each tick every living snek moves one cell: its submitted direction, else
 //!   its previous direction, else the first non-wall direction. Reversing into
 //!   your own neck is ignored (you keep going straight).
-//! - Perimeter cells are walls; hitting one kills you.
+//! - Perimeter cells are walls; hitting one kills you. (The UI doesn't draw
+//!   them — it crops the view to the interior.)
 //! - Head-on collisions kill the shortest snek(s); running into a body kills
 //!   the runner.
 //! - Health starts at 100 and drops 1 per tick; eating food restores it to 100
@@ -309,9 +310,13 @@ impl Engine {
                 for p in players_here {
                     if snakes[p].len() == min_len && !dead.contains(p) {
                         dead.push(p.clone());
+                        // Dead player first, so renderers know whose corpse
+                        // (and head cell) this clash trail belongs to.
+                        let mut involved = vec![p.clone()];
+                        involved.extend(players_here.iter().filter(|o| *o != p).cloned());
                         clashes.extend(snakes[p].iter().map(|&pos| Clash {
                             pos,
-                            players: players_here.clone(),
+                            players: involved.clone(),
                             reason: ClashReason::HeadOn,
                         }));
                     }
