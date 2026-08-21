@@ -100,6 +100,9 @@ pub fn replay_page(id: i64) -> impl IntoView {
     let failed = RwSignal::new(false);
     let frame = RwSignal::new(0usize);
     let playing = RwSignal::new(true);
+    // Playback multiplier over the game's real tick rate. Watching at real
+    // speed is a slog, so default to 2x.
+    let speed = RwSignal::new(2u32);
 
     spawn_local(async move {
         let url = format!("/api/history/{id}");
@@ -124,7 +127,8 @@ pub fn replay_page(id: i64) -> impl IntoView {
         if !playing.get_untracked() {
             return;
         }
-        let step_ms = (r.config.tick_ms as f64).max(200.0);
+        let step_ms =
+            (r.config.tick_ms as f64 / speed.get_untracked() as f64).max(120.0);
         if now - last_step.get_untracked() >= step_ms {
             last_step.set(now);
             frame.update(|f| {
@@ -178,6 +182,25 @@ pub fn replay_page(id: i64) -> impl IntoView {
                             />
                             <span class="footnote turn-count">
                                 {turn.turn_number} "/" {r.turns.len()}
+                            </span>
+                            <span class="speed-group">
+                                {[1u32, 2, 4]
+                                    .into_iter()
+                                    .map(|s| {
+                                        view! {
+                                            <button
+                                                class="speed"
+                                                class:selected=move || speed.get() == s
+                                                on:click=move |_| {
+                                                    speed.set(s);
+                                                    playing.set(true);
+                                                }
+                                            >
+                                                {s} "x"
+                                            </button>
+                                        }
+                                    })
+                                    .collect_view()}
                             </span>
                         </div>
                     </div>
