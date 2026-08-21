@@ -81,14 +81,28 @@ fn storage() -> Option<web_sys::Storage> {
 pub fn secret() -> String {
     let get = || -> Option<String> { storage()?.get_item("snek_secret").ok()? };
     get().unwrap_or_else(|| {
-        let secret = web_sys::window()
-            .map(|w| w.crypto().unwrap().random_uuid())
-            .unwrap_or_else(|| format!("anon-{}", js_sys::Math::random()));
+        let secret = random_secret();
         if let Some(s) = storage() {
             let _ = s.set_item("snek_secret", &secret);
         }
         secret
     })
+}
+
+/// 128 random bits as hex. Uses `crypto.getRandomValues`, which (unlike
+/// `crypto.randomUUID`) also works in non-secure contexts like plain-http
+/// LAN addresses; falls back to Math.random only if even that is missing.
+fn random_secret() -> String {
+    let mut buf = [0u8; 16];
+    let ok = web_sys::window()
+        .and_then(|w| w.crypto().ok())
+        .map(|c| c.get_random_values_with_u8_array(&mut buf).is_ok())
+        .unwrap_or(false);
+    if ok {
+        buf.iter().map(|b| format!("{b:02x}")).collect()
+    } else {
+        format!("anon-{}-{}", js_sys::Math::random(), js_sys::Date::now())
+    }
 }
 
 fn load_profile() -> ProfileInfo {
