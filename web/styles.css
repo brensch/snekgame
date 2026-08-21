@@ -30,8 +30,8 @@ a {
   color: #000;
 }
 
-/* --- neubrutalist controls: hard borders, hard offset shadows, tactile
-   press. No soft outlines anywhere. ---------------------------------- */
+/* --- neubrutalist controls: flat at rest (borders only); the hard offset
+   shadow appears on hover, focus, press, or selection. ----------------- */
 
 button {
   font-family: inherit;
@@ -44,8 +44,13 @@ button {
   color: #000;
   /* everything reads left-aligned, buttons included */
   text-align: left;
-  box-shadow: 3px 3px 0 #000;
   transition: transform 60ms ease, box-shadow 60ms ease;
+}
+
+button:hover:not(:disabled),
+button:focus-visible {
+  outline: none;
+  box-shadow: 3px 3px 0 #000;
 }
 
 button:active:not(:disabled) {
@@ -59,20 +64,15 @@ button:disabled {
   box-shadow: none;
 }
 
-button:focus-visible {
-  outline: none;
-  box-shadow: 5px 5px 0 #000;
-}
-
 button.big {
   width: 100%;
   height: 70px;
   font-size: 30px;
-  box-shadow: 4px 4px 0 #000;
 }
 
-button.big:active:not(:disabled) {
-  box-shadow: 1px 1px 0 #000;
+button.big:hover:not(:disabled),
+button.big:focus-visible {
+  box-shadow: 4px 4px 0 #000;
 }
 
 input, select {
@@ -83,13 +83,12 @@ input, select {
   padding: 10px;
   background: #fff;
   width: 100%;
-  box-shadow: 3px 3px 0 #000;
   transition: box-shadow 60ms ease;
 }
 
 input:focus, select:focus {
   outline: none;
-  box-shadow: 5px 5px 0 #000;
+  box-shadow: 4px 4px 0 #000;
 }
 
 .topbar {
@@ -111,6 +110,9 @@ input:focus, select:focus {
   font-size: 18px;
   cursor: pointer;
   user-select: none;
+}
+
+.profile-chip:hover {
   box-shadow: 2px 2px 0 #000;
 }
 
@@ -134,13 +136,11 @@ input:focus, select:focus {
   padding: 10px;
   margin: 10px 0;
   font-size: 15px;
-  box-shadow: 4px 4px 0 #000;
 }
 
 .banner.error {
   border-color: #c00;
   color: #c00;
-  box-shadow: 4px 4px 0 #c00;
 }
 
 .banner.rainbow {
@@ -172,7 +172,6 @@ td.kick {
 /* players roster: one framed block, uniform 1px separators inside */
 table.players {
   border: 2px solid #000;
-  box-shadow: 4px 4px 0 #000;
 }
 
 table.players td {
@@ -245,7 +244,6 @@ button.mini {
   border: 2px solid #000;
   touch-action: manipulation;
   text-align: center;
-  box-shadow: 3px 3px 0 #000;
 }
 
 .dpad button:active {
@@ -331,7 +329,6 @@ button.mini {
   padding: 16px;
   max-height: 90vh;
   overflow-y: auto;
-  box-shadow: 8px 8px 0 #000;
 }
 
 .scrubber {
@@ -380,15 +377,15 @@ button.mini {
   border-left-width: 1px;
   border-right-width: 1px;
   text-align: center;
-  box-shadow: none;
 }
 
-.speed-group {
-  box-shadow: 3px 3px 0 #000;
+.speed-group button.speed:hover:not(:disabled) {
+  box-shadow: none;
 }
 
 .speed-group button.speed:active {
   transform: none;
+  box-shadow: none;
 }
 
 .speed-group button.speed:first-child {
