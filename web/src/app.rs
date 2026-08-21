@@ -63,10 +63,9 @@ pub fn app() -> impl IntoView {
             Route::Session(name) if !profile.name.trim().is_empty() => {
                 net::ensure_connected(store, &name);
             }
-            Route::Session(_) => {
-                // Must pick a name before joining.
-                store.show_profile_editor.set(true);
-            }
+            // Session route with no name: the full-page setup is showing;
+            // we simply don't connect until a profile exists.
+            Route::Session(_) => {}
             _ => net::disconnect(store),
         }
     });
@@ -118,11 +117,6 @@ pub fn app() -> impl IntoView {
         net::send_move(store, dir);
     });
 
-    // First visit: force the profile editor open.
-    if store.profile.get_untracked().name.trim().is_empty() {
-        store.show_profile_editor.set(true);
-    }
-
     // Whenever the modal opens, push one history entry so mobile back
     // closes it; popstate is the single place that actually closes.
     Effect::new(move |_| {
@@ -150,44 +144,67 @@ pub fn app() -> impl IntoView {
     let share_copied = RwSignal::new(false);
     view! {
         <div class="container">
-            <div class="topbar">
-                <a class="brand" href="#/">"snek 🐍"</a>
-                <span style="display: flex; gap: 8px;">
-                    {move || {
-                        if let Route::Session(name) = store.route.get() {
-                            Some(
-                                view! {
-                                    <span
-                                        class="profile-chip"
-                                        on:click=move |_| share_session(&name, share_copied)
-                                    >
-                                        {move || if share_copied.get() { "copied ✓" } else { "share" }}
-                                    </span>
-                                },
-                            )
-                        } else {
-                            None
-                        }
-                    }}
-                    <span
-                        class="profile-chip"
-                        style=move || format!("background: {};", store.profile.get().colour)
-                        on:click=move |_| store.show_profile_editor.set(true)
-                    >
-                        {move || {
-                            let p = store.profile.get();
-                            format!("{} {}", p.name, p.emoji)
+            {move || {
+                // No player yet: the setup form IS the page. Nothing else
+                // renders (and the server refuses nameless joins anyway).
+                if store.profile.get().name.trim().is_empty() {
+                    return view! {
+                        <div>
+                            <h1 style="padding-top: 28px;">"snek 🐍"</h1>
+                            <p>"Before you slither: who are you?"</p>
+                            {profile_form()}
+                        </div>
+                    }
+                        .into_any();
+                }
+                view! {
+                    <div>
+                        <div class="topbar">
+                            <a class="brand" href="#/">"snek 🐍"</a>
+                            <span style="display: flex; gap: 8px;">
+                                {move || {
+                                    if let Route::Session(name) = store.route.get() {
+                                        Some(
+                                            view! {
+                                                <span
+                                                    class="profile-chip"
+                                                    on:click=move |_| share_session(&name, share_copied)
+                                                >
+                                                    {move || {
+                                                        if share_copied.get() { "copied ✓" } else { "share" }
+                                                    }}
+                                                </span>
+                                            },
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                }}
+                                <span
+                                    class="profile-chip"
+                                    style=move || {
+                                        format!("background: {};", store.profile.get().colour)
+                                    }
+                                    on:click=move |_| store.show_profile_editor.set(true)
+                                >
+                                    {move || {
+                                        let p = store.profile.get();
+                                        format!("{} {}", p.name, p.emoji)
+                                    }}
+                                </span>
+                            </span>
+                        </div>
+                        {move || match store.route.get() {
+                            Route::Home => home_page().into_any(),
+                            Route::Session(name) => session_page(name).into_any(),
+                            Route::History => history_page().into_any(),
+                            Route::Replay(id) => replay_page(id).into_any(),
                         }}
-                    </span>
-                </span>
-            </div>
-            {move || match store.route.get() {
-                Route::Home => home_page().into_any(),
-                Route::Session(name) => session_page(name).into_any(),
-                Route::History => history_page().into_any(),
-                Route::Replay(id) => replay_page(id).into_any(),
+                        {move || store.show_profile_editor.get().then(profile_editor)}
+                    </div>
+                }
+                    .into_any()
             }}
-            {move || store.show_profile_editor.get().then(profile_editor)}
         </div>
     }
 }
@@ -252,7 +269,9 @@ fn normalize_word(raw: &str) -> String {
 // Profile editor
 // ---------------------------------------------------------------------------
 
-fn profile_editor() -> impl IntoView {
+/// The profile form itself — used as the entire first-run page and inside
+/// the edit modal. Saving commits the profile and closes the modal if open.
+fn profile_form() -> impl IntoView {
     let store = Store::use_store();
     let draft = RwSignal::new(store.profile.get_untracked());
     // A shufflable window into the (large) emoji list.
@@ -266,30 +285,22 @@ fn profile_editor() -> impl IntoView {
         save_profile(&p);
         store.profile.set(p.clone());
         net::send(&ClientMsg::UpdateProfile(p));
-        close_profile_editor(store);
+        if store.show_profile_editor.get_untracked() {
+            close_profile_editor(store);
+        }
     };
 
     view! {
-        <div
-            class="modal-back"
-            on:click=move |_| {
-                // Tap outside dismisses — unless we still need a name.
-                if !store.profile.get_untracked().name.trim().is_empty() {
-                    close_profile_editor(store);
+        <div class="profile-form">
+            <input
+                type="text"
+                placeholder="your name"
+                maxlength="20"
+                prop:value=move || draft.get().name
+                on:input=move |ev| {
+                    draft.update(|p| p.name = event_target_value(&ev));
                 }
-            }
-        >
-            <div class="modal" on:click=move |ev| ev.stop_propagation()>
-                <h3>"Who are you?"</h3>
-                <input
-                    type="text"
-                    placeholder="your name"
-                    maxlength="20"
-                    prop:value=move || draft.get().name
-                    on:input=move |ev| {
-                        draft.update(|p| p.name = event_target_value(&ev));
-                    }
-                />
+            />
                 <div class="row" style="margin-top: 10px; margin-bottom: 6px;">
                     <h3 style="margin: 0; align-self: center;">"Emoji"</h3>
                     <button
@@ -356,6 +367,19 @@ fn profile_editor() -> impl IntoView {
                 >
                     "That's me"
                 </button>
+        </div>
+    }
+}
+
+/// The edit-profile modal (opened from the top-right chip) — the same form,
+/// wrapped with backdrop dismiss + back-button close.
+fn profile_editor() -> impl IntoView {
+    let store = Store::use_store();
+    view! {
+        <div class="modal-back" on:click=move |_| close_profile_editor(store)>
+            <div class="modal" on:click=move |ev| ev.stop_propagation()>
+                <h3 style="margin-top: 0;">"Who are you?"</h3>
+                {profile_form()}
             </div>
         </div>
     }

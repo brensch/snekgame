@@ -70,6 +70,12 @@ async fn handle_socket(mut socket: WebSocket, registry: Registry) -> Result<(), 
         colour: info.colour,
     };
     if !valid_profile(&profile) {
+        // Player setup is mandatory: no name, no entry — tell them why.
+        let _ = socket
+            .send(Message::Binary(
+                encode(&ServerMsg::Error("set up your player first".into())).into(),
+            ))
+            .await;
         return Err("bad profile");
     }
 
