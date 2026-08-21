@@ -164,26 +164,7 @@ pub fn app() -> impl IntoView {
                 view! {
                     <div>
                         <div class="topbar">
-                            // Plain "/" home — no stray "#" in the URL.
-                            <a
-                                class="brand"
-                                href="/"
-                                on:click=move |ev: web_sys::MouseEvent| {
-                                    ev.prevent_default();
-                                    if let Some(w) = web_sys::window() {
-                                        if let Ok(h) = w.history() {
-                                            let _ = h.push_state_with_url(
-                                                &JsValue::NULL,
-                                                "",
-                                                Some("/"),
-                                            );
-                                        }
-                                    }
-                                    store.route.set(Route::Home);
-                                }
-                            >
-                                "snek 🐍"
-                            </a>
+                            <a class="brand" href="#/">"snek 🐍"</a>
                             <span style="display: flex; gap: 8px;">
                                 {move || {
                                     if let Route::Session(name) = store.route.get() {
