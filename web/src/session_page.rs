@@ -212,6 +212,20 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
 // Live game
 // ---------------------------------------------------------------------------
 
+/// On-screen d-pad — the primary controller on touch screens.
+fn dpad() -> impl IntoView {
+    let press = |dir: Dir| move |_| net::send(&ClientMsg::Move(dir));
+    view! {
+        <div class="dpad">
+            <button class="d-up" on:click=press(Dir::Up)>"▲"</button>
+            <button class="d-left" on:click=press(Dir::Left)>"◀"</button>
+            <div class="d-mid"></div>
+            <button class="d-right" on:click=press(Dir::Right)>"▶"</button>
+            <button class="d-down" on:click=press(Dir::Down)>"▼"</button>
+        </div>
+    }
+}
+
 fn game_view(game: GameView) -> impl IntoView {
     let store = Store::use_store();
     let me = store.me.get();
@@ -256,6 +270,7 @@ fn game_view(game: GameView) -> impl IntoView {
 
     let spectating = !game.players.iter().any(|p| p.id == me);
     let i_died = !spectating && !over && !last_turn.alive.contains(&me);
+    let show_dpad = !over && !spectating && !i_died;
 
     // Results, ranked, once the game is over.
     let results = over.then(|| {
@@ -347,7 +362,8 @@ fn game_view(game: GameView) -> impl IntoView {
                 {spectating.then_some(" — spectating (next game starts from the lobby)")}
                 {i_died.then_some(" — you died 💀 watch the rest")}
             </p>
-            {board_view(game.config, game.players.clone(), &turn, on_cell)}
+            {board_view(game.config, game.players.clone(), &turn, me.clone(), on_cell)}
+            {show_dpad.then(dpad)}
             {countdown}
             {results}
             <table style="margin-top: 12px;">

@@ -153,7 +153,7 @@ pub fn replay_page(id: i64) -> impl IntoView {
                 view! {
                     <div>
                         <p>"Turn " {turn.turn_number} " / " {r.turns.len()}</p>
-                        {board_view(r.config, r.players.clone(), &turn, |_| {})}
+                        {board_view(r.config, r.players.clone(), &turn, String::new(), |_| {})}
                         <div class="row" style="margin-top: 10px;">
                             <button on:click=move |_| {
                                 playing.update(|p| *p = !*p);
