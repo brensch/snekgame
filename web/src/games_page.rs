@@ -123,7 +123,7 @@ pub fn home_page() -> impl IntoView {
 
     view! {
         <div>
-            <h1 style="padding-top: 28px;">"A game entirely unrelated to toes*"</h1>
+            <h1 style="padding-top: 28px;">"Nokia snake, but violent*"</h1>
 
             {move || {
                 match sessions.get() {
@@ -231,7 +231,7 @@ pub fn home_page() -> impl IntoView {
             </p>
 
             <div style="margin-top: 40px;">
-                <p>"* Toes may be involved"</p>
+                <p>"* no toes involved"</p>
                 <p>"A game by Brendo"</p>
             </div>
         </div>
