@@ -65,7 +65,7 @@ pub fn app() -> impl IntoView {
         };
         if let Some(dir) = dir {
             e.prevent_default();
-            net::send(&ClientMsg::Move(dir));
+            net::send_move(store, dir);
         }
     });
 
@@ -95,7 +95,7 @@ pub fn app() -> impl IntoView {
         } else {
             Dir::Up
         };
-        net::send(&ClientMsg::Move(dir));
+        net::send_move(store, dir);
     });
 
     // First visit: force the profile editor open.
@@ -103,19 +103,38 @@ pub fn app() -> impl IntoView {
         store.show_profile_editor.set(true);
     }
 
+    let share_copied = RwSignal::new(false);
     view! {
         <div class="container">
             <div class="topbar">
                 <a class="brand" href="#/">"snek 🐍"</a>
-                <span
-                    class="profile-chip"
-                    style=move || format!("background: {};", store.profile.get().colour)
-                    on:click=move |_| store.show_profile_editor.set(true)
-                >
+                <span style="display: flex; gap: 8px;">
                     {move || {
-                        let p = store.profile.get();
-                        format!("{} {}", p.name, p.emoji)
+                        if let Route::Session(name) = store.route.get() {
+                            Some(
+                                view! {
+                                    <span
+                                        class="profile-chip"
+                                        on:click=move |_| share_session(&name, share_copied)
+                                    >
+                                        {move || if share_copied.get() { "copied ✓" } else { "share" }}
+                                    </span>
+                                },
+                            )
+                        } else {
+                            None
+                        }
                     }}
+                    <span
+                        class="profile-chip"
+                        style=move || format!("background: {};", store.profile.get().colour)
+                        on:click=move |_| store.show_profile_editor.set(true)
+                    >
+                        {move || {
+                            let p = store.profile.get();
+                            format!("{} {}", p.name, p.emoji)
+                        }}
+                    </span>
                 </span>
             </div>
             {move || match store.route.get() {
@@ -126,6 +145,31 @@ pub fn app() -> impl IntoView {
             }}
             {move || store.show_profile_editor.get().then(profile_editor)}
         </div>
+    }
+}
+
+/// Native share sheet where available (mobile); clipboard fallback elsewhere.
+fn share_session(word: &str, copied: RwSignal<bool>) {
+    let Some(window) = web_sys::window() else { return };
+    let loc = window.location();
+    let url = format!(
+        "{}//{}/#/s/{}",
+        loc.protocol().unwrap_or_default(),
+        loc.host().unwrap_or_default(),
+        word
+    );
+    let nav = window.navigator();
+    let has_share = js_sys::Reflect::has(nav.as_ref(), &"share".into()).unwrap_or(false);
+    if has_share {
+        let data = web_sys::ShareData::new();
+        data.set_title("snek 🐍");
+        data.set_text("come play snek with me");
+        data.set_url(&url);
+        let _ = nav.share_with_data(&data);
+    } else {
+        let _ = nav.clipboard().write_text(&url);
+        copied.set(true);
+        gloo_timers::callback::Timeout::new(1500, move || copied.set(false)).forget();
     }
 }
 

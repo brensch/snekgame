@@ -78,47 +78,52 @@ pub fn board_view(
             }
         }
 
-        // Body: one rounded polyline through the centres, starting at the
-        // neck — the head cell holds nothing but the player's emoji.
+        // Body: one rounded polyline through the centres, drawn through the
+        // head cell too so it blends seamlessly into the head square.
         let head = snake[0];
         if path_cells.len() > 1 {
-            let body = &path_cells[1..];
-            if body.len() == 1 {
-                sneks.push_str(&format!(
-                    r##"<circle cx="{}" cy="{}" r="0.36" fill="{colour}"/>"##,
-                    cx(body[0]),
-                    cy(body[0])
-                ));
-            } else {
-                let points: String = body
-                    .iter()
-                    .map(|&p| format!("{},{}", cx(p), cy(p)))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                sneks.push_str(&format!(
-                    r##"<polyline points="{points}" fill="none" stroke="{colour}" stroke-width="0.72" stroke-linecap="round" stroke-linejoin="round"/>"##
-                ));
-                // Tail taper: a slightly smaller round cap on the last cell.
-                let t = *body.last().unwrap();
-                sneks.push_str(&format!(
-                    r##"<circle cx="{}" cy="{}" r="0.30" fill="{colour}"/>"##,
-                    cx(t),
-                    cy(t)
-                ));
-            }
+            let points: String = path_cells
+                .iter()
+                .map(|&p| format!("{},{}", cx(p), cy(p)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            sneks.push_str(&format!(
+                r##"<polyline points="{points}" fill="none" stroke="{colour}" stroke-width="0.72" stroke-linecap="round" stroke-linejoin="round"/>"##
+            ));
+            // Tail taper: a slightly smaller round cap on the last cell.
+            let t = *path_cells.last().unwrap();
+            sneks.push_str(&format!(
+                r##"<circle cx="{}" cy="{}" r="0.30" fill="{colour}"/>"##,
+                cx(t),
+                cy(t)
+            ));
         }
 
-        // tac-style numbers: health on the second tile…
+        // The head: a full body-coloured square with the player's emoji.
+        sneks.push_str(&format!(
+            r##"<rect x="{x}" y="{y}" width="1" height="1" fill="{colour}"/>"##,
+            x = head as usize % w,
+            y = head as usize / w,
+        ));
+        let emoji = emoji_of.get(player_id.as_str()).copied().unwrap_or("🐍");
+        sneks.push_str(&emoji_text(cx(head), cy(head), 0.8, emoji));
+
+        // Numbers as the snek unfurls: length on the first body tile,
+        // health on the one after.
         if let Some(&second) = path_cells.get(1) {
-            let hp = turn.health.get(player_id).copied().unwrap_or(0);
-            sneks.push_str(&number_text(cx(second), cy(second), &hp.to_string()));
+            sneks.push_str(&number_text(cx(second), cy(second), &snake.len().to_string()));
         }
-        // …and the count of stacked segments on the butt (growth queued up).
+        if let Some(&third) = path_cells.get(2) {
+            let hp = turn.health.get(player_id).copied().unwrap_or(0);
+            sneks.push_str(&number_text(cx(third), cy(third), &hp.to_string()));
+        }
+        // Stacked-segment count on the butt (growth queued up).
         let tail_cell = *snake.last().unwrap();
         let stacked = snake.iter().filter(|&&p| p == tail_cell).count();
         if stacked > 1
             && tail_cell != head
             && path_cells.get(1) != Some(&tail_cell)
+            && path_cells.get(2) != Some(&tail_cell)
         {
             sneks.push_str(&number_text(
                 cx(tail_cell),
@@ -126,10 +131,6 @@ pub fn board_view(
                 &stacked.to_string(),
             ));
         }
-
-        // The head: just the player's emoji.
-        let emoji = emoji_of.get(player_id.as_str()).copied().unwrap_or("🐍");
-        sneks.push_str(&emoji_text(cx(head), cy(head), 0.8, emoji));
     }
 
     // --- clashes stay emoji, like tac. The dead snek's body becomes a 💀

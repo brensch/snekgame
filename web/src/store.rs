@@ -2,7 +2,7 @@
 
 use leptos::prelude::*;
 use snek_shared::protocol::{LobbyState, ProfileInfo};
-use snek_shared::{GameConfig, PlayerId, PlayerProfile, Turn};
+use snek_shared::{Dir, GameConfig, PlayerId, PlayerProfile, Turn};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Route {
@@ -41,6 +41,9 @@ pub struct Store {
     pub game: RwSignal<Option<GameView>>,
     /// History scrubber position when reviewing a finished game (None = live).
     pub view_turn: RwSignal<Option<usize>>,
+    /// The direction we're currently steering (highlights the d-pad).
+    /// Starts at the clockwise default; corrected from each resolved turn.
+    pub selected_dir: RwSignal<Option<Dir>>,
     pub saved_id: RwSignal<Option<i64>>,
     /// performance-now ms when the pre-game countdown ends.
     pub countdown_ends: RwSignal<f64>,
@@ -60,6 +63,7 @@ impl Store {
             lobby: RwSignal::new(None),
             game: RwSignal::new(None),
             view_turn: RwSignal::new(None),
+            selected_dir: RwSignal::new(None),
             saved_id: RwSignal::new(None),
             countdown_ends: RwSignal::new(0.0),
             now_ms: RwSignal::new(0.0),

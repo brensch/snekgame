@@ -62,6 +62,12 @@ pub fn disconnect(store: Store) {
     store.view_turn.set(None);
 }
 
+/// Steer: optimistic d-pad highlight now, server truth on the next turn.
+pub fn send_move(store: Store, dir: snek_shared::Dir) {
+    store.selected_dir.set(Some(dir));
+    send(&ClientMsg::Move(dir));
+}
+
 pub fn send(msg: &ClientMsg) {
     ACTIVE.with(|a| {
         if let Some(conn) = &*a.borrow() {
@@ -233,6 +239,13 @@ fn apply(store: Store, msg: ServerMsg) {
             store.saved_id.set(None);
             store.view_turn.set(None);
             store.countdown_ends.set(now() + countdown_ms as f64);
+            // Pre-select the clockwise default heading on the d-pad.
+            let me = store.me.get_untracked();
+            store.selected_dir.set(
+                turn.snakes
+                    .get(&me)
+                    .map(|s| snek_shared::clockwise_start_dir(&config, s[0])),
+            );
             store.game.set(Some(GameView {
                 config,
                 players,
@@ -240,6 +253,12 @@ fn apply(store: Store, msg: ServerMsg) {
             }));
         }
         ServerMsg::Turn(turn) => {
+            // The applied move is the truth (covers ignored reversals and
+            // auto-continue) — sync the d-pad highlight to it.
+            let me = store.me.get_untracked();
+            if let Some(&dir) = turn.moves.get(&me) {
+                store.selected_dir.set(Some(dir));
+            }
             store.game.update(|g| {
                 if let Some(g) = g {
                     g.turns.push(turn);

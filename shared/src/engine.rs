@@ -22,7 +22,42 @@ use std::collections::BTreeMap;
 
 const START_LENGTH: usize = 3;
 const MAX_HEALTH: u8 = 100;
-const FOOD_SPAWN_CHANCE: f64 = 0.5;
+/// Official battlesnake standard-mode food settings: keep at least
+/// `MIN_FOOD` on the board, otherwise spawn one with 15% chance per turn.
+const FOOD_SPAWN_CHANCE: f64 = 0.15;
+const MIN_FOOD: usize = 1;
+
+/// The direction a snek starts moving: clockwise around the board, based on
+/// where it spawned. Of the two clockwise-tangent candidates, pick the one
+/// with more room before the wall (so corner spawns don't drive straight
+/// into it). Also used by the UI to pre-select the d-pad.
+pub fn clockwise_start_dir(config: &GameConfig, pos: Pos) -> Dir {
+    let (w, h) = (config.board_width as i16, config.board_height as i16);
+    let (x, y) = (pos as i16 % w, pos as i16 / w);
+    // Offset from centre, doubled to stay in integers.
+    let (vx, vy) = (2 * x - (w - 1), 2 * y - (h - 1));
+    // Clockwise tangent in screen coordinates (y grows downward).
+    let (tx, ty) = (-vy, vx);
+
+    let mut candidates: Vec<(i16, i16, Dir)> = Vec::new(); // (room, |component|, dir)
+    if tx > 0 {
+        candidates.push(((w - 2) - x, tx.abs(), Dir::Right));
+    }
+    if tx < 0 {
+        candidates.push((x - 1, tx.abs(), Dir::Left));
+    }
+    if ty > 0 {
+        candidates.push(((h - 2) - y, ty.abs(), Dir::Down));
+    }
+    if ty < 0 {
+        candidates.push((y - 1, ty.abs(), Dir::Up));
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|&(room, comp, _)| (room, comp))
+        .map(|(_, _, dir)| dir)
+        .unwrap_or(Dir::Right) // dead centre: arbitrary but deterministic
+}
 
 pub struct Engine {
     pub config: GameConfig,
@@ -143,8 +178,11 @@ impl Engine {
             for &((sx, sy), (ex, ey)) in &edges {
                 let mut i = 1;
                 while i < segments {
-                    let x = sx + (((ex - sx) as i32 * i + segments / 2) / segments) as i16;
-                    let y = sy + (((ey - sy) as i32 * i + segments / 2) / segments) as i16;
+                    // JS Math.round semantics (half rounds toward +inf),
+                    // matching tac's getMidpoints exactly.
+                    let js_round = |v: f64| (v + 0.5).floor() as i16;
+                    let x = js_round(sx as f64 + (ex - sx) as f64 * i as f64 / segments as f64);
+                    let y = js_round(sy as f64 + (ey - sy) as f64 * i as f64 / segments as f64);
                     if !positions.contains(&(x, y)) {
                         positions.push((x, y));
                         added += 1;
@@ -241,16 +279,10 @@ impl Engine {
                     dir = None;
                 }
             }
-            let dir = dir.or(last_dir).unwrap_or_else(|| {
-                // Stacked snek with no history: first direction not facing a wall.
-                *Dir::ALL
-                    .iter()
-                    .find(|d| {
-                        let t = self.target(head, **d);
-                        t.map(|t| !self.config.is_wall(t)).unwrap_or(false)
-                    })
-                    .unwrap_or(&Dir::Up)
-            });
+            let dir = dir
+                .or(last_dir)
+                // Stacked snek with no history: head off clockwise.
+                .unwrap_or_else(|| clockwise_start_dir(&self.config, head));
             applied.insert(player.clone(), dir);
 
             let target = self.target(head, dir);
@@ -368,8 +400,8 @@ impl Engine {
         }
         remove_dead(&mut snakes, &mut health, &mut alive, &starved);
 
-        // --- Spawn food ----------------------------------------------------
-        if self.rng.chance(FOOD_SPAWN_CHANCE) {
+        // --- Spawn food (battlesnake standard rules) -----------------------
+        if food.len() < MIN_FOOD || self.rng.chance(FOOD_SPAWN_CHANCE) {
             let free = self.free_cells(&snakes, &food);
             if !free.is_empty() {
                 let pick = self.rng.below(free.len());
@@ -596,6 +628,55 @@ mod tests {
         assert!(!t.game_over(), "snek died on the way to food");
         assert_eq!(t.snakes["solo"].len(), 4, "should have grown");
         assert_eq!(t.health["solo"], 100, "should be healed");
+    }
+
+    #[test]
+    fn everyone_starts_clockwise() {
+        // 8 players on a 13x13 board: 4 corners + 4 edge midpoints.
+        let players: Vec<PlayerId> = (0..8).map(|i| format!("p{i}")).collect();
+        let mut e = Engine::new(config(), players.clone(), 5);
+        let t1 = e.first_turn();
+
+        // Expected clockwise headings by spawn position.
+        let expected = |pos: Pos| {
+            let (x, y) = (pos % 13, pos / 13);
+            match (x, y) {
+                (2, 2) => Dir::Right,   // top-left corner
+                (10, 2) => Dir::Down,   // top-right corner
+                (2, 10) => Dir::Up,     // bottom-left corner
+                (10, 10) => Dir::Left,  // bottom-right corner
+                (6, 2) => Dir::Right,   // top mid
+                (10, 6) => Dir::Down,   // right mid
+                (6, 10) => Dir::Left,   // bottom mid
+                (2, 6) => Dir::Up,      // left mid
+                other => panic!("unexpected spawn position {other:?}"),
+            }
+        };
+        let heads: std::collections::BTreeMap<PlayerId, Pos> =
+            t1.snakes.iter().map(|(p, s)| (p.clone(), s[0])).collect();
+
+        // Nobody submits a move; everyone should head off clockwise, safely.
+        let t2 = e.next_turn(&t1, &BTreeMap::new());
+        assert_eq!(t2.alive.len(), 8, "clockwise starts must be safe");
+        for p in &players {
+            assert_eq!(
+                t2.moves[p],
+                expected(heads[p]),
+                "player at {:?} went the wrong way",
+                (heads[p] % 13, heads[p] / 13)
+            );
+            assert_eq!(t2.moves[p], clockwise_start_dir(&config(), heads[p]));
+        }
+    }
+
+    #[test]
+    fn food_replenishes_to_minimum() {
+        let mut e = two_player_engine();
+        let mut t = e.first_turn();
+        // Force the board to zero food and step: min-food rule must restock.
+        t.food.clear();
+        let t2 = e.next_turn(&t, &moves(&[("a", Dir::Right), ("b", Dir::Down)]));
+        assert!(!t2.food.is_empty(), "min food must be maintained");
     }
 
     #[test]

@@ -15,6 +15,7 @@ web-sys = { version = "0.3", features = [
     "WebSocket", "BinaryType", "MessageEvent", "CloseEvent",
     "KeyboardEvent", "TouchEvent", "Touch", "TouchList",
     "MouseEvent", "Element", "DomRect",
+    "Navigator", "ShareData", "Clipboard",
     "HtmlInputElement", "HtmlSelectElement",
 ] }
 wasm-bindgen-futures = "0.4"

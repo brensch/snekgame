@@ -3,5 +3,5 @@ pub mod protocol;
 pub mod rng;
 pub mod types;
 
-pub use engine::Engine;
+pub use engine::{clockwise_start_dir, Engine};
 pub use types::*;

@@ -11,12 +11,11 @@ use snek_shared::{Dir, GameConfig, Pos, Turn};
 const BOARD_SIZES: &[(&str, u8)] = &[("Small", 11), ("Medium", 13), ("Large", 17)];
 const SPEEDS: &[(&str, u32)] = &[("Chill (2s)", 2000), ("Normal (1s)", 1000), ("Fast (0.5s)", 500)];
 
-pub fn session_page(session: String) -> impl IntoView {
+pub fn session_page(_session: String) -> impl IntoView {
     let store = Store::use_store();
 
     view! {
         <div>
-            <h2>"session: " {session}</h2>
             {move || match store.conn.get() {
                 ConnStatus::Reconnecting | ConnStatus::Connecting => Some(view! {
                     <div class="banner error">"Reconnecting… hold tight 🛟"</div>
@@ -212,16 +211,27 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
 // Live game
 // ---------------------------------------------------------------------------
 
-/// On-screen d-pad — the primary controller on touch screens.
+/// On-screen d-pad — the primary controller on touch screens. The selected
+/// direction lights up in the player's colour.
 fn dpad() -> impl IntoView {
-    let press = |dir: Dir| move |_| net::send(&ClientMsg::Move(dir));
+    let store = Store::use_store();
+    let press = move |dir: Dir| move |_| net::send_move(store, dir);
+    let style = move |dir: Dir| {
+        move || {
+            if store.selected_dir.get() == Some(dir) {
+                format!("background: {};", store.profile.get().colour)
+            } else {
+                String::new()
+            }
+        }
+    };
     view! {
         <div class="dpad">
-            <button class="d-up" on:click=press(Dir::Up)>"▲"</button>
-            <button class="d-left" on:click=press(Dir::Left)>"◀"</button>
+            <button class="d-up" style=style(Dir::Up) on:click=press(Dir::Up)>"▲"</button>
+            <button class="d-left" style=style(Dir::Left) on:click=press(Dir::Left)>"◀"</button>
             <div class="d-mid"></div>
-            <button class="d-right" on:click=press(Dir::Right)>"▶"</button>
-            <button class="d-down" on:click=press(Dir::Down)>"▼"</button>
+            <button class="d-right" style=style(Dir::Right) on:click=press(Dir::Right)>"▶"</button>
+            <button class="d-down" style=style(Dir::Down) on:click=press(Dir::Down)>"▼"</button>
         </div>
     }
 }
@@ -265,7 +275,7 @@ fn game_view(game: GameView) -> impl IntoView {
         } else {
             Dir::Up
         };
-        net::send(&ClientMsg::Move(dir));
+        net::send_move(store, dir);
     };
 
     let spectating = !game.players.iter().any(|p| p.id == me);
@@ -331,30 +341,6 @@ fn game_view(game: GameView) -> impl IntoView {
         }
     });
 
-    // Live player table.
-    let table_turn = if over { &last_turn } else { &turn };
-    let player_rows = game
-        .players
-        .iter()
-        .map(|p| {
-            let alive = table_turn.alive.contains(&p.id);
-            let length = table_turn.snakes.get(&p.id).map(|s| s.len()).unwrap_or(0);
-            let health = table_turn.health.get(&p.id).copied().unwrap_or(0);
-            view! {
-                <tr style=format!(
-                    "background: {}; {}",
-                    p.colour,
-                    if alive { "" } else { "opacity: 0.4;" },
-                )>
-                    <td>{p.name.clone()} " " {p.emoji.clone()}</td>
-                    <td class="right">{if alive { "alive" } else { "dead" }}</td>
-                    <td class="right">{health} "hp"</td>
-                    <td class="right">{length} " long"</td>
-                </tr>
-            }
-        })
-        .collect_view();
-
     view! {
         <div>
             <p>
@@ -366,9 +352,6 @@ fn game_view(game: GameView) -> impl IntoView {
             {show_dpad.then(dpad)}
             {countdown}
             {results}
-            <table style="margin-top: 12px;">
-                <tbody>{player_rows}</tbody>
-            </table>
         </div>
     }
 }
