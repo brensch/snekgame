@@ -197,13 +197,12 @@ pub fn home_page() -> impl IntoView {
                 }
             }}
 
-            <h3 style="margin-top: 28px;">
-                {move || {
-                    let any = sessions.get().map(|l| !l.is_empty()).unwrap_or(false);
-                    if any { "Start a new one" } else { "Start a game" }
-                }}
-            </h3>
+            {move || {
+                let any = sessions.get().map(|l| !l.is_empty()).unwrap_or(false);
+                any.then(|| view! { <h3 style="margin-top: 28px;">"or start your own lobby"</h3> })
+            }}
             <input
+                style="margin-top: 16px;"
                 type="text"
                 placeholder="name your game"
                 maxlength="32"
@@ -221,7 +220,7 @@ pub fn home_page() -> impl IntoView {
                 disabled=move || new_name.get().trim().is_empty()
                 on:click=move |_| create()
             >
-                "Create game\u{00A0}" {rotating}
+                "Start game\u{00A0}" {rotating}
             </button>
 
             <p style="margin-top: 24px;">
