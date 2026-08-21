@@ -132,10 +132,27 @@ td.kick {
   width: 40px;
 }
 
+/* players roster: one framed block, uniform 1px separators inside */
+table.players {
+  border: 2px solid #000;
+}
+
+table.players td {
+  border-bottom: none;
+  padding: 8px;
+}
+
+table.players tr + tr td {
+  border-top: 1px solid #000;
+}
+
 /* the add-a-bot footer row inside the players table */
 .add-bot-row td {
-  border-bottom: none;
-  padding-top: 10px;
+  background: #fff;
+}
+
+table.players .add-bot-row td {
+  border-top: 2px solid #000;
 }
 
 button.mini {

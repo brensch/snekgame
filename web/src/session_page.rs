@@ -157,7 +157,7 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
     };
 
     let roster = view! {
-        <table>
+        <table class="players">
             <tbody>
                 {lobby
                     .players
