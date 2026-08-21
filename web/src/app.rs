@@ -255,6 +255,8 @@ fn normalize_word(raw: &str) -> String {
 fn profile_editor() -> impl IntoView {
     let store = Store::use_store();
     let draft = RwSignal::new(store.profile.get_untracked());
+    // A shufflable window into the (large) emoji list.
+    let shown = RwSignal::new(palette::random_emoji_set(24));
 
     let save = move || {
         let p = draft.get_untracked();
@@ -288,26 +290,43 @@ fn profile_editor() -> impl IntoView {
                         draft.update(|p| p.name = event_target_value(&ev));
                     }
                 />
-                <h3>"Emoji"</h3>
+                <div class="row" style="margin-top: 10px; margin-bottom: 6px;">
+                    <h3 style="margin: 0; align-self: center;">"Emoji"</h3>
+                    <button
+                        class="mini"
+                        style="flex: 0 0 auto;"
+                        on:click=move |_| shown.set(palette::random_emoji_set(24))
+                    >
+                        "🎲 shuffle"
+                    </button>
+                </div>
                 <div class="emoji-grid">
-                    {palette::EMOJIS
-                        .iter()
-                        .map(|e| {
-                            let e = e.to_string();
-                            let pick = e.clone();
-                            view! {
-                                <div
-                                    class="pick"
-                                    class:selected=move || draft.get().emoji == e
-                                    on:click=move |_| {
-                                        draft.update(|p| p.emoji = pick.clone());
-                                    }
-                                >
-                                    {e.clone()}
-                                </div>
-                            }
-                        })
-                        .collect_view()}
+                    {move || {
+                        let current = draft.get().emoji;
+                        let mut list = shown.get();
+                        // Keep whatever is selected visible across shuffles.
+                        if !list.contains(&current) {
+                            list.insert(0, current.clone());
+                            list.pop();
+                        }
+                        list.into_iter()
+                            .map(|e| {
+                                let sel = e.clone();
+                                let pick = e.clone();
+                                view! {
+                                    <div
+                                        class="pick"
+                                        class:selected=move || draft.get().emoji == sel
+                                        on:click=move |_| {
+                                            draft.update(|p| p.emoji = pick.clone());
+                                        }
+                                    >
+                                        {e.clone()}
+                                    </div>
+                                }
+                            })
+                            .collect_view()
+                    }}
                 </div>
                 <h3>"Colour"</h3>
                 <div class="swatches">

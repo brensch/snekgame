@@ -112,11 +112,13 @@ pub fn home_page() -> impl IntoView {
             .set_hash(&format!("#/s/{id}"));
     };
 
-    // tac's RotatingEmoji, driven off the shared coarse clock. (Careful:
-    // ms-since-epoch overflows a 32-bit usize cast on wasm, so reduce in u64.)
+    // tac's RotatingEmoji: the actionish send list, hopping rather than
+    // marching so it feels random. (Reduce in u64 — ms-since-epoch overflows
+    // a 32-bit usize cast on wasm.)
     let rotating = move || {
-        let i = ((store.now_ms.get() / 400.0) as u64 % palette::EMOJIS.len() as u64) as usize;
-        palette::EMOJIS[i]
+        let t = (store.now_ms.get() / 400.0) as u64;
+        let i = (t.wrapping_mul(7) % palette::SEND_EMOJIS.len() as u64) as usize;
+        palette::SEND_EMOJIS[i]
     };
 
     view! {

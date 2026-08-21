@@ -1,9 +1,27 @@
-//! Profile options — emoji list and colour formula lifted from tac.
+//! Profile options — emoji lists and colour formula lifted from tac.
 
+/// tac's full profile emoji list (shared/types/Emojis.ts).
 pub const EMOJIS: &[&str] = &[
     "👍", "🚀", "🔥", "🍕", "🌈", "🦍", "🎲", "🦄", "💡", "🌋", "🎭", "🎷", "🧪", "🦕", "🧠",
-    "📡", "🔮", "🦜", "🦥", "🌵", "🧳", "🗿", "🍝", "🍤", "🦷", "🧻", "🥩", "🍉", "🪱", "🐍",
-    "🕺", "🎃",
+    "📡", "🔮", "🦜", "🦥", "🌵", "🧳", "🗿", "🍝", "🍤", "🦷", "🧻", "🥩", "🍉", "🪱", "🧿",
+    "🥒", "🐉", "🎢", "🤯", "🦔", "🫖", "🐓", "🫃", "🎡", "🥴", "🦨", "🧚", "🌭", "🧼", "🧇",
+    "🛹", "🫛", "🍄", "🦞", "🪲", "🍔", "🦐", "🛷", "🦒", "🌙", "💾", "💿", "🦖", "🥷", "🛼",
+    "🦚", "🍙", "🛁", "🍧", "🛢", "🎱", "🛶", "🎪", "🎬", "🥨", "🦉", "🦦", "🌯", "🧀", "🦧",
+    "🥌", "🪐", "🧸", "💍", "🌶️", "🧊", "🧈", "🎃", "🦑", "🍖", "🦘", "🥛", "🦀", "🧦", "🍌",
+    "🍯", "🥟", "🪂", "🥋", "🍿", "🎠", "🧫", "🍫", "🎐", "🪡", "🥚", "🍩", "🪕", "🎗️", "🎴",
+    "🪑", "🛩", "🦋", "🍷", "🪃", "🥢", "🥄", "🧲", "🪨", "🍠", "🦗", "🦢", "🍡", "🦤", "🪒",
+    "🧽", "🪞", "🦫", "🍟", "🎨", "🎓", "🍹", "🪦", "🥀", "🎏", "🧨", "🛣️", "🎮", "🧁", "🥬",
+    "🧢", "🎧", "🍂", "🍮", "🎆", "🎎", "🍻", "🧭", "🧬", "🍱", "🦙", "🎹", "🍜", "🪜", "🎼",
+    "🍋", "🎯", "🛑", "🥃", "🥓", "🍰", "🪁", "🦣", "🎤", "🛸", "🎛️", "🍘", "🧋", "🛍️", "🪝",
+    "🍲", "🪄", "🎿", "🍳", "🪀", "🥔", "🪣", "🎣", "🧩", "🦭", "🥵", "🥶", "🛏️", "🪵", "🍈",
+    "🛋", "🍥", "🧂", "🎳", "🪔", "🪗", "🥏", "🪚", "🥕", "🧆", "🧄", "🍭", "🧃", "🧯",
+];
+
+/// tac's sendEmojis — the actionish set that rotates on the play button.
+pub const SEND_EMOJIS: &[&str] = &[
+    "🚀", "🛫", "🏹", "💨", "📈", "💸", "🏄", "🌙", "➡️", "💹", "🐂", "🎬", "🚦", "👉", "🔛",
+    "🆒", "🦍", "✅", "👍", "🍑", "🦶", "🤑", "⛷️", "🕺", "🏌️", "🏂", "🕹️", "🥇", "💡", "🚒",
+    "🏎️", "✈️", "🛩️", "🚢", "🛥️", "⛵", "🚤", "🚨", "🆕", "▶️", "🔜", "☑️",
 ];
 
 /// tac's generateColor: hsl(h, 85%, 60%).
@@ -13,4 +31,15 @@ pub fn colour(hue: u32) -> String {
 
 pub fn swatches() -> Vec<String> {
     (0..16).map(|i| colour(i * 360 / 16)).collect()
+}
+
+/// A random spread of profile emojis for the picker.
+pub fn random_emoji_set(count: usize) -> Vec<String> {
+    let mut pool: Vec<&str> = EMOJIS.to_vec();
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count.min(pool.len()) {
+        let i = (js_sys::Math::random() * pool.len() as f64) as usize;
+        out.push(pool.swap_remove(i.min(pool.len() - 1)).to_string());
+    }
+    out
 }
