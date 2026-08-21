@@ -45,18 +45,26 @@ pub struct Registry {
     inner: Arc<Mutex<HashMap<String, mpsc::Sender<Cmd>>>>,
     /// Live snapshots for the active-games list, kept fresh by the actors.
     infos: Arc<Mutex<HashMap<String, SessionSummary>>>,
+    /// Pushes the active list to /ws/games watchers on every change.
+    games_watch: Arc<tokio::sync::watch::Sender<Vec<SessionSummary>>>,
     db: Arc<Db>,
     next_conn_id: Arc<AtomicU64>,
 }
 
 impl Registry {
     pub fn new(db: Arc<Db>) -> Registry {
+        let (games_watch, _) = tokio::sync::watch::channel(Vec::new());
         Registry {
             inner: Arc::new(Mutex::new(HashMap::new())),
             infos: Arc::new(Mutex::new(HashMap::new())),
+            games_watch: Arc::new(games_watch),
             db,
             next_conn_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    pub fn watch_games(&self) -> tokio::sync::watch::Receiver<Vec<SessionSummary>> {
+        self.games_watch.subscribe()
     }
 
     pub fn new_conn_id(&self) -> u64 {
@@ -79,6 +87,7 @@ impl Registry {
 
     fn publish(&self, info: SessionSummary) {
         self.infos.lock().unwrap().insert(info.id.clone(), info);
+        self.games_watch.send_replace(self.active_sessions());
     }
 
     /// Get the actor for a session, spawning it if needed. Retries once if it
@@ -124,6 +133,7 @@ impl Registry {
             }
         }
         self.infos.lock().unwrap().remove(session);
+        self.games_watch.send_replace(self.active_sessions());
     }
 }
 

@@ -33,6 +33,7 @@ pub fn build_app(db_path: &Path) -> Router {
     };
     Router::new()
         .route("/ws", get(ws_route))
+        .route("/ws/games", get(games_watch))
         .route("/api/sessions", get(session_list))
         .route("/api/history", get(history_list))
         .route("/api/history/{id}", get(history_game))
@@ -43,6 +44,37 @@ pub fn build_app(db_path: &Path) -> Router {
 /// Active games (someone in the lobby or playing right now).
 async fn session_list(State(state): State<AppState>) -> Response {
     Json(state.registry.active_sessions()).into_response()
+}
+
+/// Push-updated active-games list: sends the current list on connect and a
+/// fresh postcard frame every time it changes.
+async fn games_watch(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> Response {
+    use axum::extract::ws::Message;
+    ws.on_upgrade(move |mut sock| async move {
+        let mut rx = state.registry.watch_games();
+        loop {
+            let list = rx.borrow_and_update().clone();
+            let frame = postcard::to_allocvec(&list).unwrap();
+            if sock.send(Message::Binary(frame.into())).await.is_err() {
+                break;
+            }
+            tokio::select! {
+                changed = rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                msg = sock.recv() => match msg {
+                    None | Some(Err(_)) => break,
+                    Some(Ok(Message::Close(_))) => break,
+                    _ => {}
+                },
+            }
+        }
+    })
 }
 
 async fn ws_route(
