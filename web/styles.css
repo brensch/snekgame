@@ -2,6 +2,9 @@
 
 * {
   box-sizing: border-box;
+  /* iOS Safari: kill double-tap-to-zoom on every tappable thing (still
+     allows scroll/pinch). Board overrides this with touch-action: none. */
+  touch-action: manipulation;
 }
 
 body {
@@ -172,6 +175,8 @@ button.mini {
   margin-left: calc(50% - 50vw);
   touch-action: none;
   user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
   cursor: pointer;
 }
 
@@ -193,6 +198,8 @@ button.mini {
   justify-content: center;
   margin: 14px auto 4px;
   user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
 }
 
 .dpad button {
