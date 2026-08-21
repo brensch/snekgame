@@ -28,6 +28,10 @@ pub fn board_view(
         .iter()
         .map(|p| (p.id.as_str(), p.colour.as_str()))
         .collect();
+    let emoji_of: HashMap<&str, &str> = players
+        .iter()
+        .map(|p| (p.id.as_str(), p.emoji.as_str()))
+        .collect();
 
     let cx = |pos: Pos| (pos as usize % w) as f64 + 0.5;
     let cy = |pos: Pos| (pos as usize / w) as f64 + 0.5;
@@ -126,7 +130,6 @@ pub fn board_view(
             }
             None => (0.0, -1.0),
         };
-        let (px, py) = (-dy, dx); // perpendicular
         let is_me = *player_id == my_id;
         if is_me {
             sneks.push_str(&format!(
@@ -137,16 +140,6 @@ pub fn board_view(
         sneks.push_str(&format!(
             r##"<circle cx="{hx}" cy="{hy}" r="0.44" fill="{colour}"/>"##
         ));
-        for side in [-1.0f64, 1.0] {
-            let ex = hx + px * 0.17 * side + dx * 0.16;
-            let ey = hy + py * 0.17 * side + dy * 0.16;
-            sneks.push_str(&format!(
-                r##"<circle cx="{ex}" cy="{ey}" r="0.115" fill="#ffffff"/>
-                   <circle cx="{plx}" cy="{ply}" r="0.055" fill="#000000"/>"##,
-                plx = ex + dx * 0.04,
-                ply = ey + dy * 0.04,
-            ));
-        }
         // Tongue, because snek.
         sneks.push_str(&format!(
             r##"<path d="M {sx} {sy} l {fx} {fy}" stroke="#e53935" stroke-width="0.07" stroke-linecap="round"/>"##,
@@ -154,6 +147,12 @@ pub fn board_view(
             sy = hy + dy * 0.40,
             fx = dx * 0.22,
             fy = dy * 0.22,
+        ));
+        // The player's emoji is the face.
+        let emoji = emoji_of.get(player_id.as_str()).copied().unwrap_or("🐍");
+        sneks.push_str(&format!(
+            r##"<text x="{hx}" y="{ty}" font-size="0.62" text-anchor="middle" dominant-baseline="central">{emoji}</text>"##,
+            ty = hy + 0.03,
         ));
     }
 
