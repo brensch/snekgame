@@ -15,11 +15,25 @@ const CHECKER_B: &str = "#cfe6b8";
 const BRICK: &str = "#a8503c";
 const MORTAR: &str = "#7c3a2b";
 
+fn emoji_text(x: f64, y: f64, size: f64, glyph: &str) -> String {
+    format!(
+        r##"<text x="{x}" y="{ty}" font-size="{size}" text-anchor="middle" dominant-baseline="central">{glyph}</text>"##,
+        ty = y + 0.04,
+    )
+}
+
+fn number_text(x: f64, y: f64, value: &str) -> String {
+    format!(
+        r##"<text x="{x}" y="{ty}" font-size="0.44" font-weight="bold" font-family="Courier New, monospace" fill="#000" text-anchor="middle" dominant-baseline="central">{value}</text>"##,
+        ty = y + 0.03,
+    )
+}
+
 pub fn board_view(
     config: GameConfig,
     players: Vec<PlayerProfile>,
     turn: &Turn,
-    my_id: PlayerId,
+    _my_id: PlayerId,
     on_cell: impl Fn(Pos) + Copy + 'static,
 ) -> impl IntoView {
     let w = config.board_width as usize;
@@ -68,22 +82,10 @@ pub fn board_view(
         ));
     }
 
-    // --- food: little apples ---------------------------------------------
+    // --- food stays emoji, like tac --------------------------------------
     let mut food = String::new();
     for &pos in &turn.food {
-        let (x, y) = (cx(pos), cy(pos));
-        food.push_str(&format!(
-            r##"<circle cx="{x}" cy="{cyb}" r="0.30" fill="#d7263d"/>
-               <circle cx="{hx}" cy="{hy}" r="0.09" fill="#ffffff" opacity="0.55"/>
-               <path d="M {x} {sy} q 0.05 -0.16 0.16 -0.2" stroke="#5d4037" stroke-width="0.06" fill="none" stroke-linecap="round"/>
-               <ellipse cx="{lx}" cy="{ly}" rx="0.11" ry="0.055" fill="#66bb6a" transform="rotate(-30 {lx} {ly})"/>"##,
-            cyb = y + 0.04,
-            hx = x - 0.10,
-            hy = y - 0.06,
-            sy = y - 0.24,
-            lx = x + 0.14,
-            ly = y - 0.30,
-        ));
+        food.push_str(&emoji_text(cx(pos), cy(pos), 0.8, "🎃"));
     }
 
     // --- sneks ------------------------------------------------------------
@@ -99,77 +101,69 @@ pub fn board_view(
             }
         }
 
-        // Body: one rounded polyline through the centres.
+        // Body: one rounded polyline through the centres, starting at the
+        // neck — the head cell holds nothing but the player's emoji.
+        let head = snake[0];
         if path_cells.len() > 1 {
-            let points: String = path_cells
-                .iter()
-                .map(|&p| format!("{},{}", cx(p), cy(p)))
-                .collect::<Vec<_>>()
-                .join(" ");
-            sneks.push_str(&format!(
-                r##"<polyline points="{points}" fill="none" stroke="{colour}" stroke-width="0.72" stroke-linecap="round" stroke-linejoin="round"/>"##
-            ));
-            // Tail taper: a slightly smaller round cap on the last cell.
-            let t = *path_cells.last().unwrap();
-            sneks.push_str(&format!(
-                r##"<circle cx="{}" cy="{}" r="0.30" fill="{colour}"/>"##,
-                cx(t),
-                cy(t)
+            let body = &path_cells[1..];
+            if body.len() == 1 {
+                sneks.push_str(&format!(
+                    r##"<circle cx="{}" cy="{}" r="0.36" fill="{colour}"/>"##,
+                    cx(body[0]),
+                    cy(body[0])
+                ));
+            } else {
+                let points: String = body
+                    .iter()
+                    .map(|&p| format!("{},{}", cx(p), cy(p)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                sneks.push_str(&format!(
+                    r##"<polyline points="{points}" fill="none" stroke="{colour}" stroke-width="0.72" stroke-linecap="round" stroke-linejoin="round"/>"##
+                ));
+                // Tail taper: a slightly smaller round cap on the last cell.
+                let t = *body.last().unwrap();
+                sneks.push_str(&format!(
+                    r##"<circle cx="{}" cy="{}" r="0.30" fill="{colour}"/>"##,
+                    cx(t),
+                    cy(t)
+                ));
+            }
+        }
+
+        // tac-style numbers: health on the second tile…
+        if let Some(&second) = path_cells.get(1) {
+            let hp = turn.health.get(player_id).copied().unwrap_or(0);
+            sneks.push_str(&number_text(cx(second), cy(second), &hp.to_string()));
+        }
+        // …and the count of stacked segments on the butt (growth queued up).
+        let tail_cell = *snake.last().unwrap();
+        let stacked = snake.iter().filter(|&&p| p == tail_cell).count();
+        if stacked > 1
+            && tail_cell != head
+            && path_cells.get(1) != Some(&tail_cell)
+        {
+            sneks.push_str(&number_text(
+                cx(tail_cell),
+                cy(tail_cell),
+                &stacked.to_string(),
             ));
         }
 
-        // Head with eyes looking along the heading.
-        let head = snake[0];
-        let (hx, hy) = (cx(head), cy(head));
-        let (dx, dy) = match path_cells.get(1) {
-            Some(&neck) => {
-                let ddx = cx(head) - cx(neck);
-                let ddy = cy(head) - cy(neck);
-                let len = (ddx * ddx + ddy * ddy).sqrt().max(0.001);
-                (ddx / len, ddy / len)
-            }
-            None => (0.0, -1.0),
-        };
-        let is_me = *player_id == my_id;
-        if is_me {
-            sneks.push_str(&format!(
-                r##"<circle cx="{hx}" cy="{hy}" r="0.52" fill="none" stroke="#ffffff" stroke-width="0.10"/>
-                   <circle cx="{hx}" cy="{hy}" r="0.58" fill="none" stroke="#000000" stroke-width="0.045"/>"##
-            ));
-        }
-        sneks.push_str(&format!(
-            r##"<circle cx="{hx}" cy="{hy}" r="0.44" fill="{colour}"/>"##
-        ));
-        // Tongue, because snek.
-        sneks.push_str(&format!(
-            r##"<path d="M {sx} {sy} l {fx} {fy}" stroke="#e53935" stroke-width="0.07" stroke-linecap="round"/>"##,
-            sx = hx + dx * 0.40,
-            sy = hy + dy * 0.40,
-            fx = dx * 0.22,
-            fy = dy * 0.22,
-        ));
-        // The player's emoji is the face.
+        // The head: just the player's emoji.
         let emoji = emoji_of.get(player_id.as_str()).copied().unwrap_or("🐍");
-        sneks.push_str(&format!(
-            r##"<text x="{hx}" y="{ty}" font-size="0.62" text-anchor="middle" dominant-baseline="central">{emoji}</text>"##,
-            ty = hy + 0.03,
-        ));
+        sneks.push_str(&emoji_text(cx(head), cy(head), 0.8, emoji));
     }
 
-    // --- clash starbursts -------------------------------------------------
+    // --- clashes stay emoji, like tac -------------------------------------
     let mut clashes = String::new();
     for clash in &turn.clashes {
-        let (x, y) = (cx(clash.pos), cy(clash.pos));
-        let mut pts = String::new();
-        for i in 0..16 {
-            let ang = std::f64::consts::PI * 2.0 * i as f64 / 16.0;
-            let r = if i % 2 == 0 { 0.46 } else { 0.20 };
-            pts.push_str(&format!("{},{} ", x + ang.cos() * r, y + ang.sin() * r));
-        }
         clashes.push_str(&format!(
-            r##"<polygon points="{pts}" fill="#b71c1c" opacity="0.85"/>
-               <circle cx="{x}" cy="{y}" r="0.10" fill="#fff176"/>"##
+            r##"<rect x="{x}" y="{y}" width="1" height="1" fill="#d3d3d3" opacity="0.8"/>"##,
+            x = clash.pos as usize % w,
+            y = clash.pos as usize / w,
         ));
+        clashes.push_str(&emoji_text(cx(clash.pos), cy(clash.pos), 0.8, "💀"));
     }
 
     let svg = format!(
