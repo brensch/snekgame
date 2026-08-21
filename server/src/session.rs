@@ -226,10 +226,15 @@ impl SessionActor {
     }
 
     fn publish_info(&self) {
+        // Humans only — presence in the lobby means a live connection, so
+        // this count drops the moment someone leaves and the game disappears
+        // from the list when the last human does (bots don't keep it listed).
+        let humans = self.lobby.len().saturating_sub(self.bots.len());
         self.registry.publish(SessionSummary {
             id: self.name.clone(),
             name: self.display_name(),
-            players: self.lobby.len() as u32,
+            players: humans as u32,
+            bots: self.bots.len() as u32,
             playing: self.game.is_some(),
         });
     }

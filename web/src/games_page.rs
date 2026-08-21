@@ -152,6 +152,8 @@ pub fn home_page() -> impl IntoView {
                                                     <td class="right">
                                                         {s.players}
                                                         {if s.players == 1 { " player" } else { " players" }}
+                                                        {(s.bots > 0)
+                                                            .then(|| format!(" + {} 🤖", s.bots))}
                                                     </td>
                                                     <td class="right">
                                                         {if s.playing { "playing 🐍" } else { "in lobby" }}

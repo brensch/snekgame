@@ -127,6 +127,23 @@ td.right, th.right {
   text-align: right;
 }
 
+td.kick {
+  cursor: pointer;
+  width: 40px;
+}
+
+/* the add-a-bot footer row inside the players table */
+.add-bot-row td {
+  border-bottom: none;
+  padding-top: 10px;
+}
+
+button.mini {
+  font-size: 14px;
+  padding: 5px 10px;
+  margin-right: 6px;
+}
+
 /* --- board ------------------------------------------------------------- */
 
 /* Full-bleed and square: breaks out of the page padding so the board spans

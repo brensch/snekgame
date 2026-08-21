@@ -158,13 +158,6 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
 
     let roster = view! {
         <table>
-            <thead>
-                <tr>
-                    <th>"Player"</th>
-                    <th class="right">"Ready"</th>
-                    <th class="right">"Remove?"</th>
-                </tr>
-            </thead>
             <tbody>
                 {lobby
                     .players
@@ -174,11 +167,10 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                         let id = p.id.clone();
                         view! {
                             <tr style=format!("background: {};", p.colour)>
-                                <td>{p.name.clone()} " " {p.emoji.clone()}</td>
-                                <td class="right">{if ready { "Yeah" } else { "Nah" }}</td>
+                                <td>{p.emoji.clone()} " " {p.name.clone()}</td>
+                                <td class="right">{if ready { "ready" } else { "not ready" }}</td>
                                 <td
-                                    class="right"
-                                    style="cursor: pointer;"
+                                    class="right kick"
                                     on:click=move |_| net::send(&ClientMsg::Kick(id.clone()))
                                 >
                                     "❌"
@@ -187,6 +179,29 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                         }
                     })
                     .collect_view()}
+                <tr class="add-bot-row">
+                    <td colspan="3">
+                        <span class="footnote" style="margin-right: 8px;">"add a bot"</span>
+                        <button
+                            class="mini"
+                            on:click=move |_| net::send(&ClientMsg::AddBot(BotDifficulty::Easy))
+                        >
+                            "🐛 easy"
+                        </button>
+                        <button
+                            class="mini"
+                            on:click=move |_| net::send(&ClientMsg::AddBot(BotDifficulty::Medium))
+                        >
+                            "🤖 medium"
+                        </button>
+                        <button
+                            class="mini"
+                            on:click=move |_| net::send(&ClientMsg::AddBot(BotDifficulty::Hard))
+                        >
+                            "🐲 hard"
+                        </button>
+                    </td>
+                </tr>
             </tbody>
         </table>
     };
@@ -200,31 +215,21 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
             {(i_am_ready && !not_ready.is_empty())
                 .then(|| {
                     view! {
-                        <p style="color: #c00;">"Not ready: " {not_ready.join(", ")}</p>
+                        <p style="color: #c00; margin: 8px 0 0;">
+                            "Waiting on: " {not_ready.join(", ")}
+                        </p>
                     }
                 })}
             {last_game}
-            {config_row}
-            <div class="row" style="margin-top: 2px;">
-                <label style="flex: 0 0 auto; align-self: center;">"Add a bot:"</label>
-                <button on:click=move |_| net::send(&ClientMsg::AddBot(BotDifficulty::Easy))>
-                    "🐛 easy"
-                </button>
-                <button on:click=move |_| net::send(&ClientMsg::AddBot(BotDifficulty::Medium))>
-                    "🤖 medium"
-                </button>
-                <button on:click=move |_| net::send(&ClientMsg::AddBot(BotDifficulty::Hard))>
-                    "🐲 hard"
-                </button>
-            </div>
-            <div class="banner">
-                <b>"Rules"</b>
-                <br />
-                "Steer your snek with swipes, taps, arrows or WASD.\u{00A0}"
-                "Eat 🎃 to grow and refill health; you lose 1 health per turn. "
-                "Walls, bodies and bigger heads kill you. Outlive everyone."
-            </div>
+            <h3 style="margin-top: 24px;">"Players"</h3>
             {roster}
+            <h3 style="margin-top: 24px;">"Settings"</h3>
+            {config_row}
+            <p class="footnote" style="margin-top: 18px;">
+                "Steer with swipes, taps, arrows or WASD. Eat 🎃 to grow and "
+                "refill health; you lose 1 health per turn. Walls, bodies and "
+                "bigger heads kill you. Outlive everyone."
+            </p>
         </div>
     }
 }

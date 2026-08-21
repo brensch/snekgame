@@ -122,6 +122,28 @@ pub fn new_session_id() -> String {
     random_hex(8)
 }
 
+fn session_storage() -> Option<web_sys::Storage> {
+    web_sys::window()?.session_storage().ok()?
+}
+
+/// Remember a session's display name so a rejoin after the server tidied the
+/// empty session away (phone lock, tab sleep) restores it instead of landing
+/// in an "unnamed game".
+pub fn remember_session_name(session_id: &str, name: &str) {
+    if name.is_empty() || name == "unnamed game" {
+        return;
+    }
+    if let Some(s) = session_storage() {
+        let _ = s.set_item(&format!("snek_sname_{session_id}"), name);
+    }
+}
+
+pub fn recall_session_name(session_id: &str) -> Option<String> {
+    session_storage()?
+        .get_item(&format!("snek_sname_{session_id}"))
+        .ok()?
+}
+
 fn load_profile() -> ProfileInfo {
     let s = storage();
     let get = |key: &str| -> Option<String> { s.as_ref()?.get_item(key).ok()? };

@@ -134,12 +134,19 @@ fn open_socket(store: Store, session: String, backoff_ms: u32) {
             if !is_current(generation) {
                 return;
             }
+            // Creating: the pending name. Rejoining: whatever name we last
+            // saw for this session, in case the server tidied it away and
+            // this join is recreating it.
+            let display_name = store
+                .pending_name
+                .get_untracked()
+                .or_else(|| crate::store::recall_session_name(&session));
             send(&ClientMsg::Join {
                 version: PROTOCOL_VERSION,
                 session: session.clone(),
                 secret: crate::store::secret(),
                 profile: store.profile.get_untracked(),
-                display_name: store.pending_name.get_untracked(),
+                display_name,
             });
             store.conn.set(ConnStatus::Connected);
             let mut n = 0u32;
@@ -230,7 +237,12 @@ fn schedule_reconnect(store: Store, generation: u64) {
 fn apply(store: Store, msg: ServerMsg) {
     match msg {
         ServerMsg::Welcome { your_id } => store.me.set(your_id),
-        ServerMsg::Lobby(lobby) => store.lobby.set(Some(lobby)),
+        ServerMsg::Lobby(lobby) => {
+            crate::store::remember_session_name(&lobby.session, &lobby.display_name);
+            // The create-flow name has served its purpose once we're in.
+            store.pending_name.set(None);
+            store.lobby.set(Some(lobby));
+        }
         ServerMsg::GameStart {
             config,
             players,

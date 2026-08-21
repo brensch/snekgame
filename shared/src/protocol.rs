@@ -94,12 +94,15 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Option<T> {
     postcard::from_bytes(bytes).ok()
 }
 
-/// One row of the active-games list (`GET /api/sessions`, JSON).
+/// One row of the active-games list (`GET /api/sessions` + /ws/games).
+/// `players` counts humans only — a game is listed while at least one human
+/// is present, so bot-only lobbies vanish the moment everyone leaves.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
     pub name: String,
     pub players: u32,
+    pub bots: u32,
     pub playing: bool,
 }
 
