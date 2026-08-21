@@ -138,6 +138,10 @@ pub fn app() -> impl IntoView {
         if MODAL_HISTORY.with(|c| c.get()) {
             MODAL_HISTORY.with(|c| c.set(false));
             store.show_profile_editor.set(false);
+        } else {
+            // Back/forward across pushState entries (e.g. the clean "/"
+            // home URL) — sync the route to wherever we landed.
+            read_route();
         }
     });
 
@@ -160,7 +164,26 @@ pub fn app() -> impl IntoView {
                 view! {
                     <div>
                         <div class="topbar">
-                            <a class="brand" href="#/">"snek 🐍"</a>
+                            // Plain "/" home — no stray "#" in the URL.
+                            <a
+                                class="brand"
+                                href="/"
+                                on:click=move |ev: web_sys::MouseEvent| {
+                                    ev.prevent_default();
+                                    if let Some(w) = web_sys::window() {
+                                        if let Ok(h) = w.history() {
+                                            let _ = h.push_state_with_url(
+                                                &JsValue::NULL,
+                                                "",
+                                                Some("/"),
+                                            );
+                                        }
+                                    }
+                                    store.route.set(Route::Home);
+                                }
+                            >
+                                "snek 🐍"
+                            </a>
                             <span style="display: flex; gap: 8px;">
                                 {move || {
                                     if let Route::Session(name) = store.route.get() {
