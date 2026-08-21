@@ -13,9 +13,28 @@ use leptos::prelude::*;
 use snek_shared::protocol::ClientMsg;
 use snek_shared::Dir;
 use std::cell::Cell;
+use wasm_bindgen::JsValue;
 
 thread_local! {
     static TOUCH_START: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
+    /// True while the profile modal has pushed a history entry, so the
+    /// mobile back button/gesture closes the modal instead of navigating.
+    static MODAL_HISTORY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Close the profile editor. If we pushed a history entry when opening, go
+/// back to consume it — popstate then actually closes the modal, so the
+/// history stack never ends up with a stale entry.
+fn close_profile_editor(store: Store) {
+    if MODAL_HISTORY.with(|c| c.get()) {
+        if let Some(w) = web_sys::window() {
+            if let Ok(h) = w.history() {
+                let _ = h.back();
+                return;
+            }
+        }
+    }
+    store.show_profile_editor.set(false);
 }
 
 pub fn app() -> impl IntoView {
@@ -103,6 +122,30 @@ pub fn app() -> impl IntoView {
     if store.profile.get_untracked().name.trim().is_empty() {
         store.show_profile_editor.set(true);
     }
+
+    // Whenever the modal opens, push one history entry so mobile back
+    // closes it; popstate is the single place that actually closes.
+    Effect::new(move |_| {
+        if store.show_profile_editor.get() {
+            MODAL_HISTORY.with(|c| {
+                if !c.get() {
+                    if let Some(w) = web_sys::window() {
+                        if let Ok(h) = w.history() {
+                            if h.push_state(&JsValue::NULL, "").is_ok() {
+                                c.set(true);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    window_event_listener(ev::popstate, move |_| {
+        if MODAL_HISTORY.with(|c| c.get()) {
+            MODAL_HISTORY.with(|c| c.set(false));
+            store.show_profile_editor.set(false);
+        }
+    });
 
     let share_copied = RwSignal::new(false);
     view! {
@@ -221,12 +264,20 @@ fn profile_editor() -> impl IntoView {
         save_profile(&p);
         store.profile.set(p.clone());
         net::send(&ClientMsg::UpdateProfile(p));
-        store.show_profile_editor.set(false);
+        close_profile_editor(store);
     };
 
     view! {
-        <div class="modal-back">
-            <div class="modal">
+        <div
+            class="modal-back"
+            on:click=move |_| {
+                // Tap outside dismisses — unless we still need a name.
+                if !store.profile.get_untracked().name.trim().is_empty() {
+                    close_profile_editor(store);
+                }
+            }
+        >
+            <div class="modal" on:click=move |ev| ev.stop_propagation()>
                 <h3>"Who are you?"</h3>
                 <input
                     type="text"
