@@ -13,17 +13,17 @@ use wasm_bindgen::JsCast;
 const CHECKER_A: &str = "#dcedc8";
 const CHECKER_B: &str = "#cfe6b8";
 
+// Vertical centering uses dy="0.36em" instead of dominant-baseline, which
+// WebKit ignores on SVG <text> — dy is honoured identically everywhere.
 fn emoji_text(x: f64, y: f64, size: f64, glyph: &str) -> String {
     format!(
-        r##"<text x="{x}" y="{ty}" font-size="{size}" text-anchor="middle" dominant-baseline="central">{glyph}</text>"##,
-        ty = y + 0.04,
+        r##"<text x="{x}" y="{y}" dy="0.36em" font-size="{size}" text-anchor="middle">{glyph}</text>"##
     )
 }
 
 fn number_text(x: f64, y: f64, value: &str) -> String {
     format!(
-        r##"<text x="{x}" y="{ty}" font-size="0.44" font-weight="bold" font-family="Courier New, monospace" fill="#000" text-anchor="middle" dominant-baseline="central">{value}</text>"##,
-        ty = y + 0.03,
+        r##"<text x="{x}" y="{y}" dy="0.36em" font-size="0.44" font-weight="bold" font-family="Courier New, monospace" fill="#000" text-anchor="middle">{value}</text>"##
     )
 }
 
