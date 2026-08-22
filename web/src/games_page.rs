@@ -59,25 +59,35 @@ pub fn home_page() -> impl IntoView {
                                         .map(|s| {
                                             let href = format!("#/s/{}", s.id);
                                             view! {
+                                                // Two-line row: big host emoji spans both lines,
+                                                // counts and status stack, Join fills the height.
                                                 <tr>
+                                                    <td class="host-emoji">{s.host_emoji}</td>
                                                     <td>
-                                                        <b>{s.host_emoji} " " {s.host_name} "'s game"</b>
+                                                        <b>{s.host_name} "'s"<br />"game"</b>
                                                     </td>
                                                     <td class="right">
-                                                        {s.players}
-                                                        {if s.players == 1 { " player" } else { " players" }}
+                                                        <div>"🧑 " {s.players}</div>
                                                         {(s.bots > 0)
-                                                            .then(|| format!(" + {} 🤖", s.bots))}
+                                                            .then(|| {
+                                                                view! { <div>"🤖 " {s.bots}</div> }
+                                                            })}
                                                     </td>
                                                     <td class="right">
-                                                        {if s.playing { "playing 🐍" } else { "in lobby" }}
+                                                        "in"<br />
+                                                        {if s.playing { "game" } else { "lobby" }}
                                                     </td>
-                                                    <td class="right">
+                                                    <td class="right join-cell">
                                                         <a href=href>
-                                                            <button style=format!(
-                                                                "background: {};",
-                                                                store.profile.get_untracked().colour,
-                                                            )>"Join"</button>
+                                                            <button
+                                                                class="join"
+                                                                style=format!(
+                                                                    "background: {};",
+                                                                    store.profile.get_untracked().colour,
+                                                                )
+                                                            >
+                                                                "Join"
+                                                            </button>
                                                         </a>
                                                     </td>
                                                 </tr>

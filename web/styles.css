@@ -173,10 +173,30 @@ td.kick {
   width: 40px;
 }
 
-/* home games list: quiet rows, no dividers */
+/* home games list: quiet two-line rows, no dividers */
 table.games td {
   border-bottom: none;
   padding: 8px 8px 8px 0;
+  vertical-align: middle;
+  font-size: 15px;
+}
+
+table.games td.host-emoji {
+  font-size: 36px;
+  line-height: 1;
+  width: 48px;
+  padding-right: 6px;
+}
+
+/* Join hugs the right edge, exactly under Start new game, two lines tall */
+table.games td.join-cell {
+  padding-right: 0;
+  width: 1%;
+  white-space: nowrap;
+}
+
+table.games button.join {
+  height: 58px;
 }
 
 /* players roster: one framed block, uniform 1px separators inside */
