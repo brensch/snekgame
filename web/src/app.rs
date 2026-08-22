@@ -55,17 +55,19 @@ pub fn app() -> impl IntoView {
     let clock = Interval::new(200, move || store.now_ms.set(net::now()));
     clock.forget();
 
-    // --- websocket follows the route --------------------------------------
+    // --- the connection follows the route ---------------------------------
     Effect::new(move |_| {
         let route = store.route.get();
         let profile = store.profile.get();
         match route {
             Route::Session(name) if !profile.name.trim().is_empty() => {
-                net::ensure_connected(store, &name);
+                net::ensure_session(store, &name);
             }
             // Session route with no name: the full-page setup is showing;
             // we simply don't connect until a profile exists.
             Route::Session(_) => {}
+            // Home watches the live games list.
+            Route::Home => net::ensure_watch(store),
             _ => net::disconnect(store),
         }
     });

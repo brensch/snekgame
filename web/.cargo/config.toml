@@ -1,0 +1,3 @@
+# WebTransport bindings in web-sys are gated behind the unstable-APIs cfg.
+[build]
+rustflags = ["--cfg=web_sys_unstable_apis"]

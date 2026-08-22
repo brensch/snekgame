@@ -27,7 +27,13 @@ const CONN_BUFFER: usize = 256;
 /// wipe the lobby) before it is tidied away.
 const EMPTY_GRACE: Duration = Duration::from_secs(60);
 
-pub type Frame = Arc<[u8]>;
+/// Outbound message with its transport class: control frames ride the
+/// reliable stream; snapshots ride (redundant) datagrams and may be dropped.
+#[derive(Clone)]
+pub enum Frame {
+    Control(Arc<[u8]>),
+    Snapshot(Arc<[u8]>),
+}
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -301,7 +307,7 @@ impl SessionActor {
                 // Late joiner while a game runs: catch them up so they can
                 // spectate (or resume, if they are in it).
                 if let Some(game) = &self.game {
-                    let frame = encode_frame(&ServerMsg::GameInProgress {
+                    let frame = control_frame(&ServerMsg::GameInProgress {
                         config: self.config,
                         players: game.players.clone(),
                         turns: game.turns.clone(),
@@ -410,8 +416,10 @@ impl SessionActor {
                 }
             }
             ClientMsg::Ping(n) => {
-                self.send_to(conn_id, encode_frame(&ServerMsg::Pong(n))).await;
+                self.send_to(conn_id, control_frame(&ServerMsg::Pong(n))).await;
             }
+            // Handled at the transport layer before a session exists.
+            ClientMsg::WatchGames => {}
         }
     }
 
@@ -446,7 +454,7 @@ impl SessionActor {
         let mut engine = Engine::new(self.config, ids, seed);
         let first = engine.first_turn();
 
-        let frame = encode_frame(&ServerMsg::GameStart {
+        let frame = control_frame(&ServerMsg::GameStart {
             config: self.config,
             players: players.clone(),
             turn: first.clone(),
@@ -488,7 +496,8 @@ impl SessionActor {
         let over = next.game_over();
         game.turns.push(next.clone());
 
-        self.broadcast(encode_frame(&ServerMsg::Turn(next))).await;
+        // Snapshots are datagram-class: unreliable, redundant, single-packet.
+        self.broadcast(Frame::Snapshot(encode(&ServerMsg::Turn(next)).into())).await;
 
         if over {
             self.finish_game().await;
@@ -526,7 +535,7 @@ impl SessionActor {
         match saved {
             Ok(Ok(id)) => {
                 self.last_game_id = Some(id);
-                self.broadcast(encode_frame(&ServerMsg::GameSaved { id })).await;
+                self.broadcast(control_frame(&ServerMsg::GameSaved { id })).await;
             }
             Ok(Err(e)) => tracing::error!("failed to save game: {e}"),
             Err(e) => tracing::error!("save task panicked: {e}"),
@@ -546,7 +555,7 @@ impl SessionActor {
             last_game_id: self.last_game_id,
         };
         self.publish_info();
-        self.broadcast(encode_frame(&ServerMsg::Lobby(state))).await;
+        self.broadcast(control_frame(&ServerMsg::Lobby(state))).await;
     }
 
     /// Send a pre-encoded frame to every connection; drop connections whose
@@ -573,8 +582,8 @@ impl SessionActor {
     }
 }
 
-fn encode_frame(msg: &ServerMsg) -> Frame {
-    encode(msg).into()
+fn control_frame(msg: &ServerMsg) -> Frame {
+    Frame::Control(encode(msg).into())
 }
 
 /// Per-connection outbound channel, sized so a healthy client never blocks

@@ -1,103 +1,20 @@
 //! The home screen: live games to join (paginated), or start your own —
 //! named in one flow, with the URL carrying only an opaque session id.
-//! The list is pushed by the server over /ws/games the moment it changes.
+//! The list is pushed by the server over WebTransport the moment it changes
+//! (the route effect in app.rs opens the watch connection).
 
 use crate::palette;
 use crate::store::{new_session_id, Store};
 use leptos::prelude::*;
 use snek_shared::protocol::SessionSummary;
-use std::cell::{Cell, RefCell};
-use wasm_bindgen::closure::Closure;
-use wasm_bindgen::{JsCast, JsValue};
 
 const PAGE_SIZE: usize = 6;
 
-thread_local! {
-    /// Generation guard for the watch socket: bumping it orphans any
-    /// callbacks still attached to an older socket.
-    static WATCH_GEN: Cell<u64> = const { Cell::new(0) };
-    static WATCH_WS: RefCell<Option<web_sys::WebSocket>> = const { RefCell::new(None) };
-}
-
-fn watch_url() -> String {
-    let loc = web_sys::window().unwrap().location();
-    let proto = if loc.protocol().unwrap_or_default() == "https:" { "wss" } else { "ws" };
-    format!("{proto}://{}/ws/games", loc.host().unwrap_or_default())
-}
-
-/// Open (or re-open) the live games feed. The server pushes the full list on
-/// connect and again whenever it changes; on drop we retry every 2s while
-/// the home page is still the active generation.
-fn open_games_watch(sessions: RwSignal<Option<Vec<SessionSummary>>>) {
-    let generation = WATCH_GEN.with(|g| {
-        g.set(g.get() + 1);
-        g.get()
-    });
-    connect_games_watch(generation, sessions);
-}
-
-fn close_games_watch() {
-    WATCH_GEN.with(|g| g.set(g.get() + 1));
-    WATCH_WS.with(|w| {
-        if let Some(ws) = w.borrow_mut().take() {
-            let _ = ws.close();
-        }
-    });
-}
-
-fn connect_games_watch(generation: u64, sessions: RwSignal<Option<Vec<SessionSummary>>>) {
-    let current = move || WATCH_GEN.with(|g| g.get()) == generation;
-    if !current() {
-        return;
-    }
-    let Ok(ws) = web_sys::WebSocket::new(&watch_url()) else {
-        schedule_watch_retry(generation, sessions);
-        return;
-    };
-    ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
-
-    let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
-        move |ev: web_sys::MessageEvent| {
-            if !current() {
-                return;
-            }
-            let Ok(buf) = ev.data().dyn_into::<js_sys::ArrayBuffer>() else {
-                return;
-            };
-            let bytes = js_sys::Uint8Array::new(&buf).to_vec();
-            if let Ok(list) = postcard::from_bytes::<Vec<SessionSummary>>(&bytes) {
-                sessions.set(Some(list));
-            }
-        },
-    );
-    ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    on_message.forget();
-
-    let on_close = Closure::<dyn FnMut(JsValue)>::new(move |_| {
-        schedule_watch_retry(generation, sessions);
-    });
-    ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
-    ws.set_onerror(Some(on_close.as_ref().unchecked_ref()));
-    on_close.forget();
-
-    WATCH_WS.with(|w| *w.borrow_mut() = Some(ws));
-}
-
-fn schedule_watch_retry(generation: u64, sessions: RwSignal<Option<Vec<SessionSummary>>>) {
-    gloo_timers::callback::Timeout::new(2000, move || {
-        connect_games_watch(generation, sessions);
-    })
-    .forget();
-}
-
 pub fn home_page() -> impl IntoView {
     let store = Store::use_store();
-    let sessions = RwSignal::new(Option::<Vec<SessionSummary>>::None);
+    let sessions = store.sessions;
     let page = RwSignal::new(0usize);
     let new_name = RwSignal::new(String::new());
-
-    open_games_watch(sessions);
-    on_cleanup(close_games_watch);
 
     let create = move || {
         let name = new_name.get_untracked().trim().to_string();

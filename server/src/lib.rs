@@ -1,6 +1,6 @@
 pub mod db;
 pub mod session;
-pub mod ws;
+pub mod wt;
 
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, StatusCode, Uri};
@@ -25,64 +25,28 @@ pub struct AppState {
     pub db: Arc<Db>,
 }
 
-pub fn build_app(db_path: &Path) -> Router {
+/// Build the HTTP app (static frontend + read-only APIs) and the shared
+/// session registry that the WebTransport endpoint plugs into.
+pub fn build(db_path: &Path) -> (Router, Registry) {
     let db = Arc::new(Db::open(db_path).expect("failed to open sqlite db"));
+    let registry = Registry::new(db.clone());
     let state = AppState {
-        registry: Registry::new(db.clone()),
+        registry: registry.clone(),
         db,
     };
-    Router::new()
-        .route("/ws", get(ws_route))
-        .route("/ws/games", get(games_watch))
+    let router = Router::new()
         .route("/api/sessions", get(session_list))
         .route("/api/history", get(history_list))
         .route("/api/history/{id}", get(history_game))
         .route("/api/history/{id}/meta", get(history_meta))
         .fallback(static_handler)
-        .with_state(state)
+        .with_state(state);
+    (router, registry)
 }
 
 /// Active games (someone in the lobby or playing right now).
 async fn session_list(State(state): State<AppState>) -> Response {
     Json(state.registry.active_sessions()).into_response()
-}
-
-/// Push-updated active-games list: sends the current list on connect and a
-/// fresh postcard frame every time it changes.
-async fn games_watch(
-    ws: axum::extract::ws::WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> Response {
-    use axum::extract::ws::Message;
-    ws.on_upgrade(move |mut sock| async move {
-        let mut rx = state.registry.watch_games();
-        loop {
-            let list = rx.borrow_and_update().clone();
-            let frame = postcard::to_allocvec(&list).unwrap();
-            if sock.send(Message::Binary(frame.into())).await.is_err() {
-                break;
-            }
-            tokio::select! {
-                changed = rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                }
-                msg = sock.recv() => match msg {
-                    None | Some(Err(_)) => break,
-                    Some(Ok(Message::Close(_))) => break,
-                    _ => {}
-                },
-            }
-        }
-    })
-}
-
-async fn ws_route(
-    ws: axum::extract::ws::WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> Response {
-    ws::ws_handler(ws, State(state.registry)).await
 }
 
 async fn history_list(State(state): State<AppState>) -> Response {

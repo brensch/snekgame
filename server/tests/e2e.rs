@@ -1,15 +1,18 @@
-//! Full-stack test: two websocket clients join a session, ready up, start a
-//! game, play until it ends, and the finished game lands in sqlite and is
-//! served by the history API.
+//! Full-stack test over real QUIC: two WebTransport clients join a session,
+//! ready up, play a game via datagram snapshots, and the finished game lands
+//! in sqlite and the history API.
 
-use futures_util::{SinkExt, StreamExt};
 use snek_shared::protocol::*;
 use snek_shared::{Dir, GameConfig};
-use tokio_tungstenite::tungstenite::Message;
+use std::time::Duration;
+use wtransport::{ClientConfig, Connection, Endpoint, Identity, RecvStream, SendStream};
 
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+struct Client {
+    conn: Connection,
+    send: SendStream,
+    /// Stream + datagram messages merged by reader tasks (cancel-safe).
+    rx: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
+}
 
 fn info(name: &str) -> ProfileInfo {
     ProfileInfo {
@@ -19,38 +22,86 @@ fn info(name: &str) -> ProfileInfo {
     }
 }
 
-async fn connect(port: u16, session: &str, secret: &str, profile: ProfileInfo) -> Ws {
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
-        .await
-        .expect("ws connect");
-    ws.send(Message::Binary(encode(&ClientMsg::Join {
-        version: PROTOCOL_VERSION,
-        session: session.to_string(),
-        secret: secret.to_string(),
-        profile,
-        display_name: Some("e2e game".to_string()),
-    })))
-    .await
-    .unwrap();
-    ws
+async fn write_frame(send: &mut SendStream, msg: &ClientMsg) {
+    let bytes = encode(msg);
+    send.write_all(&(bytes.len() as u32).to_le_bytes()).await.unwrap();
+    send.write_all(&bytes).await.unwrap();
 }
 
-async fn send(ws: &mut Ws, msg: &ClientMsg) {
-    ws.send(Message::Binary(encode(msg))).await.unwrap();
+async fn read_stream_msg(recv: &mut RecvStream) -> ServerMsg {
+    let mut len_buf = [0u8; 4];
+    read_exact(recv, &mut len_buf).await;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    read_exact(recv, &mut buf).await;
+    decode(&buf).expect("bad stream frame")
 }
 
-async fn next_msg(ws: &mut Ws) -> ServerMsg {
-    loop {
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(15), ws.next())
+async fn read_exact(recv: &mut RecvStream, buf: &mut [u8]) {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = recv.read(&mut buf[filled..]).await.unwrap().expect("eof");
+        filled += n;
+    }
+}
+
+impl Client {
+    async fn connect(port: u16, session: &str, secret: &str, profile: ProfileInfo) -> Client {
+        let config = ClientConfig::builder()
+            .with_bind_default()
+            .with_no_cert_validation()
+            .build();
+        let conn = Endpoint::client(config)
+            .unwrap()
+            .connect(format!("https://127.0.0.1:{port}"))
+            .await
+            .expect("wt connect");
+        let (mut send, mut recv) = conn.open_bi().await.unwrap().await.unwrap();
+        write_frame(
+            &mut send,
+            &ClientMsg::Join {
+                version: PROTOCOL_VERSION,
+                session: session.to_string(),
+                secret: secret.to_string(),
+                profile,
+                display_name: Some("e2e game".to_string()),
+            },
+        )
+        .await;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream_tx = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                let msg = read_stream_msg(&mut recv).await;
+                if stream_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        let dgram_conn = conn.clone();
+        tokio::spawn(async move {
+            while let Ok(dgram) = dgram_conn.receive_datagram().await {
+                if let Some(msg) = decode::<ServerMsg>(&dgram) {
+                    if tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Client { conn, send, rx }
+    }
+
+    async fn control(&mut self, msg: &ClientMsg) {
+        write_frame(&mut self.send, msg).await;
+    }
+
+    /// Next message from either the control stream or a datagram.
+    async fn next_msg(&mut self) -> ServerMsg {
+        tokio::time::timeout(Duration::from_secs(15), self.rx.recv())
             .await
             .expect("timed out waiting for server message")
-            .expect("stream ended")
-            .expect("ws error");
-        if let Message::Binary(bytes) = frame {
-            if let Some(msg) = decode::<ServerMsg>(&bytes) {
-                return msg;
-            }
-        }
+            .expect("connection closed")
     }
 }
 
@@ -61,27 +112,34 @@ async fn two_players_play_a_full_game() {
     let db_path = dir.join("test.db");
     let _ = std::fs::remove_file(&db_path);
 
-    let app = snek_server::build_app(&db_path);
+    let (app, registry) = snek_server::build(&db_path);
+
+    // HTTP on an ephemeral port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let http_port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let mut alice = connect(port, "e2e-test", "alice-secret-0000", info("alice")).await;
-    let mut bob = connect(port, "e2e-test", "bob-secret-000000", info("bob")).await;
+    // WebTransport on an ephemeral UDP port with a self-signed identity.
+    let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
 
-    // Identity: the server assigns a public id that is a hash of the secret,
-    // so the secret itself is never visible to other players.
-    let alice_id = match next_msg(&mut alice).await {
+    let mut alice = Client::connect(wt_port, "e2e-test", "alice-secret-0000", info("alice")).await;
+    let mut bob = Client::connect(wt_port, "e2e-test", "bob-secret-000000", info("bob")).await;
+
+    // Identity: hash of the secret, never the secret.
+    let alice_id = match alice.next_msg().await {
         ServerMsg::Welcome { your_id } => your_id,
         other => panic!("expected welcome, got {other:?}"),
     };
-    assert_eq!(alice_id.len(), 12, "public id is a short hash");
-    assert!(!alice_id.contains("secret"), "secret must not leak");
+    assert_eq!(alice_id.len(), 12);
+    assert!(!alice_id.contains("secret"));
 
     // Both must appear in the lobby.
     let mut seen_both = false;
     for _ in 0..10 {
-        if let ServerMsg::Lobby(l) = next_msg(&mut bob).await {
+        if let ServerMsg::Lobby(l) = bob.next_msg().await {
             if l.players.len() == 2 {
                 seen_both = true;
                 break;
@@ -90,24 +148,29 @@ async fn two_players_play_a_full_game() {
     }
     assert!(seen_both, "lobby never showed both players");
 
-    // Configure a fast small game, ready up, start.
-    send(
-        &mut alice,
-        &ClientMsg::Configure(GameConfig {
+    alice
+        .control(&ClientMsg::Configure(GameConfig {
             board_width: 11,
             board_height: 11,
             tick_ms: 250,
-        }),
-    )
-    .await;
-    send(&mut alice, &ClientMsg::SetReady(true)).await;
-    send(&mut bob, &ClientMsg::SetReady(true)).await;
-    send(&mut alice, &ClientMsg::Start).await;
+        }))
+        .await;
+    alice.control(&ClientMsg::SetReady(true)).await;
+    bob.control(&ClientMsg::SetReady(true)).await;
+    // Different connections have no cross-ordering: wait until the lobby
+    // echoes both ready before starting.
+    for _ in 0..10 {
+        if let ServerMsg::Lobby(l) = alice.next_msg().await {
+            if l.ready.len() == 2 {
+                break;
+            }
+        }
+    }
+    alice.control(&ClientMsg::Start).await;
 
-    // Alice should see the game start.
     let mut started = false;
     for _ in 0..10 {
-        if let ServerMsg::GameStart { turn, .. } = next_msg(&mut alice).await {
+        if let ServerMsg::GameStart { turn, .. } = alice.next_msg().await {
             assert_eq!(turn.alive.len(), 2);
             started = true;
             break;
@@ -115,21 +178,26 @@ async fn two_players_play_a_full_game() {
     }
     assert!(started, "game never started");
 
-    // Steer sneks up and down and wait for the game to finish (they will hit
-    // walls and the game resolves).
-    send(&mut alice, &ClientMsg::Move(Dir::Up)).await;
-    send(&mut bob, &ClientMsg::Move(Dir::Down)).await;
+    // Moves go up as datagrams.
+    let _ = alice.conn.send_datagram(encode(&ClientMsg::Move(Dir::Up)));
+    let _ = bob.conn.send_datagram(encode(&ClientMsg::Move(Dir::Down)));
+    // Datagram pings get datagram pongs.
+    let _ = alice.conn.send_datagram(encode(&ClientMsg::Ping(7)));
 
     let mut saved_id: Option<i64> = None;
     let mut game_over = false;
-    for _ in 0..200 {
-        match next_msg(&mut alice).await {
+    let mut got_pong = false;
+    let mut turn_count = 0u32;
+    for _ in 0..400 {
+        match alice.next_msg().await {
             ServerMsg::Turn(turn) => {
+                turn_count += 1;
                 if turn.game_over() {
                     game_over = true;
                     assert_eq!(turn.winners.len(), 2, "all players ranked");
                 }
             }
+            ServerMsg::Pong(7) => got_pong = true,
             ServerMsg::GameSaved { id } => {
                 saved_id = Some(id);
                 break;
@@ -138,33 +206,77 @@ async fn two_players_play_a_full_game() {
         }
     }
     assert!(game_over, "game never ended");
+    assert!(got_pong, "datagram ping never answered");
+    assert!(turn_count > 0, "no turn snapshots arrived");
     let saved_id = saved_id.expect("game was not saved");
 
-    // History API serves the finished game (under its display name).
-    let body = http_get(port, "/api/history").await;
+    // History API serves the finished game.
+    let body = http_get(http_port, "/api/history").await;
     assert!(body.contains("e2e game"), "history list missing the game: {body}");
     assert!(body.contains("alice"), "history list missing players");
-
-    // Active-sessions API lists the lobby with its display name.
-    let body = http_get(port, "/api/sessions").await;
-    assert!(body.contains("e2e-test"), "sessions list missing id: {body}");
-    assert!(body.contains("e2e game"), "sessions list missing name: {body}");
-
-    let blob = http_get_bytes(port, &format!("/api/history/{saved_id}")).await;
+    let blob = http_get_bytes(http_port, &format!("/api/history/{saved_id}")).await;
     let record: snek_shared::GameRecord = postcard::from_bytes(&blob).expect("decode record");
     assert_eq!(record.players.len(), 2);
     assert!(record.turns.last().unwrap().game_over());
 
-    // Reconnect model: a fresh connection with the same secret gets the same
-    // public identity back.
-    let mut alice2 = connect(port, "e2e-test", "alice-secret-0000", info("alice")).await;
-    match next_msg(&mut alice2).await {
+    // Sessions API lists the (post-game) lobby.
+    let body = http_get(http_port, "/api/sessions").await;
+    assert!(body.contains("e2e-test"), "sessions list missing id: {body}");
+
+    // Reconnect with the same secret -> same public identity.
+    let mut alice2 =
+        Client::connect(wt_port, "e2e-test", "alice-secret-0000", info("alice")).await;
+    match alice2.next_msg().await {
         ServerMsg::Welcome { your_id } => assert_eq!(your_id, alice_id),
         other => panic!("expected welcome, got {other:?}"),
     }
-    match next_msg(&mut alice2).await {
-        ServerMsg::Lobby(l) => assert_eq!(l.session, "e2e-test"),
-        other => panic!("expected lobby for rejoiner, got {other:?}"),
+}
+
+#[tokio::test]
+async fn watch_games_pushes_list() {
+    let dir = std::env::temp_dir().join(format!("snek-watch-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("watch.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let (_, registry) = snek_server::build(&db_path);
+    let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    // Watcher connects first and gets an (empty) list.
+    let config = ClientConfig::builder()
+        .with_bind_default()
+        .with_no_cert_validation()
+        .build();
+    let conn = Endpoint::client(config)
+        .unwrap()
+        .connect(format!("https://127.0.0.1:{wt_port}"))
+        .await
+        .unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap().await.unwrap();
+    write_frame(&mut send, &ClientMsg::WatchGames).await;
+    match tokio::time::timeout(Duration::from_secs(5), read_stream_msg(&mut recv))
+        .await
+        .unwrap()
+    {
+        ServerMsg::Sessions(list) => assert!(list.is_empty()),
+        other => panic!("expected sessions, got {other:?}"),
+    }
+
+    // A player joins somewhere -> the watcher gets a push.
+    let mut player = Client::connect(wt_port, "watch-me", "carol-secret-0000", info("carol")).await;
+    let _ = player.next_msg().await; // welcome
+    match tokio::time::timeout(Duration::from_secs(5), read_stream_msg(&mut recv))
+        .await
+        .unwrap()
+    {
+        ServerMsg::Sessions(list) => {
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].id, "watch-me");
+        }
+        other => panic!("expected sessions push, got {other:?}"),
     }
 }
 

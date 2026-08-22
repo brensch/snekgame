@@ -1,13 +1,23 @@
-//! The wire protocol: postcard-encoded messages over websocket binary frames.
+//! The wire protocol: postcard-encoded messages over WebTransport (QUIC).
 //! Both sides share these exact types, so there is no schema drift and no
 //! JSON overhead.
+//!
+//! Transport mapping:
+//! - **Datagrams** (unreliable, unordered, single-packet): `Turn` snapshots
+//!   going down; `Move` and `Ping` going up. Every snapshot is full state
+//!   and sequence-numbered by turn, so loss and reordering are harmless —
+//!   the newest one always heals the picture. Senders repeat datagrams for
+//!   redundancy; receivers dedup.
+//! - **One bidirectional control stream** (reliable, ordered): everything
+//!   else — join, lobby traffic, game start/end, full-state catch-ups.
+//!   Frames on the stream are u32-le length-prefixed postcard.
 
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// The client-editable part of a profile. The public player id is derived
 /// server-side (a hash of the client's private secret), so a client can never
@@ -43,6 +53,9 @@ pub enum ClientMsg {
     /// Remove a player (or bot) from the lobby (anyone can kick, like tac).
     Kick(PlayerId),
     Ping(u32),
+    /// Alternative first message: subscribe to the active-games list
+    /// instead of joining a session (used by the home screen).
+    WatchGames,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -82,6 +95,8 @@ pub enum ServerMsg {
     },
     /// The finished game was written to history under this id.
     GameSaved { id: i64 },
+    /// Active-games list push (for WatchGames subscribers).
+    Sessions(Vec<SessionSummary>),
     Error(String),
     Pong(u32),
 }

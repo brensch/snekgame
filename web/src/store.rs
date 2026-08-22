@@ -1,7 +1,7 @@
 //! Global reactive state + the player's persistent identity (localStorage).
 
 use leptos::prelude::*;
-use snek_shared::protocol::{LobbyState, ProfileInfo};
+use snek_shared::protocol::{LobbyState, ProfileInfo, SessionSummary};
 use snek_shared::{Dir, GameConfig, PlayerId, PlayerProfile, Turn};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,6 +38,8 @@ pub struct Store {
     pub show_profile_editor: RwSignal<bool>,
     pub conn: RwSignal<ConnStatus>,
     pub lobby: RwSignal<Option<LobbyState>>,
+    /// Live games list, pushed by the server while watching (home screen).
+    pub sessions: RwSignal<Option<Vec<SessionSummary>>>,
     pub game: RwSignal<Option<GameView>>,
     /// History scrubber position when reviewing a finished game (None = live).
     pub view_turn: RwSignal<Option<usize>>,
@@ -63,6 +65,7 @@ impl Store {
             show_profile_editor: RwSignal::new(false),
             conn: RwSignal::new(ConnStatus::Idle),
             lobby: RwSignal::new(None),
+            sessions: RwSignal::new(None),
             game: RwSignal::new(None),
             view_turn: RwSignal::new(None),
             selected_dir: RwSignal::new(None),
