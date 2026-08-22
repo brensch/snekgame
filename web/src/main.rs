@@ -1,5 +1,6 @@
 mod app;
 mod board;
+mod compute_page;
 mod games_page;
 mod history_page;
 mod net;

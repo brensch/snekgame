@@ -10,6 +10,7 @@ pub enum Route {
     Session(String),
     History,
     Replay(i64),
+    Compute,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,8 +51,6 @@ pub struct Store {
     pub saved_id: RwSignal<Option<i64>>,
     /// performance-now ms when the pre-game countdown ends.
     pub countdown_ends: RwSignal<f64>,
-    /// Per-device compute contributions of the finished game.
-    pub compute_stats: RwSignal<Vec<snek_shared::protocol::ComputeStat>>,
     /// Coarse clock for countdown display, ticked by an interval.
     pub now_ms: RwSignal<f64>,
     pub error: RwSignal<Option<String>>,
@@ -73,7 +72,6 @@ impl Store {
             selected_dir: RwSignal::new(None),
             saved_id: RwSignal::new(None),
             countdown_ends: RwSignal::new(0.0),
-            compute_stats: RwSignal::new(Vec::new()),
             now_ms: RwSignal::new(0.0),
             error: RwSignal::new(None),
         }

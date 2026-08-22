@@ -140,6 +140,9 @@ pub fn home_page() -> impl IntoView {
             <p style="margin-top: 24px;">
                 <a href="#/history">"Game history →"</a>
             </p>
+            <p>
+                <a href="#/compute">"The compute grid →"</a>
+            </p>
 
             <div style="margin-top: 40px;">
                 <p>"* no toes involved"</p>

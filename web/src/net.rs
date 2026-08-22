@@ -586,7 +586,6 @@ fn apply(store: Store, msg: ServerMsg) {
             countdown_ms,
         } => {
             store.saved_id.set(None);
-            store.compute_stats.set(Vec::new());
             store.view_turn.set(None);
             store.countdown_ends.set(now() + countdown_ms as f64);
             // Pre-select the clockwise default heading on the d-pad.
@@ -648,10 +647,7 @@ fn apply(store: Store, msg: ServerMsg) {
                 send(&ClientMsg::BotMove { request_id, dir, proof, elapsed_ms });
             });
         }
-        ServerMsg::GameSaved { id, compute } => {
-            store.saved_id.set(Some(id));
-            store.compute_stats.set(compute);
-        }
+        ServerMsg::GameSaved { id, .. } => store.saved_id.set(Some(id)),
         ServerMsg::Error(e) => store.error.set(Some(e)),
         ServerMsg::Pong(_) => {}
     }

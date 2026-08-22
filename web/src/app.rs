@@ -1,6 +1,7 @@
 //! App shell: hash routing, home page, profile editor, global inputs
 //! (keyboard + swipe), and the websocket lifecycle tied to the route.
 
+use crate::compute_page::compute_page;
 use crate::games_page::home_page;
 use crate::history_page::{history_page, replay_page};
 use crate::net;
@@ -236,6 +237,7 @@ pub fn app() -> impl IntoView {
                             Route::Session(name) => session_page(name).into_any(),
                             Route::History => history_page().into_any(),
                             Route::Replay(id) => replay_page(id).into_any(),
+                            Route::Compute => compute_page().into_any(),
                         }}
                         {move || store.show_profile_editor.get().then(profile_editor)}
                     </div>
@@ -286,6 +288,7 @@ fn parse_hash(hash: &str) -> Route {
         [] | ["games"] => Route::Home,
         ["s", name] => Route::Session(normalize_word(name)),
         ["history"] => Route::History,
+        ["compute"] => Route::Compute,
         ["history", id] => id
             .parse()
             .map(Route::Replay)

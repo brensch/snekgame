@@ -431,6 +431,25 @@ button.mini {
   color: #fff;
 }
 
+/* compute grid stat tiles */
+.stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.stat {
+  border: 2px solid #000;
+  padding: 12px;
+}
+
+.stat-value {
+  font-size: 28px;
+  font-weight: bold;
+  line-height: 1.1;
+}
+
 tr.clickable {
   cursor: pointer;
 }

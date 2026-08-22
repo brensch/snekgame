@@ -2,7 +2,7 @@
 //! are written here once, on completion.
 
 use rusqlite::{params, Connection};
-use snek_shared::protocol::{HistoryEntry, HistoryPage};
+use snek_shared::protocol::{ComputeDonor, ComputeOverview, ComputeTotals, HistoryEntry, HistoryPage};
 use snek_shared::{GameRecord, PlayerProfile, Winner};
 use std::path::Path;
 use std::sync::Mutex;
@@ -149,6 +149,52 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+    /// All-time compute stats. One scan of compute_stats (a row per host per
+    /// game — thousands of rows even after years), so no indexes needed.
+    pub fn compute_overview(&self) -> rusqlite::Result<ComputeOverview> {
+        let conn = self.conn.lock().unwrap();
+        let totals = conn.query_row(
+            "SELECT COUNT(DISTINCT player_id || '|' || device),
+                    COUNT(DISTINCT game_id),
+                    COALESCE(SUM(moves), 0),
+                    COALESCE(SUM(total_sims), 0),
+                    COALESCE(SUM(total_wall_ms), 0)
+             FROM compute_stats",
+            [],
+            |r| {
+                Ok(ComputeTotals {
+                    devices: r.get(0)?,
+                    games: r.get(1)?,
+                    moves: r.get::<_, i64>(2)? as u64,
+                    sims: r.get::<_, i64>(3)? as u64,
+                    wall_ms: r.get::<_, i64>(4)? as u64,
+                })
+            },
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT name, device, COUNT(DISTINCT game_id), SUM(moves),
+                    SUM(total_sims), SUM(total_wall_ms), MAX(benchmark_sims_per_sec)
+             FROM compute_stats
+             GROUP BY player_id, device
+             ORDER BY SUM(total_sims) DESC
+             LIMIT 50",
+        )?;
+        let donors = stmt
+            .query_map([], |r| {
+                Ok(ComputeDonor {
+                    name: r.get(0)?,
+                    device: r.get(1)?,
+                    games: r.get(2)?,
+                    moves: r.get::<_, i64>(3)? as u64,
+                    sims: r.get::<_, i64>(4)? as u64,
+                    wall_ms: r.get::<_, i64>(5)? as u64,
+                    best_benchmark: r.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ComputeOverview { totals, donors })
     }
 
     pub fn get_game_meta(&self, id: i64) -> rusqlite::Result<Option<HistoryEntry>> {

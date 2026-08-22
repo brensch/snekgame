@@ -166,6 +166,34 @@ pub struct ComputeStat {
     pub wall_ms: u64,
 }
 
+/// All-time client-compute statistics (JSON, /api/compute).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComputeOverview {
+    pub totals: ComputeTotals,
+    /// Grouped by player + device, biggest contributors first.
+    pub donors: Vec<ComputeDonor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComputeTotals {
+    pub devices: u32,
+    pub games: u32,
+    pub moves: u64,
+    pub sims: u64,
+    pub wall_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComputeDonor {
+    pub name: String,
+    pub device: String,
+    pub games: u32,
+    pub moves: u64,
+    pub sims: u64,
+    pub wall_ms: u64,
+    pub best_benchmark: u32,
+}
+
 /// One page of history. `next` is the keyset cursor for the next (older)
 /// page: pass it back as ?before=.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

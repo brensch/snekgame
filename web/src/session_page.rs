@@ -421,49 +421,6 @@ fn game_view(game: GameView) -> impl IntoView {
                 <table class="players">
                     <tbody>{rows}</tbody>
                 </table>
-                {move || {
-                    let stats = store.compute_stats.get();
-                    (!stats.is_empty())
-                        .then(|| {
-                            view! {
-                                <h3 style="margin-top: 18px;">"🧠 bot compute"</h3>
-                                <table class="players">
-                                    <tbody>
-                                        {stats
-                                            .into_iter()
-                                            .map(|c| {
-                                                let rate = if c.wall_ms > 0 {
-                                                    format!(
-                                                        "{}k sims/s",
-                                                        c.sims * 1000 / c.wall_ms / 1000,
-                                                    )
-                                                } else {
-                                                    "—".to_string()
-                                                };
-                                                view! {
-                                                    <tr>
-                                                        <td>
-                                                            {c.name}
-                                                            <br />
-                                                            <span class="footnote">{c.device}</span>
-                                                        </td>
-                                                        <td class="right">
-                                                            {c.moves} " moves"
-                                                            <br />
-                                                            <span class="footnote">
-                                                                {format!("{:.1}M sims · ", c.sims as f64 / 1e6)}
-                                                                {rate}
-                                                            </span>
-                                                        </td>
-                                                    </tr>
-                                                }
-                                            })
-                                            .collect_view()}
-                                    </tbody>
-                                </table>
-                            }
-                        })
-                }}
                 <p class="footnote">"Drag to replay:"</p>
                 {scrub}
                 <button

@@ -36,6 +36,7 @@ pub fn build(db_path: &Path) -> (Router, Registry) {
     };
     let router = Router::new()
         .route("/api/sessions", get(session_list))
+        .route("/api/compute", get(compute_overview))
         .route("/api/history", get(history_list))
         .route("/api/history/{id}", get(history_game))
         .route("/api/history/{id}/meta", get(history_meta))
@@ -61,6 +62,15 @@ async fn history_list(
     let db = state.db.clone();
     match tokio::task::spawn_blocking(move || db.list_games(before, limit)).await {
         Ok(Ok(page)) => Json(page).into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// All-time client-compute statistics.
+async fn compute_overview(State(state): State<AppState>) -> Response {
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.compute_overview()).await {
+        Ok(Ok(overview)) => Json(overview).into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
