@@ -16,11 +16,15 @@ pub fn session_page(_session: String) -> impl IntoView {
 
     view! {
         <div>
-            {move || match store.conn.get() {
-                ConnStatus::Reconnecting | ConnStatus::Connecting => Some(view! {
-                    <div class="banner error">"🕊️ carrier pigeons can't find you"</div>
-                }),
-                _ => None,
+            {move || {
+                // Fresh joins show the quiet "Joining session…" body below;
+                // the pigeons are reserved for genuinely lost connections.
+                (store.conn.get() == ConnStatus::Reconnecting)
+                    .then(|| {
+                        view! {
+                            <div class="banner error">"🕊️ carrier pigeons can't find you"</div>
+                        }
+                    })
             }}
             {move || {
                 if let Some(game) = store.game.get() {

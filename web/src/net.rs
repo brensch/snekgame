@@ -106,6 +106,9 @@ fn ensure(store: Store, mode: Mode) {
         }
     });
     if mode_changed {
+        // A navigation, not a reconnect: fresh joins must not flash the
+        // reconnect banner just because the previous mode was connected.
+        store.conn.set(ConnStatus::Connecting);
         // Session-scoped state must not leak between sessions (or linger
         // after going home) — a stale game would freeze over the new lobby.
         store.lobby.set(None);
@@ -129,8 +132,9 @@ pub fn nudge(store: Store) {
         match &mut *a {
             Some(conn) => {
                 conn.backoff_ms = BACKOFF_START_MS;
-                // A transport that looks connected but has gone silent is a
-                // zombie (suspended tabs often never fire `closed`).
+                // A transport that looks fine but has gone silent is a
+                // zombie (suspended tabs often never fire `closed`), and a
+                // connect/join that never completes is a hang.
                 let unhealthy = conn.transport.is_none()
                     || store.conn.get_untracked() != ConnStatus::Connected
                     || is_stale();
@@ -144,11 +148,13 @@ pub fn nudge(store: Store) {
     }
 }
 
-/// Watchdog (driven by the shared clock while the tab is visible): a
-/// connection that claims Connected but has gone silent gets reopened.
-/// Connecting/reconnecting states are left to the backoff machinery.
+/// Watchdog (driven by the shared clock while the tab is visible): any
+/// non-idle connection that has been silent past the staleness window gets
+/// reopened — zombie "Connected" transports and stalled connect/join
+/// cycles alike. Every reopen resets the clock, so healthy attempts are
+/// never interrupted.
 pub fn check_liveness(store: Store) {
-    if store.conn.get_untracked() == ConnStatus::Connected && is_stale() {
+    if store.conn.get_untracked() != ConnStatus::Idle && is_stale() {
         nudge(store);
     }
 }
@@ -554,6 +560,12 @@ fn schedule_reconnect(store: Store, generation: u64) {
 
 fn apply(store: Store, msg: ServerMsg) {
     mark_rx();
+    // Connected means the server is actually talking to us on this
+    // connection — not merely that a QUIC handshake finished. This is what
+    // lets the hung-attempt guard recycle a stalled join.
+    if store.conn.get_untracked() != ConnStatus::Connected {
+        store.conn.set(ConnStatus::Connected);
+    }
     match msg {
         ServerMsg::Welcome { your_id } => store.me.set(your_id),
         ServerMsg::Sessions(list) => store.sessions.set(Some(list)),
