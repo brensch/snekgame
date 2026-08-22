@@ -55,6 +55,25 @@ pub fn app() -> impl IntoView {
     let clock = Interval::new(200, move || store.now_ms.set(net::now()));
     clock.forget();
 
+    // --- coming back to the app reconnects immediately --------------------
+    {
+        use wasm_bindgen::closure::Closure;
+        use wasm_bindgen::JsCast;
+        let cb = Closure::<dyn FnMut()>::new(move || net::nudge(store));
+        if let Some(w) = web_sys::window() {
+            let _ = w.add_event_listener_with_callback("focus", cb.as_ref().unchecked_ref());
+            let _ = w.add_event_listener_with_callback("online", cb.as_ref().unchecked_ref());
+            let _ = w.add_event_listener_with_callback("pageshow", cb.as_ref().unchecked_ref());
+            if let Some(d) = w.document() {
+                let _ = d.add_event_listener_with_callback(
+                    "visibilitychange",
+                    cb.as_ref().unchecked_ref(),
+                );
+            }
+        }
+        cb.forget();
+    }
+
     // --- the connection follows the route ---------------------------------
     Effect::new(move |_| {
         let route = store.route.get();

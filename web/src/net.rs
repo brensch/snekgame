@@ -92,6 +92,28 @@ fn ensure(store: Store, mode: Mode) {
     }
 }
 
+/// The app came back to the foreground (or the network returned): don't
+/// wait out a (possibly throttled) backoff timer — reconnect right now if
+/// the connection isn't healthy. `open` bumps the generation, so any
+/// pending backoff timers and the old transport's callbacks go stale.
+pub fn nudge(store: Store) {
+    let reopen = ACTIVE.with(|a| {
+        let mut a = a.borrow_mut();
+        match &mut *a {
+            Some(conn) => {
+                conn.backoff_ms = BACKOFF_START_MS;
+                let unhealthy = conn.transport.is_none()
+                    || store.conn.get_untracked() != ConnStatus::Connected;
+                unhealthy.then(|| conn.mode.clone())
+            }
+            None => None,
+        }
+    });
+    if let Some(mode) = reopen {
+        open(store, mode, BACKOFF_START_MS);
+    }
+}
+
 /// Tear down (leaving for an unconnected page).
 pub fn disconnect(store: Store) {
     ACTIVE.with(|a| {
