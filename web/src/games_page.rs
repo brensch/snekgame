@@ -15,14 +15,46 @@ pub fn home_page() -> impl IntoView {
     let store = Store::use_store();
     let sessions = store.sessions;
     let page = RwSignal::new(0usize);
+    // Creating: join in the background while the button shows a loading
+    // state; navigate only once the lobby has actually arrived, so the
+    // session page renders fully populated on its first frame.
+    let creating = RwSignal::new(Option::<String>::None);
 
     let create = move || {
+        if creating.get_untracked().is_some() {
+            return;
+        }
         let id = new_session_id();
-        let _ = web_sys::window()
-            .unwrap()
-            .location()
-            .set_hash(&format!("#/s/{id}"));
+        creating.set(Some(id.clone()));
+        crate::net::ensure_session(store, &id);
+        // Fallback: if the join is slow, navigate anyway and let the
+        // session page's machinery take over.
+        let fallback_id = id.clone();
+        gloo_timers::callback::Timeout::new(3_000, move || {
+            if creating.try_get_untracked().flatten() == Some(fallback_id.clone()) {
+                let _ = web_sys::window()
+                    .unwrap()
+                    .location()
+                    .set_hash(&format!("#/s/{fallback_id}"));
+            }
+        })
+        .forget();
     };
+
+    // The moment our new lobby lands, transition.
+    Effect::new(move |_| {
+        let Some(id) = creating.get() else { return };
+        let joined = store
+            .lobby
+            .with(|l| l.as_ref().map(|l| l.session == id).unwrap_or(false));
+        if joined {
+            creating.set(None);
+            let _ = web_sys::window()
+                .unwrap()
+                .location()
+                .set_hash(&format!("#/s/{id}"));
+        }
+    });
 
     // tac's RotatingEmoji: the actionish send list, hopping rather than
     // marching so it feels random. (Reduce in u64 — ms-since-epoch overflows
@@ -132,9 +164,12 @@ pub fn home_page() -> impl IntoView {
                         store.profile.get().colour,
                     )
                 }
+                disabled=move || creating.get().is_some()
                 on:click=move |_| create()
             >
-                "Start new game\u{00A0}" {rotating}
+                {move || if creating.get().is_some() { "Starting" } else { "Start new game" }}
+                "\u{00A0}"
+                {rotating}
             </button>
 
             <p style="margin-top: 24px;">
