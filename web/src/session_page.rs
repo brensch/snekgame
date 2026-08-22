@@ -381,7 +381,7 @@ fn game_view(game: GameView) -> impl IntoView {
             <div>
                 {rain}
                 <h3>"Game over"</h3>
-                <table>
+                <table class="players">
                     <tbody>{rows}</tbody>
                 </table>
                 <p class="footnote">"Drag to replay:"</p>
