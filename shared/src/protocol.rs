@@ -121,6 +121,14 @@ pub struct SessionSummary {
     pub playing: bool,
 }
 
+/// One page of history. `next` is the keyset cursor for the next (older)
+/// page: pass it back as ?before=.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryPage {
+    pub entries: Vec<HistoryEntry>,
+    pub next: Option<i64>,
+}
+
 /// Summary row for the history list API (this one travels as JSON over a
 /// plain GET since it is not perf-sensitive).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

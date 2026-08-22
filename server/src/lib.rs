@@ -49,10 +49,18 @@ async fn session_list(State(state): State<AppState>) -> Response {
     Json(state.registry.active_sessions()).into_response()
 }
 
-async fn history_list(State(state): State<AppState>) -> Response {
+async fn history_list(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let before = q.get("before").and_then(|v| v.parse::<i64>().ok());
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(10);
     let db = state.db.clone();
-    match tokio::task::spawn_blocking(move || db.list_games(100)).await {
-        Ok(Ok(list)) => Json(list).into_response(),
+    match tokio::task::spawn_blocking(move || db.list_games(before, limit)).await {
+        Ok(Ok(page)) => Json(page).into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

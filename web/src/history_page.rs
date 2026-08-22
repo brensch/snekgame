@@ -47,17 +47,45 @@ fn replay_footer(id: i64, meta: &HistoryEntry) -> impl IntoView {
 
 pub fn history_page() -> impl IntoView {
     let entries = RwSignal::new(Option::<Vec<HistoryEntry>>::None);
+    let next = RwSignal::new(Option::<i64>::None);
+    // Cursor trail: the `before` values of the pages we came through, so
+    // "newer" can walk back without numbered pages or COUNT queries.
+    let trail = RwSignal::new(Vec::<Option<i64>>::new());
+    let current = RwSignal::new(Option::<i64>::None);
     let failed = RwSignal::new(false);
 
-    spawn_local(async move {
-        match gloo_net::http::Request::get("/api/history").send().await {
-            Ok(resp) => match resp.json::<Vec<HistoryEntry>>().await {
-                Ok(list) => entries.set(Some(list)),
+    let fetch = move |before: Option<i64>| {
+        current.set(before);
+        spawn_local(async move {
+            let url = match before {
+                Some(b) => format!("/api/history?before={b}&limit=10"),
+                None => "/api/history?limit=10".to_string(),
+            };
+            match gloo_net::http::Request::get(&url).send().await {
+                Ok(resp) => match resp.json::<snek_shared::protocol::HistoryPage>().await {
+                    Ok(page) => {
+                        entries.set(Some(page.entries));
+                        next.set(page.next);
+                    }
+                    Err(_) => failed.set(true),
+                },
                 Err(_) => failed.set(true),
-            },
-            Err(_) => failed.set(true),
+            }
+        });
+    };
+    fetch(None);
+
+    let older = move |_| {
+        if let Some(n) = next.get_untracked() {
+            trail.update(|t| t.push(current.get_untracked()));
+            fetch(Some(n));
         }
-    });
+    };
+    let newer = move |_| {
+        if let Some(prev) = trail.try_update(|t| t.pop()).flatten() {
+            fetch(prev);
+        }
+    };
 
     view! {
         <div>
@@ -123,6 +151,25 @@ pub fn history_page() -> impl IntoView {
                             .into_any()
                     }
                 }
+            }}
+            {move || {
+                let has_older = next.get().is_some();
+                let has_newer = !trail.get().is_empty();
+                (has_older || has_newer)
+                    .then(|| {
+                        view! {
+                            <div class="row" style="margin-top: 10px;">
+                                <button disabled=!has_newer on:click=newer>"‹ newer"</button>
+                                <button
+                                    disabled=!has_older
+                                    style="text-align: right;"
+                                    on:click=older
+                                >
+                                    "older ›"
+                                </button>
+                            </div>
+                        }
+                    })
             }}
             <p>
                 <a href="#/">"← home"</a>

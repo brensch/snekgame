@@ -2,7 +2,7 @@
 //! are written here once, on completion.
 
 use rusqlite::{params, Connection};
-use snek_shared::protocol::HistoryEntry;
+use snek_shared::protocol::{HistoryEntry, HistoryPage};
 use snek_shared::{GameRecord, PlayerProfile, Winner};
 use std::path::Path;
 use std::sync::Mutex;
@@ -26,8 +26,9 @@ impl Db {
                 winners_json  TEXT NOT NULL,
                 record_blob   BLOB NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_games_finished
-                ON games (finished_at_ms DESC);",
+            -- rowid order IS finish order (rows insert at game end), so the
+            -- primary key serves list ordering; no secondary index needed.
+            DROP INDEX IF EXISTS idx_games_finished;",
         )?;
         // Lobby names never existed. Shed the column from older databases.
         let _ = conn.execute_batch("ALTER TABLE games DROP COLUMN session;");
@@ -60,13 +61,27 @@ impl Db {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn list_games(&self, limit: u32) -> rusqlite::Result<Vec<HistoryEntry>> {
+    /// Keyset-paginated history: newest first, resuming below `before`.
+    ///
+    /// Cost: one clustered B-tree descent + `limit+1` sequential leaf reads,
+    /// independent of page depth (OFFSET would scan everything skipped).
+    /// The replay blob is the last column and is never selected here, so
+    /// its overflow pages are never touched by listing.
+    pub fn list_games(
+        &self,
+        before: Option<i64>,
+        limit: u32,
+    ) -> rusqlite::Result<HistoryPage> {
+        let limit = limit.clamp(1, 50) as i64;
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        // rowid order == finish order; fetch one extra to learn if there is
+        // an older page.
+        let mut stmt = conn.prepare_cached(
             "SELECT id, finished_at_ms, num_turns, players_json, winners_json
-             FROM games ORDER BY finished_at_ms DESC LIMIT ?1",
+             FROM games WHERE id < ?1 ORDER BY id DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map([limit], |row| {
+        let cursor = before.unwrap_or(i64::MAX);
+        let rows = stmt.query_map([cursor, limit + 1], |row| {
             let players_json: String = row.get(3)?;
             let winners_json: String = row.get(4)?;
             Ok(HistoryEntry {
@@ -78,7 +93,14 @@ impl Db {
                 winners: serde_json::from_str::<Vec<Winner>>(&winners_json).unwrap_or_default(),
             })
         })?;
-        rows.collect()
+        let mut entries: Vec<HistoryEntry> = rows.collect::<Result<_, _>>()?;
+        let next = if entries.len() as i64 > limit {
+            entries.truncate(limit as usize);
+            entries.last().map(|e| e.id)
+        } else {
+            None
+        };
+        Ok(HistoryPage { entries, next })
     }
 
     pub fn get_game_meta(&self, id: i64) -> rusqlite::Result<Option<HistoryEntry>> {

@@ -467,15 +467,32 @@ impl SessionActor {
             return;
         };
 
-        // Bots pick their moves right before the tick resolves.
-        let current = game.turns.last().unwrap();
-        for (bot_id, &difficulty) in &self.bots {
-            if current.alive.contains(bot_id) {
+        // Bots think in parallel on blocking threads (PUCT is time-budgeted,
+        // capped by tick length so the game loop never slips).
+        let current = game.turns.last().unwrap().clone();
+        let tick_cap = (self.config.tick_ms / 3).max(5);
+        let handles: Vec<_> = self
+            .bots
+            .iter()
+            .filter(|(id, _)| current.alive.contains(*id))
+            .map(|(bot_id, &difficulty)| {
+                let config = self.config;
+                let turn = current.clone();
+                let id = bot_id.clone();
                 let seed = rand::random::<u64>();
-                let mv = bot::choose_move(&self.config, current, bot_id, difficulty, seed);
-                game.pending.insert(bot_id.clone(), mv);
+                let budget = bot::budget_ms(difficulty).min(tick_cap);
+                tokio::task::spawn_blocking(move || {
+                    let mv = bot::choose_move(&config, &turn, &id, difficulty, seed, Some(budget));
+                    (id, mv)
+                })
+            })
+            .collect();
+        for handle in handles {
+            if let Ok((id, mv)) = handle.await {
+                game.pending.insert(id, mv);
             }
         }
+        let game = self.game.as_mut().unwrap();
 
         let moves = std::mem::take(&mut game.pending);
         let next = game.engine.next_turn(game.turns.last().unwrap(), &moves);
