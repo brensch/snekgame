@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// The client-editable part of a profile. The public player id is derived
 /// server-side (a hash of the client's private secret), so a client can never
@@ -34,14 +34,11 @@ pub struct ProfileInfo {
 pub enum ClientMsg {
     /// First message on every (re)connection. `secret` never leaves the
     /// server; everyone else only ever sees the derived public id.
-    /// `display_name` names a session being created (ignored if the session
-    /// already has one) — session ids themselves are opaque.
     Join {
         version: u16,
         session: String,
         secret: String,
         profile: ProfileInfo,
-        display_name: Option<String>,
     },
     UpdateProfile(ProfileInfo),
     SetReady(bool),
@@ -61,8 +58,6 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LobbyState {
     pub session: String,
-    /// Human-readable session name, chosen at creation; ephemeral.
-    pub display_name: String,
     pub config: GameConfig,
     pub players: Vec<PlayerProfile>,
     pub ready: Vec<PlayerId>,
@@ -109,13 +104,14 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Option<T> {
     postcard::from_bytes(bytes).ok()
 }
 
-/// One row of the active-games list (`GET /api/sessions` + /ws/games).
-/// `players` counts humans only — a game is listed while at least one human
-/// is present, so bot-only lobbies vanish the moment everyone leaves.
+/// One row of the active-games list. Games aren't named — they're known by
+/// their host (the first human in the lobby). `players` counts humans only,
+/// so bot-only lobbies vanish the moment everyone leaves.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
-    pub name: String,
+    pub host_name: String,
+    pub host_emoji: String,
     pub players: u32,
     pub bots: u32,
     pub playing: bool,
@@ -126,7 +122,6 @@ pub struct SessionSummary {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub id: i64,
-    pub session: String,
     pub finished_at_ms: i64,
     pub num_turns: u32,
     pub players: Vec<PlayerProfile>,

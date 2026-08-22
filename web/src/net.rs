@@ -80,13 +80,23 @@ pub fn ensure_watch(store: Store) {
 }
 
 fn ensure(store: Store, mode: Mode) {
-    let need_new = ACTIVE.with(|a| {
+    let (need_new, mode_changed) = ACTIVE.with(|a| {
         let a = a.borrow();
         match &*a {
-            Some(c) if c.mode == mode && c.transport.is_some() => false,
-            _ => true,
+            Some(c) if c.mode == mode && c.transport.is_some() => (false, false),
+            Some(c) => (true, c.mode != mode),
+            None => (true, true),
         }
     });
+    if mode_changed {
+        // Session-scoped state must not leak between sessions (or linger
+        // after going home) — a stale game would freeze over the new lobby.
+        store.lobby.set(None);
+        store.game.set(None);
+        store.saved_id.set(None);
+        store.view_turn.set(None);
+        store.selected_dir.set(None);
+    }
     if need_new {
         open(store, mode, BACKOFF_START_MS);
     }
@@ -248,10 +258,6 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
             session: session.clone(),
             secret: crate::store::secret(),
             profile: store.profile.get_untracked(),
-            display_name: store
-                .pending_name
-                .get_untracked()
-                .or_else(|| crate::store::recall_session_name(session)),
         },
     };
     {
@@ -401,12 +407,7 @@ fn apply(store: Store, msg: ServerMsg) {
     match msg {
         ServerMsg::Welcome { your_id } => store.me.set(your_id),
         ServerMsg::Sessions(list) => store.sessions.set(Some(list)),
-        ServerMsg::Lobby(lobby) => {
-            crate::store::remember_session_name(&lobby.session, &lobby.display_name);
-            // The create-flow name has served its purpose once we're in.
-            store.pending_name.set(None);
-            store.lobby.set(Some(lobby));
-        }
+        ServerMsg::Lobby(lobby) => store.lobby.set(Some(lobby)),
         ServerMsg::GameStart {
             config,
             players,

@@ -64,7 +64,6 @@ impl Client {
                 session: session.to_string(),
                 secret: secret.to_string(),
                 profile,
-                display_name: Some("e2e game".to_string()),
             },
         )
         .await;
@@ -212,7 +211,6 @@ async fn two_players_play_a_full_game() {
 
     // History API serves the finished game.
     let body = http_get(http_port, "/api/history").await;
-    assert!(body.contains("e2e game"), "history list missing the game: {body}");
     assert!(body.contains("alice"), "history list missing players");
     let blob = http_get_bytes(http_port, &format!("/api/history/{saved_id}")).await;
     let record: snek_shared::GameRecord = postcard::from_bytes(&blob).expect("decode record");
@@ -275,6 +273,7 @@ async fn watch_games_pushes_list() {
         ServerMsg::Sessions(list) => {
             assert_eq!(list.len(), 1);
             assert_eq!(list[0].id, "watch-me");
+            assert_eq!(list[0].host_name, "carol", "host is the first human");
         }
         other => panic!("expected sessions push, got {other:?}"),
     }

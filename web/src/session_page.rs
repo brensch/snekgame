@@ -206,11 +206,15 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
         </table>
     };
 
+    // A game is known by its host: the first human in the lobby.
+    let host_line = humans
+        .first()
+        .map(|p| format!("{} {}'s game", p.emoji, p.name))
+        .unwrap_or_else(|| "new game".to_string());
+
     view! {
         <div>
-            <h2 style="margin-top: 22px; margin-bottom: 14px;">
-                {lobby.display_name.clone()}
-            </h2>
+            <h2 style="margin-top: 22px; margin-bottom: 14px;">{host_line}</h2>
             {ready_button}
             {(i_am_ready && !not_ready.is_empty())
                 .then(|| {

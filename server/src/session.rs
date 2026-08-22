@@ -87,7 +87,7 @@ impl Registry {
             .filter(|s| s.players > 0)
             .cloned()
             .collect();
-        list.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        list.sort_by(|a, b| a.host_name.cmp(&b.host_name).then(a.id.cmp(&b.id)));
         list
     }
 
@@ -103,7 +103,6 @@ impl Registry {
         session: &str,
         conn_id: u64,
         profile: PlayerProfile,
-        display_name: Option<String>,
         tx: mpsc::Sender<Frame>,
     ) -> mpsc::Sender<Cmd> {
         loop {
@@ -118,7 +117,6 @@ impl Registry {
             let cmd = Cmd::Connect {
                 conn_id,
                 profile: profile.clone(),
-                display_name: display_name.clone(),
                 tx: tx.clone(),
             };
             match sender.send(cmd).await {
@@ -151,7 +149,6 @@ pub enum Cmd {
     Connect {
         conn_id: u64,
         profile: PlayerProfile,
-        display_name: Option<String>,
         tx: mpsc::Sender<Frame>,
     },
     Disconnect {
@@ -178,7 +175,6 @@ struct RunningGame {
 
 struct SessionActor {
     name: String,
-    display_name: Option<String>,
     registry: Registry,
     db: Arc<Db>,
     rx: mpsc::Receiver<Cmd>,
@@ -204,7 +200,6 @@ impl SessionActor {
         let (tx, rx) = mpsc::channel(1024);
         let actor = SessionActor {
             name,
-            display_name: None,
             registry,
             db,
             rx,
@@ -225,20 +220,21 @@ impl SessionActor {
         tx
     }
 
-    fn display_name(&self) -> String {
-        self.display_name
-            .clone()
-            .unwrap_or_else(|| "unnamed game".to_string())
-    }
-
     fn publish_info(&self) {
         // Humans only — presence in the lobby means a live connection, so
         // this count drops the moment someone leaves and the game disappears
         // from the list when the last human does (bots don't keep it listed).
         let humans = self.lobby.len().saturating_sub(self.bots.len());
+        // Games aren't named; they're known by their host — the first human
+        // currently in the lobby.
+        let host = self
+            .lobby
+            .iter()
+            .find(|p| !self.bots.contains_key(&p.id));
         self.registry.publish(SessionSummary {
             id: self.name.clone(),
-            name: self.display_name(),
+            host_name: host.map(|p| p.name.clone()).unwrap_or_default(),
+            host_emoji: host.map(|p| p.emoji.clone()).unwrap_or_default(),
             players: humans as u32,
             bots: self.bots.len() as u32,
             playing: self.game.is_some(),
@@ -283,19 +279,9 @@ impl SessionActor {
             Cmd::Connect {
                 conn_id,
                 profile,
-                display_name,
                 tx,
             } => {
                 self.empty_deadline = None;
-                // First name offered wins; later joins can't rename.
-                if self.display_name.is_none() {
-                    if let Some(name) = display_name {
-                        let name = name.trim().chars().take(32).collect::<String>();
-                        if !name.is_empty() {
-                            self.display_name = Some(name);
-                        }
-                    }
-                }
                 self.conns.insert(
                     conn_id,
                     Conn {
@@ -524,11 +510,10 @@ impl SessionActor {
             .unwrap_or_default();
 
         let db = self.db.clone();
-        let session = self.display_name();
         let started = game.started_at_ms;
         let finished = now_ms();
         let saved = tokio::task::spawn_blocking(move || {
-            db.insert_game(&session, started, finished, &record)
+            db.insert_game(started, finished, &record)
         })
         .await;
 
@@ -547,7 +532,6 @@ impl SessionActor {
     async fn broadcast_lobby(&mut self) {
         let state = LobbyState {
             session: self.name.clone(),
-            display_name: self.display_name(),
             config: self.config,
             players: self.lobby.clone(),
             ready: self.ready.iter().cloned().collect(),

@@ -1,5 +1,6 @@
-//! The home screen: live games to join (paginated), or start your own —
-//! named in one flow, with the URL carrying only an opaque session id.
+//! The home screen: live games to join (paginated), or start your own with
+//! one tap — games aren't named, they're known by their host, and the URL
+//! carries only an opaque session id.
 //! The list is pushed by the server over WebTransport the moment it changes
 //! (the route effect in app.rs opens the watch connection).
 
@@ -14,14 +15,8 @@ pub fn home_page() -> impl IntoView {
     let store = Store::use_store();
     let sessions = store.sessions;
     let page = RwSignal::new(0usize);
-    let new_name = RwSignal::new(String::new());
 
     let create = move || {
-        let name = new_name.get_untracked().trim().to_string();
-        if name.is_empty() {
-            return;
-        }
-        store.pending_name.set(Some(name));
         let id = new_session_id();
         let _ = web_sys::window()
             .unwrap()
@@ -67,7 +62,7 @@ pub fn home_page() -> impl IntoView {
                                             view! {
                                                 <tr>
                                                     <td>
-                                                        <b>{s.name}</b>
+                                                        <b>{s.host_emoji} " " {s.host_name} "'s game"</b>
                                                     </td>
                                                     <td class="right">
                                                         {s.players}
@@ -121,23 +116,9 @@ pub fn home_page() -> impl IntoView {
                 let any = sessions.get().map(|l| !l.is_empty()).unwrap_or(false);
                 any.then(|| view! { <h3 style="margin-top: 28px;">"or start your own lobby"</h3> })
             }}
-            <input
-                style="margin-top: 16px;"
-                type="text"
-                placeholder="name your game"
-                maxlength="32"
-                prop:value=move || new_name.get()
-                on:input=move |ev| new_name.set(event_target_value(&ev))
-                on:keydown=move |ev: web_sys::KeyboardEvent| {
-                    if ev.key() == "Enter" {
-                        create();
-                    }
-                }
-            />
             <button
                 class="big"
-                style=move || format!("margin-top: 10px; background: {};", store.profile.get().colour)
-                disabled=move || new_name.get().trim().is_empty()
+                style=move || format!("margin-top: 16px; background: {};", store.profile.get().colour)
                 on:click=move |_| create()
             >
                 "Start game\u{00A0}" {rotating}

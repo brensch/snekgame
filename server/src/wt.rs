@@ -73,18 +73,9 @@ async fn handle_session(
             session,
             secret,
             profile,
-            display_name,
         } => {
             join_session(
-                connection,
-                send,
-                recv,
-                registry,
-                version,
-                session,
-                secret,
-                profile,
-                display_name,
+                connection, send, recv, registry, version, session, secret, profile,
             )
             .await
         }
@@ -134,7 +125,6 @@ async fn join_session(
     session: String,
     secret: String,
     info: snek_shared::protocol::ProfileInfo,
-    display_name: Option<String>,
 ) -> anyhow::Result<()> {
     if version != PROTOCOL_VERSION {
         let msg = ServerMsg::Error("protocol version mismatch — refresh the page".into());
@@ -163,7 +153,7 @@ async fn join_session(
 
     let conn_id = registry.new_conn_id();
     let (tx, mut rx) = conn_channel();
-    let actor = registry.connect(&session, conn_id, profile, display_name, tx).await;
+    let actor = registry.connect(&session, conn_id, profile, tx).await;
 
     // Outbound: control frames -> stream; snapshots -> datagram x2.
     let out_conn = connection.clone();

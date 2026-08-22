@@ -46,8 +46,6 @@ pub struct Store {
     /// The direction we're currently steering (highlights the d-pad).
     /// Starts at the clockwise default; corrected from each resolved turn.
     pub selected_dir: RwSignal<Option<Dir>>,
-    /// Display name for a session we're about to create (sent with Join).
-    pub pending_name: RwSignal<Option<String>>,
     pub saved_id: RwSignal<Option<i64>>,
     /// performance-now ms when the pre-game countdown ends.
     pub countdown_ends: RwSignal<f64>,
@@ -69,7 +67,6 @@ impl Store {
             game: RwSignal::new(None),
             view_turn: RwSignal::new(None),
             selected_dir: RwSignal::new(None),
-            pending_name: RwSignal::new(None),
             saved_id: RwSignal::new(None),
             countdown_ends: RwSignal::new(0.0),
             now_ms: RwSignal::new(0.0),
@@ -125,27 +122,6 @@ pub fn new_session_id() -> String {
     random_hex(8)
 }
 
-fn session_storage() -> Option<web_sys::Storage> {
-    web_sys::window()?.session_storage().ok()?
-}
-
-/// Remember a session's display name so a rejoin after the server tidied the
-/// empty session away (phone lock, tab sleep) restores it instead of landing
-/// in an "unnamed game".
-pub fn remember_session_name(session_id: &str, name: &str) {
-    if name.is_empty() || name == "unnamed game" {
-        return;
-    }
-    if let Some(s) = session_storage() {
-        let _ = s.set_item(&format!("snek_sname_{session_id}"), name);
-    }
-}
-
-pub fn recall_session_name(session_id: &str) -> Option<String> {
-    session_storage()?
-        .get_item(&format!("snek_sname_{session_id}"))
-        .ok()?
-}
 
 fn load_profile() -> ProfileInfo {
     let s = storage();

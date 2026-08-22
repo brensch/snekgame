@@ -36,9 +36,7 @@ fn replay_footer(id: i64, meta: &HistoryEntry) -> impl IntoView {
         .collect_view();
     view! {
         <div class="chip-row">{chips}</div>
-        <p class="footnote" style="margin-top: 6px;">
-            "game #" {id} " in \u{201c}" {meta.session.clone()} "\u{201d}"
-        </p>
+        <p class="footnote" style="margin-top: 6px;">"game #" {id}</p>
     }
 }
 
@@ -104,9 +102,6 @@ pub fn history_page() -> impl IntoView {
                                                             .set_hash(&format!("#/history/{id}"));
                                                     }
                                                 >
-                                                    <td>
-                                                        <b>{e.session}</b>
-                                                    </td>
                                                     <td>{who}</td>
                                                     <td class="right">{e.num_turns} " turns"</td>
                                                 </tr>

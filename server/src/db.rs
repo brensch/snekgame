@@ -19,7 +19,6 @@ impl Db {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS games (
                 id            INTEGER PRIMARY KEY,
-                session       TEXT NOT NULL,
                 started_at_ms INTEGER NOT NULL,
                 finished_at_ms INTEGER NOT NULL,
                 num_turns     INTEGER NOT NULL,
@@ -30,6 +29,8 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_games_finished
                 ON games (finished_at_ms DESC);",
         )?;
+        // Lobby names never existed. Shed the column from older databases.
+        let _ = conn.execute_batch("ALTER TABLE games DROP COLUMN session;");
         Ok(Db {
             conn: Mutex::new(conn),
         })
@@ -37,7 +38,6 @@ impl Db {
 
     pub fn insert_game(
         &self,
-        session: &str,
         started_at_ms: i64,
         finished_at_ms: i64,
         record: &GameRecord,
@@ -46,10 +46,9 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO games
-             (session, started_at_ms, finished_at_ms, num_turns, players_json, winners_json, record_blob)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (started_at_ms, finished_at_ms, num_turns, players_json, winners_json, record_blob)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                session,
                 started_at_ms,
                 finished_at_ms,
                 record.turns.len() as i64,
@@ -64,17 +63,16 @@ impl Db {
     pub fn list_games(&self, limit: u32) -> rusqlite::Result<Vec<HistoryEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, session, finished_at_ms, num_turns, players_json, winners_json
+            "SELECT id, finished_at_ms, num_turns, players_json, winners_json
              FROM games ORDER BY finished_at_ms DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit], |row| {
-            let players_json: String = row.get(4)?;
-            let winners_json: String = row.get(5)?;
+            let players_json: String = row.get(3)?;
+            let winners_json: String = row.get(4)?;
             Ok(HistoryEntry {
                 id: row.get(0)?,
-                session: row.get(1)?,
-                finished_at_ms: row.get(2)?,
-                num_turns: row.get::<_, i64>(3)? as u32,
+                finished_at_ms: row.get(1)?,
+                num_turns: row.get::<_, i64>(2)? as u32,
                 players: serde_json::from_str::<Vec<PlayerProfile>>(&players_json)
                     .unwrap_or_default(),
                 winners: serde_json::from_str::<Vec<Winner>>(&winners_json).unwrap_or_default(),
@@ -86,19 +84,18 @@ impl Db {
     pub fn get_game_meta(&self, id: i64) -> rusqlite::Result<Option<HistoryEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, session, finished_at_ms, num_turns, players_json, winners_json
+            "SELECT id, finished_at_ms, num_turns, players_json, winners_json
              FROM games WHERE id = ?1",
         )?;
         let mut rows = stmt.query([id])?;
         match rows.next()? {
             Some(row) => {
-                let players_json: String = row.get(4)?;
-                let winners_json: String = row.get(5)?;
+                let players_json: String = row.get(3)?;
+                let winners_json: String = row.get(4)?;
                 Ok(Some(HistoryEntry {
                     id: row.get(0)?,
-                    session: row.get(1)?,
-                    finished_at_ms: row.get(2)?,
-                    num_turns: row.get::<_, i64>(3)? as u32,
+                    finished_at_ms: row.get(1)?,
+                    num_turns: row.get::<_, i64>(2)? as u32,
                     players: serde_json::from_str::<Vec<PlayerProfile>>(&players_json)
                         .unwrap_or_default(),
                     winners: serde_json::from_str::<Vec<Winner>>(&winners_json)
