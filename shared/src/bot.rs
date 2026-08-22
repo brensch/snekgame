@@ -1,27 +1,33 @@
-//! The house sneks: time-budgeted PUCT search.
+//! The house sneks: a port of the strongest heuristic agent from the
+//! author's snek3 training league (`snek-heuristic`, "ucb voronoi").
 //!
-//! Architecture (AlphaZero-shaped, minus the network):
-//! - **PUCT selection** over the bot's own four headings:
-//!   `Q(a) + c · P(a) · √N / (1 + n(a))`, with heuristic priors standing in
-//!   for a policy net.
-//! - **Priors** encode instinct: never reverse, near-zero for walls/bodies,
-//!   prefer straight, steer toward food when hungry, prefer open space.
-//! - **Opponents are sampled from their own priors** each descent (a cheap
-//!   decoupled-UCT): the search averages over plausible opponent play
-//!   instead of assuming they never turn.
-//! - **Simulation is the real engine**, so the rules can't drift.
-//! - **Leaf evaluation** blends survival, Voronoi board control, health
-//!   against distance-to-food, and length dominance (head-on threat).
-//! - **Time budgets, not iteration counts**: easy 8ms, medium 35ms, hard
-//!   100ms per move (the server also caps by tick length and runs bots on
-//!   blocking threads off the game loop). On this hardware an iteration
-//!   costs tens of microseconds, so hard runs a few thousand descents up to
-//!   32 plies deep — it is genuinely looking ~half a board-crossing ahead.
+//! Architecture:
+//! - **Decoupled-UCT MCTS over joint moves.** At every node, *every* living
+//!   snake runs its own UCB1 selection over its candidate moves; the child
+//!   is keyed by the joint choice. Opponents are searched, not assumed —
+//!   the tree discovers their best responses, which is what makes this
+//!   agent actually fight for space.
+//! - **Time-expanded Voronoi evaluation.** All heads flood outward together,
+//!   one turn per BFS layer, with body cells unblocking as tails vacate
+//!   (segment k of an L-long snake frees after L−k turns). A cell belongs
+//!   to whoever can be there first; same-turn contests go to the *longer*
+//!   snake (it wins the head-to-head), equal lengths kill the claim.
+//!   Blended with health, relative length, a hunger term (can I win the
+//!   race to food I own before starving?) and a trap term (a reachable
+//!   region smaller than my body is a death sentence).
+//! - **Guaranteed-loss pruning.** Candidate moves stepping onto a square a
+//!   longer-or-equal opponent head can also reach next turn are dropped
+//!   before the search ever sees them (unless everything loses).
+//! - **A fast internal board.** Search steps run on an index-based board
+//!   mirroring the real engine's rules (food-spawn-free lookahead), so a
+//!   descent costs microseconds instead of cloning string-keyed maps.
+//!
+//! Difficulty is purely thinking time: easy 8ms, medium 35ms, hard 100ms
+//! per move (the server caps by tick length and runs bots on blocking
+//! threads). Hard sustains tens of thousands of simulations per move.
 
-use crate::engine::Engine;
-use crate::rng::Rng;
 use crate::types::*;
-use std::collections::BTreeMap;
+use std::collections::{HashMap, VecDeque};
 
 /// Per-move thinking budget in milliseconds.
 pub fn budget_ms(difficulty: BotDifficulty) -> u32 {
@@ -32,434 +38,220 @@ pub fn budget_ms(difficulty: BotDifficulty) -> u32 {
     }
 }
 
-/// How deep a single descent may go.
-fn depth_cap(difficulty: BotDifficulty) -> u32 {
-    match difficulty {
-        BotDifficulty::Easy => 8,
-        BotDifficulty::Medium => 16,
-        BotDifficulty::Hard => 32,
-    }
-}
+const C_UCT: f32 = 1.2;
+const DRAW_VALUE: f32 = -0.25;
+const MAX_SIMS: usize = 200_000;
+const MAX_SNAKES: usize = 8;
 
-const C_PUCT: f32 = 1.5;
-/// First-play urgency: optimistic-neutral value for unvisited children.
-const FPU: f32 = 0.5;
-/// Runaway guard — budgets should stop us long before this.
-const MAX_ITERS: u32 = 100_000;
+// Voronoi blend weights (positive terms sum to 0.85; trap only subtracts).
+const W_AREA: f32 = 0.40;
+const W_HEALTH: f32 = 0.10;
+const W_LENGTH: f32 = 0.15;
+const W_FOOD: f32 = 0.20;
+const W_TRAP: f32 = 0.35;
+
+const DIRS: [Dir; 4] = [Dir::Up, Dir::Down, Dir::Left, Dir::Right];
 
 // ---------------------------------------------------------------------------
 // Public entry
 // ---------------------------------------------------------------------------
 
-/// Pick a move within `budget_ms_override` (or the difficulty default).
-/// Runs on native server threads; compiled but never called in wasm.
 pub fn choose_move(
     config: &GameConfig,
     turn: &Turn,
     me: &PlayerId,
     difficulty: BotDifficulty,
-    seed: u64,
+    _seed: u64,
     budget_ms_override: Option<u32>,
 ) -> Dir {
-    let budget = budget_ms_override.unwrap_or_else(|| budget_ms(difficulty)) as u128;
-    let cap = depth_cap(difficulty);
-    let mut rng = Rng::new(seed);
+    let budget = budget_ms_override.unwrap_or_else(|| budget_ms(difficulty));
 
-    let root_priors = priors(config, turn, me);
-    let legal: Vec<usize> = (0..4).filter(|&a| root_priors[a] > 0.0).collect();
-    match legal.len() {
-        0 => return Dir::Up, // boxed in; doesn't matter
-        1 => return DIRS[legal[0]],
+    // Index the world: alive snakes in turn order, me somewhere among them.
+    let order: Vec<&PlayerId> = turn.alive.iter().collect();
+    let Some(me_idx) = order.iter().position(|p| *p == me) else {
+        return Dir::Up; // dead already
+    };
+    let board = FastBoard::from_turn(config, turn, &order);
+
+    let root_cands = safe_candidates(&board, me_idx);
+    match root_cands.len() {
+        0 => return Dir::Up,
+        1 => return root_cands[0],
         _ => {}
     }
 
-    let mut arena: Vec<Node> = vec![Node::new(root_priors)];
-    let start = std::time::Instant::now();
-    let mut iters = 0u32;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget as u64);
+    search(&board, me_idx, deadline)
+}
 
-    while start.elapsed().as_millis() < budget && iters < MAX_ITERS {
-        iters += 1;
-        run_descent(config, turn, me, cap, &mut arena, &mut rng);
+// ---------------------------------------------------------------------------
+// Fast board: the engine's rules on indexed state (no food spawns)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct Snake {
+    body: VecDeque<u16>,
+    health: u8,
+    alive: bool,
+}
+
+impl Snake {
+    fn head(&self) -> u16 {
+        self.body[0]
     }
-
-    // Most-visited root action wins.
-    let root = &arena[0];
-    let best = (0..4)
-        .filter(|&a| root.priors[a] > 0.0)
-        .max_by(|&a, &b| {
-            let na = root.child(a).map(|c| arena[c].visits).unwrap_or(0.0);
-            let nb = root.child(b).map(|c| arena[c].visits).unwrap_or(0.0);
-            na.total_cmp(&nb)
-        })
-        .unwrap_or(legal[0]);
-    DIRS[best]
+    fn len(&self) -> usize {
+        self.body.len()
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Tree
-// ---------------------------------------------------------------------------
-
-const DIRS: [Dir; 4] = [Dir::Up, Dir::Down, Dir::Left, Dir::Right];
-const NONE: u32 = u32::MAX;
-
-struct Node {
-    visits: f32,
-    value_sum: f32,
-    priors: [f32; 4],
-    children: [u32; 4],
+#[derive(Clone)]
+struct FastBoard {
+    w: i16,
+    h: i16,
+    snakes: Vec<Snake>,
+    food: Vec<u16>,
+    alive_count: usize,
+    /// Terminal threshold: multi games end at 1 alive, solo games at 0.
+    min_alive: usize,
 }
 
-impl Node {
-    fn new(priors: [f32; 4]) -> Node {
-        Node {
-            visits: 0.0,
-            value_sum: 0.0,
-            priors,
-            children: [NONE; 4],
+impl FastBoard {
+    fn from_turn(config: &GameConfig, turn: &Turn, order: &[&PlayerId]) -> FastBoard {
+        let snakes = order
+            .iter()
+            .map(|p| Snake {
+                body: turn.snakes[*p].iter().copied().collect(),
+                health: turn.health.get(*p).copied().unwrap_or(100),
+                alive: true,
+            })
+            .collect::<Vec<_>>();
+        let alive_count = snakes.len();
+        FastBoard {
+            w: config.board_width as i16,
+            h: config.board_height as i16,
+            snakes,
+            food: turn.food.clone(),
+            alive_count,
+            min_alive: if alive_count > 1 { 1 } else { 0 },
         }
     }
 
-    fn child(&self, a: usize) -> Option<usize> {
-        (self.children[a] != NONE).then_some(self.children[a] as usize)
+    fn is_wall(&self, pos: u16) -> bool {
+        let (x, y) = (pos as i16 % self.w, pos as i16 / self.w);
+        x == 0 || y == 0 || x == self.w - 1 || y == self.h - 1
     }
 
-    fn q(&self) -> f32 {
-        if self.visits > 0.0 {
-            self.value_sum / self.visits
+    fn step_dir(&self, from: u16, dir: Dir) -> Option<u16> {
+        let (x, y) = (from as i16 % self.w, from as i16 / self.w);
+        let (dx, dy) = dir.delta();
+        let (nx, ny) = (x + dx, y + dy);
+        if nx < 0 || nx >= self.w || ny < 0 || ny >= self.h {
+            None
         } else {
-            FPU
+            Some((ny * self.w + nx) as u16)
         }
     }
-}
 
-fn run_descent(
-    config: &GameConfig,
-    root_turn: &Turn,
-    me: &PlayerId,
-    cap: u32,
-    arena: &mut Vec<Node>,
-    rng: &mut Rng,
-) {
-    let mut sim = Engine::new(*config, root_turn.alive.clone(), rng.next_u64());
-    let mut state = root_turn.clone();
-    let mut path: Vec<usize> = vec![0];
-    let mut value = None;
+    fn is_terminal(&self) -> bool {
+        self.alive_count <= self.min_alive
+    }
 
-    for depth in 0..cap {
-        let node_id = *path.last().unwrap();
+    /// Sole survivor of a multi game, if the board is terminal that way.
+    fn winner(&self) -> Option<usize> {
+        (self.min_alive == 1 && self.alive_count == 1)
+            .then(|| self.snakes.iter().position(|s| s.alive).unwrap())
+    }
 
-        // PUCT over actions with non-zero prior.
-        let sqrt_n = (arena[node_id].visits + 1.0).sqrt();
-        let mut best: Option<(f32, usize)> = None;
-        for a in 0..4 {
-            let p = arena[node_id].priors[a];
-            if p <= 0.0 {
+    /// One tick of the real rules (minus random food spawns): wall/self
+    /// deaths leave the body blocking this tick, head-on kills the shorter,
+    /// then eating and starvation.
+    fn step(&mut self, moves: &[Dir]) {
+        let n = self.snakes.len();
+        let mut died = [false; MAX_SNAKES];
+
+        // Movement (tail pops before self-check, exactly like the engine).
+        for i in 0..n {
+            if !self.snakes[i].alive {
                 continue;
             }
-            let (q, n) = match arena[node_id].child(a) {
-                Some(c) => (arena[c].q(), arena[c].visits),
-                None => (FPU, 0.0),
-            };
-            let score = q + C_PUCT * p * sqrt_n / (1.0 + n);
-            if best.map(|(s, _)| score > s).unwrap_or(true) {
-                best = Some((score, a));
-            }
-        }
-        let Some((_, action)) = best else {
-            value = Some(0.0); // nowhere to go
-            break;
-        };
-
-        // Joint move: mine chosen, opponents sampled from their instincts.
-        let mut moves: BTreeMap<PlayerId, Dir> = BTreeMap::new();
-        moves.insert(me.clone(), DIRS[action]);
-        for opp in state.alive.clone() {
-            if &opp != me {
-                let p = priors(config, &state, &opp);
-                moves.insert(opp, sample(&p, rng));
-            }
-        }
-        state = sim.next_turn(&state, &moves);
-
-        // Materialize the child and walk into it.
-        let child_id = match arena[path[path.len() - 1]].child(action) {
-            Some(c) => c,
-            None => {
-                let priors = if state.alive.contains(me) {
-                    priors(config, &state, me)
-                } else {
-                    [0.25; 4] // unused — terminal below
-                };
-                arena.push(Node::new(priors));
-                let c = arena.len() - 1;
-                let n = path[path.len() - 1];
-                arena[n].children[action] = c as u32;
-                c
-            }
-        };
-        path.push(child_id);
-
-        if !state.alive.contains(me) {
-            // Dying later is marginally better than dying now.
-            value = Some(0.04 * depth as f32 / cap as f32);
-            break;
-        }
-        if state.game_over() {
-            value = Some(1.0);
-            break;
-        }
-        // Fresh leaf: evaluate here rather than descending blind.
-        if arena[child_id].visits == 0.0 {
-            value = Some(evaluate(config, &state, me));
-            break;
-        }
-    }
-
-    let value = value.unwrap_or_else(|| evaluate(config, &state, me));
-    for &n in &path {
-        arena[n].visits += 1.0;
-        arena[n].value_sum += value;
-    }
-}
-
-fn sample(priors: &[f32; 4], rng: &mut Rng) -> Dir {
-    let total: f32 = priors.iter().sum();
-    if total <= 0.0 {
-        return DIRS[rng.below(4)];
-    }
-    let mut roll = (rng.next_u64() % 10_000) as f32 / 10_000.0 * total;
-    for a in 0..4 {
-        roll -= priors[a];
-        if roll <= 0.0 {
-            return DIRS[a];
-        }
-    }
-    DIRS[3]
-}
-
-// ---------------------------------------------------------------------------
-// Priors: instinct without a network
-// ---------------------------------------------------------------------------
-
-fn priors(config: &GameConfig, turn: &Turn, player: &PlayerId) -> [f32; 4] {
-    let mut out = [0.0f32; 4];
-    let Some(snake) = turn.snakes.get(player) else {
-        return out;
-    };
-    let head = snake[0];
-    let last = last_direction(snake, config.board_width as i16);
-    let health = turn.health.get(player).copied().unwrap_or(100);
-    let hunger = match health {
-        0..=25 => 1.0,
-        26..=60 => 0.5,
-        _ => 0.15,
-    };
-
-    for (a, &dir) in DIRS.iter().enumerate() {
-        if Some(dir.opposite()) == last {
-            continue; // never reverse
-        }
-        let Some(target) = step(config, head, dir) else {
-            out[a] = 0.0;
-            continue;
-        };
-        if config.is_wall(target) {
-            out[a] = 0.0;
-            continue;
-        }
-        // Body cells: lethal unless it's a tail that will vacate.
-        let mut blocked = false;
-        let mut tail_chase = false;
-        for s in turn.snakes.values() {
-            if let Some(i) = s.iter().position(|&c| c == target) {
-                if i == s.len() - 1 && s[s.len() - 1] != s[s.len() - 2] {
-                    tail_chase = true; // tail vacates unless they just ate
-                } else {
-                    blocked = true;
+            let head = self.snakes[i].head();
+            match self.step_dir(head, moves[i]) {
+                Some(t) if !self.is_wall(t) => {
+                    self.snakes[i].body.pop_back();
+                    if self.snakes[i].body.contains(&t) {
+                        died[i] = true; // self-collision; body blocks this tick
+                    } else {
+                        self.snakes[i].body.push_front(t);
+                    }
                 }
-                break;
+                _ => died[i] = true, // wall; body blocks this tick
             }
         }
-        if blocked {
-            out[a] = 0.02; // effectively never, but not structurally zero
-            continue;
-        }
 
-        let mut p = 1.0;
-        if tail_chase {
-            p *= 0.3;
-        }
-        if Some(dir) == last {
-            p += 0.35; // keep momentum
-        }
-        // Food pull, scaled by hunger.
-        if let Some(d) = nearest_food_dist(config, turn, target) {
-            p += hunger * 1.6 / (1.0 + d as f32);
-        }
-        // Breathing room.
-        p += 0.15 * free_neighbours(config, turn, target) as f32;
-        out[a] = p;
-    }
-
-    let total: f32 = out.iter().sum();
-    if total > 0.0 {
-        for v in &mut out {
-            *v /= total;
-        }
-    } else if let Some(l) = last {
-        // Boxed in: at least keep the engine's straight-line default legal.
-        out[DIRS.iter().position(|&d| d == l).unwrap_or(0)] = 1.0;
-    } else {
-        out = [0.25; 4];
-    }
-    out
-}
-
-fn free_neighbours(config: &GameConfig, turn: &Turn, pos: Pos) -> u32 {
-    DIRS.iter()
-        .filter_map(|&d| step(config, pos, d))
-        .filter(|&t| !config.is_wall(t))
-        .filter(|&t| !turn.snakes.values().any(|s| s.contains(&t)))
-        .count() as u32
-}
-
-fn nearest_food_dist(config: &GameConfig, turn: &Turn, from: Pos) -> Option<u32> {
-    let w = config.board_width as i32;
-    let (fx, fy) = (from as i32 % w, from as i32 / w);
-    turn.food
-        .iter()
-        .map(|&f| {
-            let (x, y) = (f as i32 % w, f as i32 / w);
-            ((x - fx).abs() + (y - fy).abs()) as u32
-        })
-        .min()
-}
-
-// ---------------------------------------------------------------------------
-// Evaluation: how good is this world for me?
-// ---------------------------------------------------------------------------
-
-fn evaluate(config: &GameConfig, turn: &Turn, me: &PlayerId) -> f32 {
-    if !turn.alive.contains(me) {
-        return 0.0;
-    }
-    if turn.game_over() {
-        return 1.0;
-    }
-
-    let (share, my_food_dist) = voronoi(config, turn, me);
-
-    // Health sustainability: fine above 60hp; below that, reachable food is
-    // what matters.
-    let health = turn.health.get(me).copied().unwrap_or(100) as f32;
-    let sustain = if health > 60.0 {
-        1.0
-    } else {
-        let h = health / 60.0;
-        let food_ok = match my_food_dist {
-            Some(d) => 1.0 / (1.0 + d as f32 / 4.0),
-            None => 0.1, // no food reachable first: bad place to be hungry
-        };
-        (0.35 * h + 0.65 * food_ok).min(1.0)
-    };
-
-    // Length dominance: longer than every opponent wins head-ons.
-    let my_len = turn.snakes.get(me).map(|s| s.len() as f32).unwrap_or(0.0);
-    let max_opp = turn
-        .snakes
-        .iter()
-        .filter(|(p, _)| *p != me)
-        .map(|(_, s)| s.len() as f32)
-        .fold(0.0, f32::max);
-    let dominance = 0.5 + 0.5 * ((my_len - max_opp) * 0.25).tanh();
-
-    0.20 + 0.40 * share + 0.20 * sustain + 0.20 * dominance
-}
-
-/// Multi-source BFS from every living head: each free cell belongs to
-/// whoever reaches it first. Returns (my share of claimed cells, my BFS
-/// distance to the nearest food I reach first).
-fn voronoi(config: &GameConfig, turn: &Turn, me: &PlayerId) -> (f32, Option<u32>) {
-    let cells = config.cells();
-    let w = config.board_width as i16;
-    const BLOCKED: u8 = 254;
-    const FREE: u8 = 255;
-    let mut owner = vec![FREE; cells];
-    for pos in 0..cells as u16 {
-        if config.is_wall(pos) {
-            owner[pos as usize] = BLOCKED;
-        }
-    }
-    for snake in turn.snakes.values() {
-        for &pos in snake {
-            owner[pos as usize] = BLOCKED;
-        }
-    }
-
-    let mut queue: std::collections::VecDeque<(Pos, u8, u32)> = std::collections::VecDeque::new();
-    let mut my_idx = u8::MAX;
-    for (i, p) in turn.alive.iter().enumerate() {
-        if p == me {
-            my_idx = i as u8;
-        }
-        if let Some(snake) = turn.snakes.get(p) {
-            queue.push_back((snake[0], i as u8, 0));
-        }
-    }
-
-    let mut counts = vec![0u32; turn.alive.len()];
-    let mut my_food_dist: Option<u32> = None;
-    while let Some((pos, who, dist)) = queue.pop_front() {
-        let (x, y) = (pos as i16 % w, pos as i16 / w);
-        for (dx, dy) in [(0i16, -1i16), (0, 1), (-1, 0), (1, 0)] {
-            let (nx, ny) = (x + dx, y + dy);
-            if nx < 0 || nx >= w || ny < 0 || ny >= config.board_height as i16 {
+        // Cross-snake collisions (bodies of this tick's dead still block).
+        for i in 0..n {
+            if !self.snakes[i].alive || died[i] {
                 continue;
             }
-            let np = (ny * w + nx) as usize;
-            if owner[np] == FREE {
-                owner[np] = who;
-                counts[who as usize] += 1;
-                if who == my_idx && my_food_dist.is_none() && turn.food.contains(&(np as Pos)) {
-                    my_food_dist = Some(dist + 1);
+            let head = self.snakes[i].head();
+            let my_len = self.snakes[i].len();
+            for j in 0..n {
+                if j == i || !self.snakes[j].alive {
+                    continue;
                 }
-                queue.push_back((np as Pos, who, dist + 1));
+                if self.snakes[j].head() == head && !died[j] {
+                    // Head-on: shortest dies, ties kill both.
+                    if my_len <= self.snakes[j].len() {
+                        died[i] = true;
+                    }
+                } else if self.snakes[j].body.iter().skip(1).any(|&c| c == head)
+                    || (died[j] && self.snakes[j].head() == head)
+                {
+                    died[i] = true;
+                }
+            }
+        }
+
+        for i in 0..n {
+            if died[i] && self.snakes[i].alive {
+                self.snakes[i].alive = false;
+                self.alive_count -= 1;
+            }
+        }
+
+        // Food + starvation.
+        for i in 0..n {
+            if !self.snakes[i].alive {
+                continue;
+            }
+            let head = self.snakes[i].head();
+            if let Some(f) = self.food.iter().position(|&c| c == head) {
+                self.food.swap_remove(f);
+                let tail = *self.snakes[i].body.back().unwrap();
+                self.snakes[i].body.push_back(tail);
+                self.snakes[i].health = 100;
+            } else {
+                self.snakes[i].health = self.snakes[i].health.saturating_sub(1);
+                if self.snakes[i].health == 0 {
+                    self.snakes[i].alive = false;
+                    self.alive_count -= 1;
+                }
             }
         }
     }
-
-    let total: u32 = counts.iter().sum();
-    let share = if total == 0 || my_idx == u8::MAX {
-        0.5
-    } else {
-        counts[my_idx as usize] as f32 / total as f32
-    };
-    (share, my_food_dist)
 }
 
 // ---------------------------------------------------------------------------
-// Small helpers
+// Candidates + guaranteed-loss pruning
 // ---------------------------------------------------------------------------
 
-fn step(config: &GameConfig, from: Pos, dir: Dir) -> Option<Pos> {
-    let w = config.board_width as i16;
-    let h = config.board_height as i16;
-    let (x, y) = (from as i16 % w, from as i16 / w);
-    let (dx, dy) = dir.delta();
-    let (nx, ny) = (x + dx, y + dy);
-    if nx < 0 || nx >= w || ny < 0 || ny >= h {
-        None
-    } else {
-        Some((ny * w + nx) as Pos)
-    }
-}
-
-fn last_direction(snake: &[Pos], width: i16) -> Option<Dir> {
-    let (head, neck) = (snake[0] as i16, *snake.get(1)? as i16);
-    if head == neck {
+fn last_dir(board: &FastBoard, i: usize) -> Option<Dir> {
+    let s = &board.snakes[i];
+    if s.len() < 2 || s.body[0] == s.body[1] {
         return None;
     }
-    match (head % width - neck % width, head / width - neck / width) {
+    let (head, neck) = (s.body[0] as i16, s.body[1] as i16);
+    match (head % board.w - neck % board.w, head / board.w - neck / board.w) {
         (0, -1) => Some(Dir::Up),
         (0, 1) => Some(Dir::Down),
         (-1, 0) => Some(Dir::Left),
@@ -468,9 +260,377 @@ fn last_direction(snake: &[Pos], width: i16) -> Option<Dir> {
     }
 }
 
+/// Non-reversing, on-board, non-wall moves; a trapped snake keeps all four
+/// (the search picks the least bad); the dead get a dummy.
+fn candidates(board: &FastBoard, i: usize) -> Vec<Dir> {
+    if !board.snakes[i].alive {
+        return vec![Dir::Up];
+    }
+    let head = board.snakes[i].head();
+    let reverse = last_dir(board, i).map(|d| d.opposite());
+    let mut v = Vec::with_capacity(4);
+    for &m in &DIRS {
+        if Some(m) == reverse {
+            continue;
+        }
+        match board.step_dir(head, m) {
+            Some(t) if !board.is_wall(t) => v.push(m),
+            _ => {}
+        }
+    }
+    if v.is_empty() {
+        v.extend_from_slice(&DIRS);
+    }
+    v
+}
+
+/// [`candidates`] minus guaranteed head-to-head losses: squares a
+/// longer-or-equal live opponent's head can also reach next turn. If every
+/// move is such a square, keep them all and let the search pick.
+fn safe_candidates(board: &FastBoard, i: usize) -> Vec<Dir> {
+    let base = candidates(board, i);
+    if base.len() <= 1 || !board.snakes[i].alive {
+        return base;
+    }
+    let my_len = board.snakes[i].len();
+    let mut danger: Vec<u16> = Vec::new();
+    for (j, s) in board.snakes.iter().enumerate() {
+        if j == i || !s.alive || s.len() < my_len {
+            continue;
+        }
+        for m in candidates(board, j) {
+            if let Some(t) = board.step_dir(s.head(), m) {
+                danger.push(t);
+            }
+        }
+    }
+    let head = board.snakes[i].head();
+    let safe: Vec<Dir> = base
+        .iter()
+        .copied()
+        .filter(|&m| {
+            board
+                .step_dir(head, m)
+                .map(|t| !danger.contains(&t))
+                .unwrap_or(false)
+        })
+        .collect();
+    if safe.is_empty() {
+        base
+    } else {
+        safe
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoupled-UCT search over joint moves
+// ---------------------------------------------------------------------------
+
+struct Node {
+    board: FastBoard,
+    cands: Vec<Vec<Dir>>,
+    visits: Vec<Vec<f32>>,
+    values: Vec<Vec<f32>>,
+    total: f32,
+    children: HashMap<u32, usize>,
+    terminal: bool,
+}
+
+impl Node {
+    fn new(board: FastBoard) -> Node {
+        let terminal = board.is_terminal();
+        let cands: Vec<Vec<Dir>> = (0..board.snakes.len())
+            .map(|i| safe_candidates(&board, i))
+            .collect();
+        let visits = cands.iter().map(|c| vec![0.0; c.len()]).collect();
+        let values = cands.iter().map(|c| vec![0.0; c.len()]).collect();
+        Node {
+            board,
+            cands,
+            visits,
+            values,
+            total: 0.0,
+            children: HashMap::new(),
+            terminal,
+        }
+    }
+
+    /// UCB1 for one snake: first unvisited candidate, else
+    /// argmax Q + c·√(ln(total+1)/n). Deterministic tie-break.
+    fn select(&self, i: usize) -> usize {
+        let n_cands = self.cands[i].len();
+        if n_cands == 1 {
+            return 0;
+        }
+        if let Some(c) = (0..n_cands).find(|&c| self.visits[i][c] == 0.0) {
+            return c;
+        }
+        let ln_total = (self.total + 1.0).ln();
+        let mut best = 0;
+        let mut best_score = f32::NEG_INFINITY;
+        for c in 0..n_cands {
+            let n = self.visits[i][c];
+            let q = self.values[i][c] / n;
+            let score = q + C_UCT * (ln_total / n).sqrt();
+            if score > best_score {
+                best_score = score;
+                best = c;
+            }
+        }
+        best
+    }
+}
+
+fn search(root: &FastBoard, me: usize, deadline: std::time::Instant) -> Dir {
+    let mut nodes = vec![Node::new(root.clone())];
+    let mut path: Vec<(usize, [usize; MAX_SNAKES])> = Vec::with_capacity(64);
+    let mut sims = 0usize;
+
+    while sims < MAX_SIMS {
+        if sims % 32 == 0 && std::time::Instant::now() >= deadline {
+            break;
+        }
+        path.clear();
+        let mut cur = 0usize;
+        let leaf_vals = loop {
+            if nodes[cur].terminal {
+                break evaluate(&nodes[cur].board);
+            }
+            let n = nodes[cur].board.snakes.len();
+            let mut cidx = [0usize; MAX_SNAKES];
+            let mut key = 0u32;
+            for (i, slot) in cidx.iter_mut().enumerate().take(n) {
+                let c = nodes[cur].select(i);
+                *slot = c;
+                key = key * 4 + c as u32;
+            }
+            path.push((cur, cidx));
+            match nodes[cur].children.get(&key) {
+                Some(&child) => cur = child,
+                None => {
+                    let mut child = nodes[cur].board.clone();
+                    let moves: Vec<Dir> =
+                        (0..n).map(|i| nodes[cur].cands[i][cidx[i]]).collect();
+                    child.step(&moves);
+                    let vals = evaluate(&child);
+                    let id = nodes.len();
+                    nodes.push(Node::new(child));
+                    nodes[cur].children.insert(key, id);
+                    break vals;
+                }
+            }
+        };
+        for &(nid, cidx) in &path {
+            let node = &mut nodes[nid];
+            node.total += 1.0;
+            for i in 0..node.board.snakes.len() {
+                node.visits[i][cidx[i]] += 1.0;
+                node.values[i][cidx[i]] += leaf_vals[i];
+            }
+        }
+        sims += 1;
+    }
+
+    // Argmax visits (Q breaks ties).
+    let root_node = &nodes[0];
+    let q = |c: usize| {
+        let n = root_node.visits[me][c];
+        if n > 0.0 {
+            root_node.values[me][c] / n
+        } else {
+            f32::NEG_INFINITY
+        }
+    };
+    let mut best = 0usize;
+    for c in 1..root_node.cands[me].len() {
+        if (root_node.visits[me][c], q(c)) > (root_node.visits[me][best], q(best)) {
+            best = c;
+        }
+    }
+    root_node.cands[me][best]
+}
+
+// ---------------------------------------------------------------------------
+// Time-expanded Voronoi evaluation (per-snake values in [-1, 1])
+// ---------------------------------------------------------------------------
+
+const UNCLAIMED: u8 = u8::MAX;
+const CONTESTED: u8 = u8::MAX - 1;
+
+fn evaluate(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    let mut vals = [-1.0f32; MAX_SNAKES];
+    if board.is_terminal() {
+        match board.winner() {
+            Some(w) => vals[w] = 1.0,
+            None => {
+                for v in vals.iter_mut().take(board.snakes.len()) {
+                    *v = DRAW_VALUE;
+                }
+            }
+        }
+        return vals;
+    }
+
+    let w = board.w as usize;
+    let cells = w * board.h as usize;
+    let alive: Vec<usize> = (0..board.snakes.len())
+        .filter(|&i| board.snakes[i].alive)
+        .collect();
+
+    // Turns until each cell is vacated (walls never are).
+    let mut blocked_until = vec![0u16; cells];
+    for pos in 0..cells as u16 {
+        if board.is_wall(pos) {
+            blocked_until[pos as usize] = u16::MAX;
+        }
+    }
+    for &i in &alive {
+        let s = &board.snakes[i];
+        let len = s.len();
+        for (k, &seg) in s.body.iter().enumerate() {
+            let c = seg as usize;
+            blocked_until[c] = blocked_until[c].max((len - k) as u16);
+        }
+    }
+
+    // Ownership race: longer snakes claim first within a turn; equal-length
+    // same-turn contests void the cell and stop both floods.
+    let mut owner = vec![UNCLAIMED; cells];
+    let mut arrival = vec![0u16; cells];
+    let mut race_order = alive.clone();
+    race_order.sort_by_key(|&i| std::cmp::Reverse(board.snakes[i].len()));
+    let mut frontier: Vec<Vec<usize>> = vec![Vec::new(); board.snakes.len()];
+    for &i in &alive {
+        frontier[i].push(board.snakes[i].head() as usize);
+    }
+    let mut t: u16 = 0;
+    while frontier.iter().any(|f| !f.is_empty()) && (t as usize) <= cells {
+        t += 1;
+        let mut next: Vec<Vec<usize>> = vec![Vec::new(); board.snakes.len()];
+        for &i in &race_order {
+            let my_len = board.snakes[i].len();
+            for &c in &frontier[i] {
+                if t > 1 && owner[c] != i as u8 {
+                    continue; // this frontier cell got contested away
+                }
+                let (x, y) = ((c % w) as i32, (c / w) as i32);
+                for (dx, dy) in [(0, 1), (0, -1), (1, 0), (-1, 0)] {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx < 0 || nx >= w as i32 || ny < 0 || ny >= board.h as i32 {
+                        continue;
+                    }
+                    let nc = ny as usize * w + nx as usize;
+                    if blocked_until[nc] > t {
+                        continue;
+                    }
+                    match owner[nc] {
+                        UNCLAIMED => {
+                            owner[nc] = i as u8;
+                            arrival[nc] = t;
+                            next[i].push(nc);
+                        }
+                        o if o != CONTESTED
+                            && o != i as u8
+                            && arrival[nc] == t
+                            && board.snakes[o as usize].len() == my_len =>
+                        {
+                            owner[nc] = CONTESTED;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+
+    let mut area = [0usize; MAX_SNAKES];
+    for c in 0..cells {
+        if owner[c] != UNCLAIMED && owner[c] != CONTESTED {
+            area[owner[c] as usize] += 1;
+        }
+    }
+    // Earliest arrival at food this snake wins the race to.
+    let mut food_dist = [u16::MAX; MAX_SNAKES];
+    for &f in &board.food {
+        let c = f as usize;
+        let o = owner[c];
+        if o != UNCLAIMED && o != CONTESTED {
+            let o = o as usize;
+            food_dist[o] = food_dist[o].min(arrival[c]);
+        }
+    }
+
+    let free = (0..cells).filter(|&c| blocked_until[c] == 0).count().max(1);
+    let n_alive = alive.len() as f32;
+    for &i in &alive {
+        let s = &board.snakes[i];
+        let len = s.len() as f32;
+        let area_score = ((area[i] as f32 / free as f32) * n_alive - 1.0).clamp(-1.0, 1.0);
+        let health = (s.health as f32 / 100.0) * 2.0 - 1.0;
+        let longest_other = alive
+            .iter()
+            .filter(|&&j| j != i)
+            .map(|&j| board.snakes[j].len())
+            .max()
+            .unwrap_or(0) as f32;
+        let length = ((len - longest_other) / 4.0).clamp(-1.0, 1.0);
+        // Hunger: the race between health and the nearest food we can win,
+        // weighted by how hungry we actually are.
+        let urgency = ((100.0 - s.health as f32) / 60.0).clamp(0.0, 1.0);
+        let margin = if food_dist[i] == u16::MAX {
+            -1.0
+        } else {
+            ((s.health as f32 - food_dist[i] as f32) / 25.0).clamp(-1.0, 1.0)
+        };
+        let food = urgency * margin;
+        // Trap: a reachable region smaller than the body is a death sentence.
+        let reach = reachable_cells(board, i, &blocked_until);
+        let trap = ((reach as f32 - len) / len).clamp(-1.0, 0.0);
+        vals[i] = (W_AREA * area_score
+            + W_HEALTH * health
+            + W_LENGTH * length
+            + W_FOOD * food
+            + W_TRAP * trap)
+            .clamp(-1.0, 1.0);
+    }
+    vals
+}
+
+/// Cells snake `i` can reach at all, opponents parked and tails decaying:
+/// enterable at step t+1 if vacated by then.
+fn reachable_cells(board: &FastBoard, i: usize, blocked_until: &[u16]) -> usize {
+    let w = board.w as usize;
+    let mut seen = vec![false; blocked_until.len()];
+    let mut queue = VecDeque::new();
+    let start = board.snakes[i].head() as usize;
+    seen[start] = true;
+    queue.push_back((start, 0u16));
+    let mut count = 0usize;
+    while let Some((c, t)) = queue.pop_front() {
+        let (x, y) = ((c % w) as i32, (c / w) as i32);
+        for (dx, dy) in [(0, 1), (0, -1), (1, 0), (-1, 0)] {
+            let (nx, ny) = (x + dx, y + dy);
+            if nx < 0 || nx >= w as i32 || ny < 0 || ny >= board.h as i32 {
+                continue;
+            }
+            let nc = ny as usize * w + nx as usize;
+            if seen[nc] || blocked_until[nc] > t + 1 {
+                continue;
+            }
+            seen[nc] = true;
+            count += 1;
+            queue.push_back((nc, t + 1));
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Engine;
+    use std::collections::BTreeMap;
 
     fn config() -> GameConfig {
         GameConfig {
@@ -480,13 +640,7 @@ mod tests {
         }
     }
 
-    fn play_duel(
-        a_diff: BotDifficulty,
-        a_budget: u32,
-        b_diff: BotDifficulty,
-        b_budget: u32,
-        seed: u64,
-    ) -> (u32, u32) {
+    fn play_duel(a_budget: u32, b_budget: u32, seed: u64) -> (u32, u32) {
         let a: PlayerId = "a".into();
         let b: PlayerId = "b".into();
         let mut engine = Engine::new(config(), vec![a.clone(), b.clone()], seed);
@@ -496,11 +650,18 @@ mod tests {
                 break;
             }
             let mut moves = BTreeMap::new();
-            for (p, d, budget) in [(&a, a_diff, a_budget), (&b, b_diff, b_budget)] {
+            for (p, budget) in [(&a, a_budget), (&b, b_budget)] {
                 if turn.alive.contains(p) {
                     moves.insert(
                         p.clone(),
-                        choose_move(&config(), &turn, p, d, seed * 1000 + i, Some(budget)),
+                        choose_move(
+                            &config(),
+                            &turn,
+                            p,
+                            BotDifficulty::Hard,
+                            seed * 1000 + i,
+                            Some(budget),
+                        ),
                     );
                 }
             }
@@ -516,22 +677,22 @@ mod tests {
         (survival(&a), survival(&b))
     }
 
-    /// A solo hard bot must cruise indefinitely.
+    /// A solo hard bot must cruise indefinitely (food discipline included).
     #[test]
     fn hard_bot_survives_solo() {
         let me: PlayerId = "bot".to_string();
         let mut engine = Engine::new(config(), vec![me.clone()], 9);
         let mut turn = engine.first_turn();
-        for i in 0..120 {
+        for i in 0..150 {
             assert!(turn.alive.contains(&me), "hard bot died at turn {i}");
-            let mv = choose_move(&config(), &turn, &me, BotDifficulty::Hard, 1000 + i, Some(20));
+            let mv = choose_move(&config(), &turn, &me, BotDifficulty::Hard, i, Some(15));
             let mut moves = BTreeMap::new();
             moves.insert(me.clone(), mv);
             turn = engine.next_turn(&turn, &moves);
         }
     }
 
-    /// The budget is honoured (this is the whole point of the design).
+    /// The budget is honoured.
     #[test]
     fn budget_is_respected() {
         let me: PlayerId = "bot".to_string();
@@ -542,33 +703,52 @@ mod tests {
             choose_move(&config(), &turn, &me, BotDifficulty::Hard, i, Some(100));
         }
         let per_move = start.elapsed().as_millis() / 10;
-        // Generous slack for debug builds; release is comfortably under.
         assert!(per_move < 400, "hard move took {per_move}ms against 100ms budget");
     }
 
-    /// More thinking time must actually buy strength: hard (40ms) should
-    /// dominate easy (4ms) across a handful of duels.
+    /// Thinking time must buy strength: 40ms should dominate 3ms.
     #[test]
-    fn hard_beats_easy() {
-        let mut hard_wins = 0;
-        let mut easy_wins = 0;
+    fn more_time_wins() {
+        let mut strong_wins = 0;
+        let mut weak_wins = 0;
         for seed in 0..5u64 {
-            let (hard, easy) = play_duel(
-                BotDifficulty::Hard,
-                40,
-                BotDifficulty::Easy,
-                4,
-                42 + seed,
-            );
-            if hard > easy {
-                hard_wins += 1;
-            } else if easy > hard {
-                easy_wins += 1;
+            let (strong, weak) = play_duel(40, 3, 42 + seed);
+            if strong > weak {
+                strong_wins += 1;
+            } else if weak > strong {
+                weak_wins += 1;
             }
         }
         assert!(
-            hard_wins > easy_wins,
-            "hard should outlast easy (hard {hard_wins} vs easy {easy_wins})"
+            strong_wins > weak_wins,
+            "more time should outlast less (strong {strong_wins} vs weak {weak_wins})"
         );
+    }
+
+    /// The pruner never leaves a losable head-to-head when an out exists.
+    #[test]
+    fn avoids_guaranteed_headon_loss() {
+        let me: PlayerId = "a".into();
+        let mut engine = Engine::new(config(), vec![me.clone(), "b".into()], 21);
+        let turn = engine.first_turn();
+        let order: Vec<&PlayerId> = turn.alive.iter().collect();
+        let board = FastBoard::from_turn(&config(), &turn, &order);
+        let my_idx = order.iter().position(|p| **p == me).unwrap();
+        for m in safe_candidates(&board, my_idx) {
+            let t = board.step_dir(board.snakes[my_idx].head(), m).unwrap();
+            for (j, s) in board.snakes.iter().enumerate() {
+                if j == my_idx || s.len() < board.snakes[my_idx].len() {
+                    continue;
+                }
+                for om in candidates(&board, j) {
+                    assert_ne!(
+                        Some(t),
+                        board.step_dir(s.head(), om),
+                        "unsafe candidate survived pruning"
+                    );
+                }
+            }
+        }
+        let _ = engine; // keep the engine alive for symmetry
     }
 }
