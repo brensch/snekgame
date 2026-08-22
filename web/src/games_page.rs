@@ -141,7 +141,7 @@ pub fn home_page() -> impl IntoView {
                 <a href="#/history">"Game history →"</a>
             </p>
             <p>
-                <a href="#/compute">"Bot farm →"</a>
+                <a href="#/compute">"Botnet →"</a>
             </p>
 
             <div style="margin-top: 40px;">

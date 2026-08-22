@@ -47,8 +47,11 @@ pub fn compute_page() -> impl IntoView {
 
     view! {
         <div>
-            <h2 style="margin-top: 22px;">"🧠 bot farm"</h2>
-            <p class="footnote">"thankyou for being part of my botnet."</p>
+            <h2 style="margin-top: 22px;">"🧠 botnet"</h2>
+            <p class="footnote">
+                "the bot engine is run in the browser by whoever has the "
+                "fastest device as you play"
+            </p>
             {move || {
                 if failed.get() {
                     return view! { <div class="banner error">"Couldn't load stats."</div> }
