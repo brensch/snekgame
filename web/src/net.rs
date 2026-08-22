@@ -453,6 +453,20 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
         });
     }
 
+    // Session hosts contribute compute: measure this device's real search
+    // speed (~600ms of actual search, chunked so the UI stays alive) and
+    // report it. The server assigns bots to the fastest phones.
+    if matches!(mode, Mode::Session(_)) {
+        spawn_local(async move {
+            let rate = benchmark_sims_per_sec(generation).await;
+            if is_current(generation) {
+                if let Some(rate) = rate {
+                    send(&ClientMsg::Benchmark { sims_per_sec: rate });
+                }
+            }
+        });
+    }
+
     // Reconnect when the transport dies.
     spawn_local(async move {
         let _ = JsFuture::from(transport.closed()).await;
@@ -463,6 +477,34 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
     });
 
     Ok(())
+}
+
+/// ~600ms of genuine search on a synthetic board, yielding between chunks.
+async fn benchmark_sims_per_sec(generation: u64) -> Option<u32> {
+    use snek_shared::{Engine, GameConfig};
+    let config = GameConfig {
+        board_width: 13,
+        board_height: 13,
+        tick_ms: 1000,
+    };
+    let a: snek_shared::PlayerId = "bench-a".into();
+    let mut engine = Engine::new(config, vec![a.clone(), "bench-b".into()], 1);
+    let turn = engine.first_turn();
+
+    const CHUNK: u32 = 1_500;
+    let start = now();
+    let mut total: u64 = 0;
+    while now() - start < 600.0 {
+        if !is_current(generation) {
+            return None;
+        }
+        let _ = snek_shared::bot::think(&config, &turn, &a, CHUNK, 0);
+        total += CHUNK as u64;
+        // Yield so input/rendering stay responsive during the benchmark.
+        gloo_timers::future::TimeoutFuture::new(0).await;
+    }
+    let elapsed = (now() - start).max(1.0);
+    Some(((total as f64) * 1000.0 / elapsed) as u32)
 }
 
 fn schedule_reconnect(store: Store, generation: u64) {
@@ -569,6 +611,23 @@ fn apply(store: Store, msg: ServerMsg) {
                 players,
                 turns,
             }));
+        }
+        ServerMsg::ComputeRequest {
+            request_id,
+            bot_id,
+            bot_name,
+            config,
+            turn,
+            sims,
+            nonce,
+        } => {
+            store.hosting.set(Some((bot_name, now())));
+            // Deterministic search; the proof binds the nonce to the work.
+            spawn_local(async move {
+                let (dir, _work) = snek_shared::bot::think(&config, &turn, &bot_id, sims, nonce);
+                let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
+                send(&ClientMsg::BotMove { request_id, dir, proof });
+            });
         }
         ServerMsg::GameSaved { id } => store.saved_id.set(Some(id)),
         ServerMsg::Error(e) => store.error.set(Some(e)),

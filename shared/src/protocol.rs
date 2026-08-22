@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// The client-editable part of a profile. The public player id is derived
 /// server-side (a hash of the client's private secret), so a client can never
@@ -53,6 +53,15 @@ pub enum ClientMsg {
     /// Alternative first message: subscribe to the active-games list
     /// instead of joining a session (used by the home screen).
     WatchGames,
+    /// Self-measured search speed (sims/sec), from ~600ms of real search in
+    /// the lobby. Makes this connection eligible to host bot compute; the
+    /// fastest phones get picked first.
+    Benchmark { sims_per_sec: u32 },
+    /// Answer to a `ComputeRequest`: the deterministic search result plus
+    /// the proof binding the nonce to the work performed. The server
+    /// randomly re-runs the identical search to audit; mismatches strike
+    /// the host and eventually ban it from computing.
+    BotMove { request_id: u64, dir: Dir, proof: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,6 +105,18 @@ pub enum ServerMsg {
     GameSaved { id: i64 },
     /// Active-games list push (for WatchGames subscribers).
     Sessions(Vec<SessionSummary>),
+    /// Run the bot search for `bot_id` on this device: exactly `sims`
+    /// simulations from `turn`, echoing `nonce` inside the proof. Due back
+    /// before the next tick.
+    ComputeRequest {
+        request_id: u64,
+        bot_id: PlayerId,
+        bot_name: String,
+        config: GameConfig,
+        turn: Turn,
+        sims: u32,
+        nonce: u64,
+    },
     Error(String),
     Pong(u32),
 }

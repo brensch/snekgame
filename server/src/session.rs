@@ -163,6 +163,18 @@ pub enum Cmd {
 struct Conn {
     player: PlayerId,
     tx: mpsc::Sender<Frame>,
+    /// Self-reported search speed; present = eligible to host bot compute.
+    sims_per_sec: Option<u32>,
+    /// Audit/timeout strikes; too many bans the conn from hosting.
+    strikes: u32,
+}
+
+struct PendingCompute {
+    bot_id: PlayerId,
+    conn_id: u64,
+    turn: Turn,
+    sims: u32,
+    nonce: u64,
 }
 
 struct RunningGame {
@@ -187,6 +199,11 @@ struct SessionActor {
     bot_counter: u32,
     ready: HashSet<PlayerId>,
     game: Option<RunningGame>,
+    /// bot id -> conn currently computing for it.
+    bot_hosts: HashMap<PlayerId, u64>,
+    /// outstanding compute requests: id -> (bot, conn, inputs for audit).
+    pending_compute: HashMap<u64, PendingCompute>,
+    next_request_id: u64,
     next_tick: Option<Instant>,
     /// Set when the last connection drops; the actor tidies itself away
     /// after EMPTY_GRACE unless someone comes back.
@@ -211,6 +228,9 @@ impl SessionActor {
             bot_counter: 0,
             ready: HashSet::new(),
             game: None,
+            bot_hosts: HashMap::new(),
+            pending_compute: HashMap::new(),
+            next_request_id: 1,
             next_tick: None,
             empty_deadline: None,
             last_winners: Vec::new(),
@@ -287,8 +307,15 @@ impl SessionActor {
                     Conn {
                         player: profile.id.clone(),
                         tx,
+                        sims_per_sec: None,
+                        strikes: 0,
                     },
                 );
+                // A watcher arriving un-pauses a game frozen for lack of one.
+                if self.game.is_some() && self.next_tick.is_none() {
+                    self.next_tick =
+                        Some(Instant::now() + Duration::from_millis(self.config.tick_ms as u64));
+                }
                 self.upsert_lobby_player(profile);
                 // Late joiner while a game runs: catch them up so they can
                 // spectate (or resume, if they are in it).
@@ -315,6 +342,7 @@ impl SessionActor {
                 if self.conns.is_empty() {
                     self.empty_deadline = Some(Instant::now() + EMPTY_GRACE);
                 }
+                self.assign_bots();
                 self.broadcast_lobby().await;
             }
             Cmd::Msg { conn_id, msg } => self.client_msg(conn_id, msg).await,
@@ -401,6 +429,44 @@ impl SessionActor {
                     self.broadcast_lobby().await;
                 }
             }
+            ClientMsg::Benchmark { sims_per_sec } => {
+                if let Some(conn) = self.conns.get_mut(&conn_id) {
+                    // Clamp against absurd claims; audits keep them honest.
+                    conn.sims_per_sec = Some(sims_per_sec.clamp(500, 2_000_000));
+                }
+                self.assign_bots();
+            }
+            ClientMsg::BotMove { request_id, dir, proof } => {
+                let Some(pending) = self.pending_compute.remove(&request_id) else {
+                    return; // stale or bogus
+                };
+                if pending.conn_id != conn_id {
+                    // Someone answered a request that wasn't theirs.
+                    self.strike(conn_id, "answered another host's request");
+                    return;
+                }
+                // Guard, not fortress: the checksum must bind our nonce and
+                // request id to the move. Cheap to verify, impossible to
+                // replay. (The deterministic search keeps full recompute
+                // audits on the table if cheating ever gets real.)
+                if proof != bot::bind_proof(pending.nonce, request_id, dir) {
+                    self.strike(conn_id, "bad response checksum");
+                    return;
+                }
+                if let Some(game) = &mut self.game {
+                    let current = game.turns.last().map(|t| t.turn_number);
+                    if current == Some(pending.turn.turn_number)
+                        && game
+                            .turns
+                            .last()
+                            .map(|t| t.alive.contains(&pending.bot_id))
+                            .unwrap_or(false)
+                    {
+                        game.pending.insert(pending.bot_id.clone(), dir);
+                    }
+                }
+
+            }
             ClientMsg::Ping(n) => {
                 self.send_to(conn_id, control_frame(&ServerMsg::Pong(n))).await;
             }
@@ -459,6 +525,8 @@ impl SessionActor {
         self.publish_info();
         self.next_tick =
             Some(Instant::now() + Duration::from_millis(COUNTDOWN_MS as u64));
+        self.assign_bots();
+        self.issue_compute_requests().await;
     }
 
     async fn tick(&mut self) {
@@ -467,29 +535,55 @@ impl SessionActor {
             return;
         };
 
-        // Bots think in parallel on blocking threads (PUCT is time-budgeted,
-        // capped by tick length so the game loop never slips).
+        // Nobody watching: the bots don't play. Freeze the tick loop; the
+        // next human connection resumes it.
+        if self.conns.is_empty() {
+            self.next_tick = None;
+            return;
+        }
+
+        // Distributed compute reconciliation: hosts whose requests never
+        // came back get a strike (and their bots fail over); the missing
+        // moves fall back to a quick server-side search so the bot never
+        // just walls itself.
         let current = game.turns.last().unwrap().clone();
-        let tick_cap = (self.config.tick_ms / 3).max(5);
-        let handles: Vec<_> = self
-            .bots
-            .iter()
-            .filter(|(id, _)| current.alive.contains(*id))
-            .map(|(bot_id, &difficulty)| {
-                let config = self.config;
-                let turn = current.clone();
-                let id = bot_id.clone();
-                let seed = rand::random::<u64>();
-                let budget = bot::budget_ms(difficulty).min(tick_cap);
-                tokio::task::spawn_blocking(move || {
-                    let mv = bot::choose_move(&config, &turn, &id, difficulty, seed, Some(budget));
-                    (id, mv)
+        let mut late_hosts: Vec<u64> = Vec::new();
+        let mut missing: Vec<PlayerId> = Vec::new();
+        for pc in self.pending_compute.values() {
+            if pc.turn.turn_number == current.turn_number
+                && current.alive.contains(&pc.bot_id)
+                && !game.pending.contains_key(&pc.bot_id)
+            {
+                late_hosts.push(pc.conn_id);
+            }
+        }
+        for bot_id in self.bots.keys() {
+            if current.alive.contains(bot_id) && !game.pending.contains_key(bot_id) {
+                missing.push(bot_id.clone());
+            }
+        }
+        late_hosts.sort_unstable();
+        late_hosts.dedup();
+        for conn_id in late_hosts {
+            self.strike(conn_id, "compute request timed out");
+        }
+        if !missing.is_empty() {
+            let handles: Vec<_> = missing
+                .into_iter()
+                .map(|id| {
+                    let config = self.config;
+                    let turn = current.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mv = bot::quick_move(&config, &turn, &id, 2_500);
+                        (id, mv)
+                    })
                 })
-            })
-            .collect();
-        for handle in handles {
-            if let Ok((id, mv)) = handle.await {
-                game.pending.insert(id, mv);
+                .collect();
+            let game = self.game.as_mut().unwrap();
+            for handle in handles {
+                if let Ok((id, mv)) = handle.await {
+                    game.pending.insert(id, mv);
+                }
             }
         }
         let game = self.game.as_mut().unwrap();
@@ -507,12 +601,18 @@ impl SessionActor {
         } else {
             self.next_tick =
                 Some(Instant::now() + Duration::from_millis(self.config.tick_ms as u64));
+            if self.bot_hosts.is_empty() {
+                self.assign_bots();
+            }
+            self.issue_compute_requests().await;
         }
     }
 
     async fn finish_game(&mut self) {
         let Some(game) = self.game.take() else { return };
         self.next_tick = None;
+        self.pending_compute.clear();
+        self.bot_hosts.clear();
 
         let record = GameRecord {
             config: self.config,
@@ -544,6 +644,110 @@ impl SessionActor {
         }
 
         self.broadcast_lobby().await;
+    }
+
+    /// Spread bots across eligible hosts (benchmarked, un-banned conns),
+    /// fastest phones first: bot i goes to host (i mod n) in speed order.
+    fn assign_bots(&mut self) {
+        let mut hosts: Vec<(u64, u32)> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.strikes < 3)
+            .filter_map(|(&id, c)| c.sims_per_sec.map(|r| (id, r)))
+            .collect();
+        hosts.sort_by_key(|&(id, r)| (std::cmp::Reverse(r), id));
+        self.bot_hosts.clear();
+        if hosts.is_empty() {
+            return;
+        }
+        let mut bot_ids: Vec<&PlayerId> = self.bots.keys().collect();
+        bot_ids.sort();
+        for (i, bot_id) in bot_ids.into_iter().enumerate() {
+            self.bot_hosts
+                .insert(bot_id.clone(), hosts[i % hosts.len()].0);
+        }
+    }
+
+    /// A host misbehaved (timeout / bad audit / wrong request). Three
+    /// strikes bans it from hosting and its bots move to the next phone.
+    fn strike(&mut self, conn_id: u64, why: &'static str) {
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.strikes += 1;
+            tracing::info!(session = %self.name, conn = conn_id, why, strikes = conn.strikes,
+                "compute host strike");
+            if conn.strikes >= 3 {
+                conn.sims_per_sec = None; // no longer eligible
+            }
+        }
+        self.assign_bots();
+    }
+
+    /// Kick off next-turn compute on the assigned phones: each request is
+    /// (turn, sims, nonce), due back before the next tick.
+    async fn issue_compute_requests(&mut self) {
+        let Some(game) = &self.game else { return };
+        let turn = game.turns.last().unwrap().clone();
+        if turn.game_over() {
+            return;
+        }
+        self.pending_compute.clear();
+        // How many bots each host carries this turn (splits their budget).
+        let mut load: HashMap<u64, u32> = HashMap::new();
+        for (bot_id, conn_id) in &self.bot_hosts {
+            if turn.alive.contains(bot_id) {
+                *load.entry(*conn_id).or_default() += 1;
+            }
+        }
+        let mut requests: Vec<(u64, Frame)> = Vec::new();
+        for (bot_id, &difficulty) in &self.bots {
+            if !turn.alive.contains(bot_id) {
+                continue;
+            }
+            let Some(&conn_id) = self.bot_hosts.get(bot_id) else {
+                continue; // no hosts: tick() falls back server-side
+            };
+            let Some(conn) = self.conns.get(&conn_id) else { continue };
+            let rate = conn.sims_per_sec.unwrap_or(10_000) as u64;
+            let share = load.get(&conn_id).copied().unwrap_or(1).max(1) as u64;
+            // difficulty ms of thinking at this phone's speed, split across
+            // its bots, capped so it always fits inside a tick.
+            let think_ms = (bot::budget_ms(difficulty) as u64).min(self.config.tick_ms as u64 / 2);
+            let sims = (rate * think_ms / 1000 / share).clamp(300, 60_000) as u32;
+            let request_id = self.next_request_id;
+            self.next_request_id += 1;
+            let nonce = rand::random::<u64>();
+            self.pending_compute.insert(
+                request_id,
+                PendingCompute {
+                    bot_id: bot_id.clone(),
+                    conn_id,
+                    turn: turn.clone(),
+                    sims,
+                    nonce,
+                },
+            );
+            let bot_name = self
+                .lobby
+                .iter()
+                .find(|p| p.id == *bot_id)
+                .map(|p| p.name.clone())
+                .unwrap_or_default();
+            requests.push((
+                conn_id,
+                control_frame(&ServerMsg::ComputeRequest {
+                    request_id,
+                    bot_id: bot_id.clone(),
+                    bot_name,
+                    config: self.config,
+                    turn: turn.clone(),
+                    sims,
+                    nonce,
+                }),
+            ));
+        }
+        for (conn_id, frame) in requests {
+            self.send_to(conn_id, frame).await;
+        }
     }
 
     async fn broadcast_lobby(&mut self) {

@@ -445,6 +445,19 @@ fn game_view(game: GameView) -> impl IntoView {
             </p>
             {board_view(game.config, game.players.clone(), &turn, me.clone(), on_cell)}
             {show_dpad.then(dpad)}
+            {move || {
+                store
+                    .hosting
+                    .get()
+                    .filter(|(_, at)| store.now_ms.get() - at < 2_500.0)
+                    .map(|(name, _)| {
+                        view! {
+                            <p class="footnote" style="text-align: center;">
+                                "🧠 your phone is thinking for " {name}
+                            </p>
+                        }
+                    })
+            }}
             {countdown}
             {results}
         </div>

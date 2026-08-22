@@ -302,3 +302,67 @@ async fn http_get_bytes(port: u16, path: &str) -> Vec<u8> {
     assert!(head.contains("200 OK"), "bad response: {head}");
     buf[split + 4..].to_vec()
 }
+
+#[tokio::test]
+async fn distributed_compute_round_trip() {
+    let dir = std::env::temp_dir().join(format!("snek-dist-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("dist.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let (_, registry) = snek_server::build(&db_path);
+    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    let mut alice = Client::connect(wt_port, "dist-test", "alice-secret-0000", info("alice")).await;
+    // Fast board so the game resolves quickly.
+    alice
+        .control(&ClientMsg::Configure(GameConfig {
+            board_width: 11,
+            board_height: 11,
+            tick_ms: 250,
+        }))
+        .await;
+    // Become a compute host, add a bot, go.
+    alice.control(&ClientMsg::Benchmark { sims_per_sec: 50_000 }).await;
+    alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Medium)).await;
+    alice.control(&ClientMsg::SetReady(true)).await;
+    alice.control(&ClientMsg::Start).await;
+
+    let mut compute_requests = 0u32;
+    let mut game_over = false;
+    for _ in 0..600 {
+        match alice.next_msg().await {
+            ServerMsg::ComputeRequest {
+                request_id,
+                bot_id,
+                config,
+                turn,
+                sims,
+                nonce,
+                ..
+            } => {
+                compute_requests += 1;
+                // Exactly what the browser does: deterministic search, then
+                // the nonce+request binding checksum.
+                let (dir, _work) = snek_shared::bot::think(&config, &turn, &bot_id, sims, nonce);
+                let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
+                alice
+                    .control(&ClientMsg::BotMove { request_id, dir, proof })
+                    .await;
+            }
+            ServerMsg::Turn(t) if t.game_over() => {
+                game_over = true;
+            }
+            ServerMsg::GameSaved { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(game_over, "game never finished");
+    assert!(
+        compute_requests > 0,
+        "server never delegated compute to the benchmarked client"
+    );
+}

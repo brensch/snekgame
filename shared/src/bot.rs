@@ -22,9 +22,13 @@
 //!   mirroring the real engine's rules (food-spawn-free lookahead), so a
 //!   descent costs microseconds instead of cloning string-keyed maps.
 //!
-//! Difficulty is purely thinking time: easy 8ms, medium 35ms, hard 100ms
-//! per move (the server caps by tick length and runs bots on blocking
-//! threads). Hard sustains tens of thousands of simulations per move.
+//! Difficulty is purely thinking budget. The search is **deterministic and
+//! bit-identical across platforms** for a fixed simulation count (UCB's
+//! `ln` uses a platform-exact approximation), which is what makes
+//! distributed compute auditable: the server hands a phone
+//! `(turn, sims, nonce)`, the phone returns `(move, proof)` where the
+//! proof hashes the nonce with the root visit statistics, and the server
+//! can recompute the identical search at any time to catch tampering.
 
 use crate::types::*;
 use std::collections::{HashMap, VecDeque};
@@ -56,32 +60,81 @@ const DIRS: [Dir; 4] = [Dir::Up, Dir::Down, Dir::Left, Dir::Right];
 // Public entry
 // ---------------------------------------------------------------------------
 
-pub fn choose_move(
+/// Deterministic move for a fixed simulation count, plus a tamper-evidence
+/// proof: fnv1a over the nonce, the chosen move, and the root visit
+/// distribution. Identical on every platform for identical inputs, so any
+/// party can re-run the search and verify both outputs.
+pub fn think(
     config: &GameConfig,
     turn: &Turn,
     me: &PlayerId,
-    difficulty: BotDifficulty,
-    _seed: u64,
-    budget_ms_override: Option<u32>,
-) -> Dir {
-    let budget = budget_ms_override.unwrap_or_else(|| budget_ms(difficulty));
-
+    sims: u32,
+    nonce: u64,
+) -> (Dir, u64) {
     // Index the world: alive snakes in turn order, me somewhere among them.
     let order: Vec<&PlayerId> = turn.alive.iter().collect();
     let Some(me_idx) = order.iter().position(|p| *p == me) else {
-        return Dir::Up; // dead already
+        return (Dir::Up, fnv1a(&[nonce, 0]));
     };
     let board = FastBoard::from_turn(config, turn, &order);
 
     let root_cands = safe_candidates(&board, me_idx);
     match root_cands.len() {
-        0 => return Dir::Up,
-        1 => return root_cands[0],
+        0 => return (Dir::Up, fnv1a(&[nonce, 1])),
+        1 => {
+            let d = root_cands[0];
+            return (d, fnv1a(&[nonce, 2, dir_index(d) as u64]));
+        }
         _ => {}
     }
+    search(&board, me_idx, sims as usize, nonce)
+}
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget as u64);
-    search(&board, me_idx, deadline)
+/// The response checksum a compute host must include: binds the server's
+/// nonce and request id to the chosen move. Verified server-side in
+/// nanoseconds; a response without the right binding is discarded and
+/// strikes the host. (Proves the request was received and answered
+/// deliberately — not that the search ran honestly; the deterministic
+/// `think` keeps full recompute-audits available if ever needed.)
+pub fn bind_proof(nonce: u64, request_id: u64, dir: Dir) -> u64 {
+    fnv1a(&[nonce, request_id, dir_index(dir) as u64, 0x736e_656b])
+}
+
+/// A quick server-side move (fallbacks and audits): same search, small sims.
+pub fn quick_move(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32) -> Dir {
+    think(config, turn, me, sims, 0).0
+}
+
+fn dir_index(d: Dir) -> usize {
+    DIRS.iter().position(|&x| x == d).unwrap_or(0)
+}
+
+fn fnv1a(words: &[u64]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for w in words {
+        for b in w.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    h
+}
+
+/// Bit-exact `ln` across native and wasm: IEEE mul/add/div/sqrt are exactly
+/// rounded everywhere, but libm's `ln` is not — so UCB uses this polynomial
+/// (exponent split + cubic in the mantissa). Accuracy ~1e-3, plenty for
+/// exploration terms; determinism is the point.
+fn fast_ln(x: f32) -> f32 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let bits = x.to_bits();
+    let e = ((bits >> 23) & 0xff) as i32 - 127;
+    let m = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000); // [1, 2)
+    // Least-squares cubic fit of log2(m) on [1,2); max error ~1.3e-3.
+    let (a, b, c, d) = (0.153_937f32, -1.029_631_1, 3.010_984_8, -2.133_964_3);
+    let l2 = ((a * m + b) * m + c) * m + d;
+    core::f32::consts::LN_2 * (e as f32 + l2)
 }
 
 // ---------------------------------------------------------------------------
@@ -365,7 +418,7 @@ impl Node {
         if let Some(c) = (0..n_cands).find(|&c| self.visits[i][c] == 0.0) {
             return c;
         }
-        let ln_total = (self.total + 1.0).ln();
+        let ln_total = fast_ln(self.total + 1.0);
         let mut best = 0;
         let mut best_score = f32::NEG_INFINITY;
         for c in 0..n_cands {
@@ -381,15 +434,12 @@ impl Node {
     }
 }
 
-fn search(root: &FastBoard, me: usize, deadline: std::time::Instant) -> Dir {
+fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64) -> (Dir, u64) {
     let mut nodes = vec![Node::new(root.clone())];
     let mut path: Vec<(usize, [usize; MAX_SNAKES])> = Vec::with_capacity(64);
     let mut sims = 0usize;
 
-    while sims < MAX_SIMS {
-        if sims % 32 == 0 && std::time::Instant::now() >= deadline {
-            break;
-        }
+    while sims < max_sims.min(MAX_SIMS) {
         path.clear();
         let mut cur = 0usize;
         let leaf_vals = loop {
@@ -447,7 +497,13 @@ fn search(root: &FastBoard, me: usize, deadline: std::time::Instant) -> Dir {
             best = c;
         }
     }
-    root_node.cands[me][best]
+    let dir = root_node.cands[me][best];
+    // Proof binds the nonce to the work actually performed.
+    let mut words: Vec<u64> = vec![nonce, dir_index(dir) as u64];
+    for c in 0..root_node.cands[me].len() {
+        words.push(root_node.visits[me][c] as u64);
+    }
+    (dir, fnv1a(&words))
 }
 
 // ---------------------------------------------------------------------------
@@ -640,29 +696,19 @@ mod tests {
         }
     }
 
-    fn play_duel(a_budget: u32, b_budget: u32, seed: u64) -> (u32, u32) {
+    fn play_duel(a_sims: u32, b_sims: u32, seed: u64) -> (u32, u32) {
         let a: PlayerId = "a".into();
         let b: PlayerId = "b".into();
         let mut engine = Engine::new(config(), vec![a.clone(), b.clone()], seed);
         let mut turn = engine.first_turn();
-        for i in 0..300 {
+        for _ in 0..300 {
             if turn.game_over() {
                 break;
             }
             let mut moves = BTreeMap::new();
-            for (p, budget) in [(&a, a_budget), (&b, b_budget)] {
+            for (p, sims) in [(&a, a_sims), (&b, b_sims)] {
                 if turn.alive.contains(p) {
-                    moves.insert(
-                        p.clone(),
-                        choose_move(
-                            &config(),
-                            &turn,
-                            p,
-                            BotDifficulty::Hard,
-                            seed * 1000 + i,
-                            Some(budget),
-                        ),
-                    );
+                    moves.insert(p.clone(), think(&config(), &turn, p, sims, 0).0);
                 }
             }
             turn = engine.next_turn(&turn, &moves);
@@ -679,40 +725,42 @@ mod tests {
 
     /// A solo hard bot must cruise indefinitely (food discipline included).
     #[test]
-    fn hard_bot_survives_solo() {
+    fn bot_survives_solo() {
         let me: PlayerId = "bot".to_string();
         let mut engine = Engine::new(config(), vec![me.clone()], 9);
         let mut turn = engine.first_turn();
         for i in 0..150 {
-            assert!(turn.alive.contains(&me), "hard bot died at turn {i}");
-            let mv = choose_move(&config(), &turn, &me, BotDifficulty::Hard, i, Some(15));
+            assert!(turn.alive.contains(&me), "bot died at turn {i}");
+            let (mv, _) = think(&config(), &turn, &me, 1500, 0);
             let mut moves = BTreeMap::new();
             moves.insert(me.clone(), mv);
             turn = engine.next_turn(&turn, &moves);
         }
     }
 
-    /// The budget is honoured.
+    /// The whole distributed-compute scheme rests on this: identical inputs
+    /// must give identical moves AND identical proofs, every time.
     #[test]
-    fn budget_is_respected() {
-        let me: PlayerId = "bot".to_string();
-        let mut engine = Engine::new(config(), vec![me.clone(), "x".into()], 3);
+    fn deterministic_move_and_proof() {
+        let a: PlayerId = "a".into();
+        let mut engine = Engine::new(config(), vec![a.clone(), "b".into()], 5);
         let turn = engine.first_turn();
-        let start = std::time::Instant::now();
-        for i in 0..10 {
-            choose_move(&config(), &turn, &me, BotDifficulty::Hard, i, Some(100));
-        }
-        let per_move = start.elapsed().as_millis() / 10;
-        assert!(per_move < 400, "hard move took {per_move}ms against 100ms budget");
+        let one = think(&config(), &turn, &a, 4000, 777);
+        let two = think(&config(), &turn, &a, 4000, 777);
+        assert_eq!(one, two, "search must be deterministic");
+        // Different nonce -> same move, different proof (nonce is bound in).
+        let three = think(&config(), &turn, &a, 4000, 778);
+        assert_eq!(one.0, three.0);
+        assert_ne!(one.1, three.1, "proof must bind the nonce");
     }
 
-    /// Thinking time must buy strength: 40ms should dominate 3ms.
+    /// More simulations must buy strength.
     #[test]
-    fn more_time_wins() {
+    fn more_sims_win() {
         let mut strong_wins = 0;
         let mut weak_wins = 0;
         for seed in 0..5u64 {
-            let (strong, weak) = play_duel(40, 3, 42 + seed);
+            let (strong, weak) = play_duel(6000, 300, 42 + seed);
             if strong > weak {
                 strong_wins += 1;
             } else if weak > strong {
@@ -721,7 +769,7 @@ mod tests {
         }
         assert!(
             strong_wins > weak_wins,
-            "more time should outlast less (strong {strong_wins} vs weak {weak_wins})"
+            "more sims should outlast fewer (strong {strong_wins} vs weak {weak_wins})"
         );
     }
 
@@ -749,6 +797,16 @@ mod tests {
                 }
             }
         }
-        let _ = engine; // keep the engine alive for symmetry
+        let _ = engine;
+    }
+
+    /// fast_ln tracks real ln closely enough for UCB.
+    #[test]
+    fn fast_ln_is_close() {
+        for i in 1..2000 {
+            let x = i as f32 * 0.37;
+            let err = (fast_ln(x) - x.ln()).abs();
+            assert!(err < 0.02, "fast_ln({x}) off by {err}");
+        }
     }
 }

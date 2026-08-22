@@ -27,6 +27,6 @@ wasm-bindgen-futures = "0.4"
 # duplicate wasm-bindgen shims and break LTO).
 wasm-streams = "0.5"
 futures-util = { version = "0.3", default-features = false }
-gloo-timers = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
 gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
 console_error_panic_hook = "0.1"
