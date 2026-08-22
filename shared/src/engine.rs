@@ -290,8 +290,8 @@ impl Engine {
                 Some(t) if !self.config.is_wall(t) => t,
                 _ => {
                     // Off the board or into the wall: die where you stood.
-                    // (Body stays on the board for this tick's collisions,
-                    // matching tac.)
+                    // The corpse is removed before cross-snake collisions —
+                    // running into a snake that died this tick is safe.
                     dead.push(player.clone());
                     let body = snake.clone();
                     clashes.extend(body.into_iter().map(|pos| Clash {
@@ -317,15 +317,19 @@ impl Engine {
             snake.insert(0, target);
         }
 
-        // --- Cross-snek collisions ----------------------------------------
-        // Occupancy including sneks that died to walls this tick (their body
-        // still blocks), matching tac's resolution order.
+        // Phase 1 deaths (walls, self-collisions) resolve first and their
+        // corpses leave the board: a snake that died this tick cannot kill
+        // anyone else.
+        remove_dead(&mut snakes, &mut health, &mut alive, &dead);
+        dead.clear();
+
+        // --- Cross-snek collisions (among survivors, simultaneously) ------
         let mut heads_at: BTreeMap<Pos, Vec<PlayerId>> = BTreeMap::new();
         let mut occupants_at: BTreeMap<Pos, Vec<PlayerId>> = BTreeMap::new();
         for (player, snake) in &snakes {
             for (i, &pos) in snake.iter().enumerate() {
                 occupants_at.entry(pos).or_default().push(player.clone());
-                if i == 0 && alive.contains(player) && !dead.contains(player) {
+                if i == 0 {
                     heads_at.entry(pos).or_default().push(player.clone());
                 }
             }
@@ -677,6 +681,43 @@ mod tests {
         t.food.clear();
         let t2 = e.next_turn(&t, &moves(&[("a", Dir::Right), ("b", Dir::Down)]));
         assert!(!t2.food.is_empty(), "min food must be maintained");
+    }
+
+    /// Regression of game #99's ending: A drives into the wall on the same
+    /// tick B steps onto A's tail cell. A's corpse must not kill B.
+    #[test]
+    fn same_tick_corpse_is_not_lethal() {
+        let a: PlayerId = "a".into();
+        let b: PlayerId = "b".into();
+        let mut engine = Engine::new(config(), vec![a.clone(), b.clone()], 1);
+        let mut snakes = BTreeMap::new();
+        // A: head 50 = (11,3), the last playable column; Right = wall.
+        snakes.insert(a.clone(), vec![50, 49, 48, 47, 60, 59, 58, 57]);
+        // B: head 44 = (5,3)... Down would be 57 only from 44? 44+13=57 ✓.
+        snakes.insert(b.clone(), vec![44, 31, 18, 19, 20, 33]);
+        let turn = Turn {
+            turn_number: 57,
+            health: [(a.clone(), 90u8), (b.clone(), 90u8)].into_iter().collect(),
+            snakes,
+            alive: vec![a.clone(), b.clone()],
+            food: vec![],
+            moves: BTreeMap::new(),
+            clashes: Vec::new(),
+            winners: Vec::new(),
+        };
+        let next = engine.next_turn(
+            &turn,
+            &moves(&[("a", Dir::Right), ("b", Dir::Down)]),
+        );
+        assert!(!next.alive.contains(&a), "A hit the wall and must die");
+        assert!(
+            next.alive.contains(&b),
+            "B stepped onto a same-tick corpse and must survive: {:?}",
+            next.clashes
+        );
+        assert_eq!(next.snakes[&b][0], 57, "B lands on the vacated cell");
+        assert!(next.game_over(), "sole survivor ends the game");
+        assert_eq!(next.winners.first().map(|w| w.player.clone()), Some(b));
     }
 
     #[test]

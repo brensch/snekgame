@@ -211,13 +211,14 @@ impl FastBoard {
     }
 
     /// One tick of the real rules (minus random food spawns): wall/self
-    /// deaths leave the body blocking this tick, head-on kills the shorter,
-    /// then eating and starvation.
+    /// deaths resolve first and their corpses leave the board (a snake that
+    /// died this tick cannot kill anyone), then head-on/body collisions
+    /// among the survivors, then eating and starvation.
     fn step(&mut self, moves: &[Dir]) {
         let n = self.snakes.len();
-        let mut died = [false; MAX_SNAKES];
 
-        // Movement (tail pops before self-check, exactly like the engine).
+        // Movement (tail pops before self-check, exactly like the engine);
+        // phase-1 deaths are removed immediately.
         for i in 0..n {
             if !self.snakes[i].alive {
                 continue;
@@ -227,18 +228,23 @@ impl FastBoard {
                 Some(t) if !self.is_wall(t) => {
                     self.snakes[i].body.pop_back();
                     if self.snakes[i].body.contains(&t) {
-                        died[i] = true; // self-collision; body blocks this tick
+                        self.snakes[i].alive = false; // self-collision
+                        self.alive_count -= 1;
                     } else {
                         self.snakes[i].body.push_front(t);
                     }
                 }
-                _ => died[i] = true, // wall; body blocks this tick
+                _ => {
+                    self.snakes[i].alive = false; // wall
+                    self.alive_count -= 1;
+                }
             }
         }
 
-        // Cross-snake collisions (bodies of this tick's dead still block).
+        // Cross-snake collisions among survivors, simultaneously.
+        let mut died = [false; MAX_SNAKES];
         for i in 0..n {
-            if !self.snakes[i].alive || died[i] {
+            if !self.snakes[i].alive {
                 continue;
             }
             let head = self.snakes[i].head();
@@ -247,14 +253,12 @@ impl FastBoard {
                 if j == i || !self.snakes[j].alive {
                     continue;
                 }
-                if self.snakes[j].head() == head && !died[j] {
+                if self.snakes[j].head() == head {
                     // Head-on: shortest dies, ties kill both.
                     if my_len <= self.snakes[j].len() {
                         died[i] = true;
                     }
-                } else if self.snakes[j].body.iter().skip(1).any(|&c| c == head)
-                    || (died[j] && self.snakes[j].head() == head)
-                {
+                } else if self.snakes[j].body.iter().skip(1).any(|&c| c == head) {
                     died[i] = true;
                 }
             }
@@ -793,6 +797,35 @@ mod tests {
             }
         }
         let _ = engine;
+    }
+
+    /// The fast board must agree with the engine: same-tick corpses are
+    /// not lethal, so the search doesn't flee survivable squares.
+    #[test]
+    fn fast_board_corpse_is_not_lethal() {
+        let a: PlayerId = "a".into();
+        let b: PlayerId = "b".into();
+        let mut snakes = BTreeMap::new();
+        snakes.insert(a.clone(), vec![50u16, 49, 48, 47, 60, 59, 58, 57]);
+        snakes.insert(b.clone(), vec![44u16, 31, 18, 19, 20, 33]);
+        let turn = Turn {
+            turn_number: 57,
+            health: [(a.clone(), 90u8), (b.clone(), 90u8)].into_iter().collect(),
+            snakes,
+            alive: vec![a.clone(), b.clone()],
+            food: vec![],
+            moves: BTreeMap::new(),
+            clashes: Vec::new(),
+            winners: Vec::new(),
+        };
+        let order: Vec<&PlayerId> = turn.alive.iter().collect();
+        let mut board = FastBoard::from_turn(&config(), &turn, &order);
+        board.step(&[Dir::Right, Dir::Down]);
+        assert!(!board.snakes[0].alive, "A hit the wall");
+        assert!(board.snakes[1].alive, "B must survive the corpse");
+        assert_eq!(board.snakes[1].head(), 57);
+        assert!(board.is_terminal());
+        assert_eq!(board.winner(), Some(1));
     }
 
     /// fast_ln tracks real ln closely enough for UCB.
