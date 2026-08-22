@@ -425,9 +425,9 @@ impl SessionActor {
                 if self.game.is_none() && self.lobby.len() < MAX_PLAYERS {
                     self.bot_counter += 1;
                     let (name, emoji, colour) = match difficulty {
-                        BotDifficulty::Easy => ("wormy (easy)", "🐛", "hsl(95, 45%, 65%)"),
-                        BotDifficulty::Medium => ("robo (medium)", "🤖", "hsl(210, 50%, 68%)"),
-                        BotDifficulty::Hard => ("draco (hard)", "🐲", "hsl(275, 45%, 68%)"),
+                        BotDifficulty::Easy => ("cool guy", "🐛", "hsl(95, 45%, 65%)"),
+                        BotDifficulty::Medium => ("dude", "🤖", "hsl(210, 50%, 68%)"),
+                        BotDifficulty::Hard => ("lad", "🐲", "hsl(275, 45%, 68%)"),
                     };
                     let id = format!("bot-{}", self.bot_counter);
                     self.bots.insert(id.clone(), difficulty);
