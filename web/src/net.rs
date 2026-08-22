@@ -229,7 +229,43 @@ fn tracing_debug(e: &JsValue) {
     web_sys::console::debug_1(e);
 }
 
+/// The datagram writer, across the spec rename: Safari (26.4+) implements
+/// only the standard `createWritable()`; Chrome still carries the legacy
+/// `writable` attribute. Feature-detect instead of picking a side.
+fn datagram_writer(
+    dgrams: &web_sys::WebTransportDatagramDuplexStream,
+) -> Result<WritableStreamDefaultWriter, JsValue> {
+    let obj: &JsValue = dgrams.as_ref();
+    let create = js_sys::Reflect::get(obj, &"createWritable".into())?;
+    let stream = if create.is_function() {
+        js_sys::Function::from(create).call0(obj)?
+    } else {
+        js_sys::Reflect::get(obj, &"writable".into())?
+    };
+    let stream: web_sys::WritableStream = stream.dyn_into()?;
+    stream.get_writer()
+}
+
+fn webtransport_missing() -> bool {
+    web_sys::window()
+        .map(|w| {
+            !js_sys::Reflect::has(&w, &"WebTransport".into()).unwrap_or(false)
+        })
+        .unwrap_or(true)
+}
+
 async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValue> {
+    if webtransport_missing() {
+        // Don't spin a silent reconnect loop on browsers that can't ever
+        // succeed — say what's needed.
+        store.error.set(Some(
+            "this browser can't play snek — it needs WebTransport \
+             (iOS/Safari 26.4+, or any current Chrome/Edge/Firefox)"
+                .into(),
+        ));
+        store.conn.set(ConnStatus::Idle);
+        return Ok(());
+    }
     let transport = WebTransport::new(&wt_url())?;
     JsFuture::from(transport.ready()).await?;
     if !is_current(generation) {
@@ -247,7 +283,7 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
 
     // Datagrams.
     let dgram_duplex = transport.datagrams();
-    let dgram_writer = dgram_duplex.writable().get_writer()?;
+    let dgram_writer = datagram_writer(&dgram_duplex)?;
     let dgram_readable = dgram_duplex.readable();
 
     // First frame declares intent.

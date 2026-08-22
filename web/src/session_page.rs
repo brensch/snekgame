@@ -22,9 +22,6 @@ pub fn session_page(_session: String) -> impl IntoView {
                 }),
                 _ => None,
             }}
-            {move || store.error.get().map(|e| view! {
-                <div class="banner error">{e}</div>
-            })}
             {move || {
                 if let Some(game) = store.game.get() {
                     view! { <div>{game_view(game)}</div> }.into_any()

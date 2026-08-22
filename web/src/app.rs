@@ -219,6 +219,9 @@ pub fn app() -> impl IntoView {
                                 </span>
                             </span>
                         </div>
+                        {move || store.error.get().map(|e| view! {
+                            <div class="banner error">{e}</div>
+                        })}
                         {move || match store.route.get() {
                             Route::Home => home_page().into_any(),
                             Route::Session(name) => session_page(name).into_any(),
