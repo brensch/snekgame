@@ -556,6 +556,10 @@ impl SessionActor {
     }
 
     async fn tick(&mut self) {
+        // Anchor the cadence to when this tick was DUE, not to whenever we
+        // finish processing it — otherwise per-tick work (and actor-queue
+        // delays) add onto the period and the rhythm wobbles.
+        let due = self.next_tick.take().unwrap_or_else(Instant::now);
         let Some(game) = &mut self.game else {
             self.next_tick = None;
             return;
@@ -569,9 +573,8 @@ impl SessionActor {
         }
 
         // Distributed compute reconciliation: hosts whose requests never
-        // came back get a strike (and their bots fail over); the missing
-        // moves fall back to a quick server-side search so the bot never
-        // just walls itself.
+        // came back get a strike and their bots fail over to the next
+        // phone. (No server fallback — bots without an answer coast.)
         let current = game.turns.last().unwrap().clone();
         let mut late_hosts: Vec<u64> = Vec::new();
         let mut missing: Vec<PlayerId> = Vec::new();
@@ -609,8 +612,16 @@ impl SessionActor {
         if over {
             self.finish_game().await;
         } else {
-            self.next_tick =
-                Some(Instant::now() + Duration::from_millis(self.config.tick_ms as u64));
+            // Fixed cadence from the due time. If we somehow fell more than
+            // a period behind (stall, load), skip forward instead of
+            // machine-gunning catch-up ticks.
+            let period = Duration::from_millis(self.config.tick_ms as u64);
+            let mut next = due + period;
+            let now = Instant::now();
+            if next <= now {
+                next = now + period;
+            }
+            self.next_tick = Some(next);
             if self.bot_hosts.is_empty() {
                 self.assign_bots();
             }

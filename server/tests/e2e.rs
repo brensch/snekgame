@@ -377,3 +377,74 @@ async fn distributed_compute_round_trip() {
         "server never delegated compute to the benchmarked client"
     );
 }
+
+/// Cadence measurement (ignored by default; run with --ignored): turn
+/// snapshots must arrive on a steady beat, not "period + processing time".
+#[tokio::test]
+#[ignore]
+async fn tick_cadence_is_steady() {
+    let dir = std::env::temp_dir().join(format!("snek-cadence-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("cadence.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let (_, registry) = snek_server::build(&db_path);
+    let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    let mut alice = Client::connect(wt_port, "cad-test", "alice-secret-0000", info("alice")).await;
+    alice
+        .control(&ClientMsg::Configure(GameConfig {
+            board_width: 17,
+            board_height: 17,
+            tick_ms: 500,
+        }))
+        .await;
+    // A bot adds per-tick work (request issuance) without needing a host.
+    alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Hard)).await;
+    alice.control(&ClientMsg::SetReady(true)).await;
+    alice.control(&ClientMsg::Start).await;
+
+    let mut arrivals: Vec<std::time::Instant> = Vec::new();
+    let mut last_turn = 0u32;
+    while arrivals.len() < 14 {
+        match alice.next_msg().await {
+            ServerMsg::Turn(t) => {
+                // Dedup the redundant snapshot echoes, like the real client.
+                if t.turn_number <= last_turn {
+                    continue;
+                }
+                last_turn = t.turn_number;
+                arrivals.push(std::time::Instant::now());
+                if t.game_over() {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        // Steer in a circle to stay alive long enough.
+        let dir = match arrivals.len() % 20 {
+            0..=4 => Dir::Right,
+            5..=9 => Dir::Down,
+            10..=14 => Dir::Left,
+            _ => Dir::Up,
+        };
+        let _ = alice.conn.send_datagram(encode(&ClientMsg::Move(dir)));
+    }
+    let deltas: Vec<f64> = arrivals
+        .windows(2)
+        .map(|w| w[1].duration_since(w[0]).as_secs_f64() * 1000.0)
+        .collect();
+    let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+    let max_dev = deltas
+        .iter()
+        .map(|d| (d - 500.0).abs())
+        .fold(0.0f64, f64::max);
+    println!("deltas: {deltas:?}\nmean {mean:.1}ms, max deviation {max_dev:.1}ms");
+    assert!(
+        max_dev < 60.0,
+        "cadence wobble too big: {max_dev:.1}ms (deltas {deltas:?})"
+    );
+}
