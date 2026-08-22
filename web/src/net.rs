@@ -28,9 +28,16 @@ use web_sys::{WebTransport, WritableStreamDefaultWriter};
 // domain (Caddy only occupies TCP 443).
 const WT_PORT: u16 = 443;
 const PING_INTERVAL_MS: u32 = 2_000;
+/// A connection is only "live" if the server said something this recently.
+/// Pings every 2s guarantee traffic, so 6s = three strikes.
+const STALE_MS: f64 = 6_000.0;
 const MOVE_REPEAT_MS: u32 = 100;
 const BACKOFF_START_MS: u32 = 300;
 const BACKOFF_MAX_MS: u32 = 3_000;
+/// Every connect attempt must resolve within this or it is killed and
+/// retried — QUIC handshakes started while offline can otherwise hang for
+/// ages with no error, stalling the whole backoff loop.
+const CONNECT_TIMEOUT_MS: u32 = 4_000;
 
 #[derive(Clone, PartialEq)]
 enum Mode {
@@ -52,6 +59,16 @@ struct Conn {
 
 thread_local! {
     static ACTIVE: RefCell<Option<Conn>> = const { RefCell::new(None) };
+    /// When the last server message arrived (any kind — pongs count).
+    static LAST_RX: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+fn mark_rx() {
+    LAST_RX.with(|c| c.set(now()));
+}
+
+fn is_stale() -> bool {
+    LAST_RX.with(|c| now() - c.get() > STALE_MS)
 }
 
 pub fn now() -> f64 {
@@ -112,8 +129,11 @@ pub fn nudge(store: Store) {
         match &mut *a {
             Some(conn) => {
                 conn.backoff_ms = BACKOFF_START_MS;
+                // A transport that looks connected but has gone silent is a
+                // zombie (suspended tabs often never fire `closed`).
                 let unhealthy = conn.transport.is_none()
-                    || store.conn.get_untracked() != ConnStatus::Connected;
+                    || store.conn.get_untracked() != ConnStatus::Connected
+                    || is_stale();
                 unhealthy.then(|| conn.mode.clone())
             }
             None => None,
@@ -121,6 +141,15 @@ pub fn nudge(store: Store) {
     });
     if let Some(mode) = reopen {
         open(store, mode, BACKOFF_START_MS);
+    }
+}
+
+/// Watchdog (driven by the shared clock while the tab is visible): a
+/// connection that claims Connected but has gone silent gets reopened.
+/// Connecting/reconnecting states are left to the backoff machinery.
+pub fn check_liveness(store: Store) {
+    if store.conn.get_untracked() == ConnStatus::Connected && is_stale() {
+        nudge(store);
     }
 }
 
@@ -209,6 +238,7 @@ fn open(store: Store, mode: Mode, backoff_ms: u32) {
         generation
     });
 
+    mark_rx(); // fresh attempt starts with a fresh liveness clock
     store.conn.update(|c| {
         *c = if *c == ConnStatus::Connected {
             ConnStatus::Reconnecting
@@ -217,12 +247,24 @@ fn open(store: Store, mode: Mode, backoff_ms: u32) {
         }
     });
 
+    let attempt_mode = mode.clone();
     spawn_local(async move {
-        if let Err(e) = connect(store, mode, generation).await {
+        if let Err(e) = connect(store, attempt_mode, generation).await {
             tracing_debug(&e);
             schedule_reconnect(store, generation);
         }
     });
+
+    // Hung-attempt guard: if this generation still isn't Connected after the
+    // deadline, abandon it (open bumps the generation, orphaning the hung
+    // future and closing its transport) and try again.
+    Timeout::new(CONNECT_TIMEOUT_MS, move || {
+        if is_current(generation) && store.conn.get_untracked() != ConnStatus::Connected {
+            let next = (backoff_ms * 2).min(BACKOFF_MAX_MS);
+            open(store, mode, next);
+        }
+    })
+    .forget();
 }
 
 fn tracing_debug(e: &JsValue) {
@@ -267,6 +309,15 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
         return Ok(());
     }
     let transport = WebTransport::new(&wt_url())?;
+    // Register immediately so the attempt-timeout guard (and any newer
+    // generation) can close a handshake that never resolves.
+    ACTIVE.with(|a| {
+        if let Some(conn) = &mut *a.borrow_mut() {
+            if conn.generation == generation {
+                conn.transport = Some(transport.clone());
+            }
+        }
+    });
     JsFuture::from(transport.ready()).await?;
     if !is_current(generation) {
         transport.close();
@@ -304,14 +355,17 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
         let _ = control_writer.write_with_chunk(&Uint8Array::from(framed.as_slice()).into());
     }
 
-    // Keepalive ping + input redundancy (session mode only).
-    let (ping, repeat) = match mode {
+    // Keepalive ping (both modes — liveness needs traffic) + input
+    // redundancy (session mode only).
+    let ping = {
+        let mut n = 0u32;
+        Interval::new(PING_INTERVAL_MS, move || {
+            n = n.wrapping_add(1);
+            send_datagram(&ClientMsg::Ping(n));
+        })
+    };
+    let repeat = match mode {
         Mode::Session(_) => {
-            let mut n = 0u32;
-            let ping = Interval::new(PING_INTERVAL_MS, move || {
-                n = n.wrapping_add(1);
-                send_datagram(&ClientMsg::Ping(n));
-            });
             let repeat = Interval::new(MOVE_REPEAT_MS, move || {
                 let live = store
                     .game
@@ -330,9 +384,9 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
                     }
                 }
             });
-            (Some(ping), Some(repeat))
+            Some(repeat)
         }
-        Mode::Watch => (None, None),
+        Mode::Watch => None,
     };
 
     ACTIVE.with(|a| {
@@ -341,7 +395,7 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
                 conn.transport = Some(transport.clone());
                 conn.control = Some(control_writer);
                 conn.dgrams = Some(dgram_writer);
-                conn._ping = ping;
+                conn._ping = Some(ping);
                 conn._repeat = repeat;
                 conn.backoff_ms = BACKOFF_START_MS; // healthy again
             } else {
@@ -440,10 +494,32 @@ fn schedule_reconnect(store: Store, generation: u64) {
 // ---------------------------------------------------------------------------
 
 fn apply(store: Store, msg: ServerMsg) {
+    mark_rx();
     match msg {
         ServerMsg::Welcome { your_id } => store.me.set(your_id),
         ServerMsg::Sessions(list) => store.sessions.set(Some(list)),
-        ServerMsg::Lobby(lobby) => store.lobby.set(Some(lobby)),
+        ServerMsg::Lobby(lobby) => {
+            // Server phase truth: no game running + we hold an *unfinished*
+            // game means we missed the ending while away — fall back to the
+            // lobby. A finished game (results screen) stays until the user
+            // leaves it.
+            if !lobby.game_running {
+                let stale_unfinished = store
+                    .game
+                    .with_untracked(|g| {
+                        g.as_ref()
+                            .and_then(|g| g.turns.last())
+                            .map(|t| !t.game_over())
+                            .unwrap_or(false)
+                    });
+                if stale_unfinished {
+                    store.game.set(None);
+                    store.view_turn.set(None);
+                    store.selected_dir.set(None);
+                }
+            }
+            store.lobby.set(Some(lobby));
+        }
         ServerMsg::GameStart {
             config,
             players,

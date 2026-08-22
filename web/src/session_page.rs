@@ -18,7 +18,7 @@ pub fn session_page(_session: String) -> impl IntoView {
         <div>
             {move || match store.conn.get() {
                 ConnStatus::Reconnecting | ConnStatus::Connecting => Some(view! {
-                    <div class="banner error">"Reconnecting… hold tight 🛟"</div>
+                    <div class="banner error">"🕊️ carrier pigeons can't find you"</div>
                 }),
                 _ => None,
             }}
@@ -179,7 +179,7 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                                     class="right kick"
                                     on:click=move |_| net::send(&ClientMsg::Kick(id.clone()))
                                 >
-                                    "❌"
+                                    "🗑️"
                                 </td>
                             </tr>
                         }
@@ -187,24 +187,11 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                     .collect_view()}
                 <tr class="add-bot-row">
                     <td colspan="3">
-                        <span class="footnote" style="margin-right: 8px;">"add a bot"</span>
                         <button
                             class="mini"
-                            on:click=move |_| net::send(&ClientMsg::AddBot(BotDifficulty::Easy))
+                            on:click=move |_| store.show_bot_picker.set(true)
                         >
-                            "🐛 easy"
-                        </button>
-                        <button
-                            class="mini"
-                            on:click=move |_| net::send(&ClientMsg::AddBot(BotDifficulty::Medium))
-                        >
-                            "🤖 medium"
-                        </button>
-                        <button
-                            class="mini"
-                            on:click=move |_| net::send(&ClientMsg::AddBot(BotDifficulty::Hard))
-                        >
-                            "🐲 hard"
+                            "➕ add a bot"
                         </button>
                     </td>
                 </tr>
@@ -235,11 +222,41 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
             {roster}
             <h3 style="margin-top: 24px;">"Settings"</h3>
             {config_row}
+            {move || store.show_bot_picker.get().then(bot_picker)}
             <p class="footnote" style="margin-top: 18px;">
                 "Steer with swipes, taps, arrows or WASD. Eat 🎃 to grow and "
                 "refill health; you lose 1 health per turn. Walls, bodies and "
                 "bigger heads kill you. Outlive everyone."
             </p>
+        </div>
+    }
+}
+
+/// Difficulty chooser for the house bots — big obvious buttons.
+fn bot_picker() -> impl IntoView {
+    let store = Store::use_store();
+    let pick = move |d: BotDifficulty| {
+        move |_| {
+            net::send(&ClientMsg::AddBot(d));
+            store.show_bot_picker.set(false);
+        }
+    };
+    view! {
+        <div class="modal-back" on:click=move |_| store.show_bot_picker.set(false)>
+            <div class="modal" on:click=move |ev| ev.stop_propagation()>
+                <h3 style="margin-top: 0;">"Add a bot"</h3>
+                <button class="big" style="margin-bottom: 10px;" on:click=pick(BotDifficulty::Easy)>
+                    "🐛 easy"
+                </button>
+                <button
+                    class="big"
+                    style="margin-bottom: 10px;"
+                    on:click=pick(BotDifficulty::Medium)
+                >
+                    "🤖 medium"
+                </button>
+                <button class="big" on:click=pick(BotDifficulty::Hard)>"🐲 hard"</button>
+            </div>
         </div>
     }
 }

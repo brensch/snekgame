@@ -532,6 +532,7 @@ impl SessionActor {
     async fn broadcast_lobby(&mut self) {
         let state = LobbyState {
             session: self.name.clone(),
+            game_running: self.game.is_some(),
             config: self.config,
             players: self.lobby.clone(),
             ready: self.ready.iter().cloned().collect(),

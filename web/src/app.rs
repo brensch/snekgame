@@ -51,8 +51,17 @@ pub fn app() -> impl IntoView {
     read_route();
     window_event_listener(ev::hashchange, move |_| read_route());
 
-    // --- shared coarse clock ---------------------------------------------
-    let clock = Interval::new(200, move || store.now_ms.set(net::now()));
+    // --- shared coarse clock + liveness watchdog ---------------------------
+    let clock = Interval::new(200, move || {
+        store.now_ms.set(net::now());
+        let visible = web_sys::window()
+            .and_then(|w| w.document())
+            .map(|d| !d.hidden())
+            .unwrap_or(true);
+        if visible {
+            net::check_liveness(store);
+        }
+    });
     clock.forget();
 
     // --- coming back to the app reconnects immediately --------------------

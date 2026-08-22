@@ -67,7 +67,7 @@ async fn handle_session(
         decode(&first).ok_or_else(|| anyhow::anyhow!("undecodable first frame"))?;
 
     match msg {
-        ClientMsg::WatchGames => watch_games(send, recv, registry).await,
+        ClientMsg::WatchGames => watch_games(connection, send, recv, registry).await,
         ClientMsg::Join {
             version,
             session,
@@ -88,10 +88,21 @@ async fn handle_session(
 // ---------------------------------------------------------------------------
 
 async fn watch_games(
+    connection: Connection,
     mut send: SendStream,
     mut recv: RecvStream,
     registry: Registry,
 ) -> anyhow::Result<()> {
+    // Answer datagram pings so watchers can measure liveness.
+    let echo_conn = connection.clone();
+    let echo = tokio::spawn(async move {
+        while let Ok(datagram) = echo_conn.receive_datagram().await {
+            if let Some(ClientMsg::Ping(n)) = decode::<ClientMsg>(&datagram) {
+                let _ = echo_conn.send_datagram(encode(&ServerMsg::Pong(n)));
+            }
+        }
+    });
+    let _guard = scopeguard(echo);
     let mut rx = registry.watch_games();
     loop {
         let list = rx.borrow_and_update().clone();
@@ -109,6 +120,17 @@ async fn watch_games(
             }
         }
     }
+}
+
+/// Abort a task when dropped.
+fn scopeguard(task: tokio::task::JoinHandle<()>) -> impl Drop {
+    struct Guard(tokio::task::JoinHandle<()>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    Guard(task)
 }
 
 // ---------------------------------------------------------------------------

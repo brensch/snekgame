@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// The client-editable part of a profile. The public player id is derived
 /// server-side (a hash of the client's private secret), so a client can never
@@ -58,6 +58,10 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LobbyState {
     pub session: String,
+    /// Server phase truth: whether a game is running right now. A client
+    /// holding an *unfinished* local game when this says false missed the
+    /// ending while away and must fall back to the lobby.
+    pub game_running: bool,
     pub config: GameConfig,
     pub players: Vec<PlayerProfile>,
     pub ready: Vec<PlayerId>,

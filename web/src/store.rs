@@ -36,6 +36,7 @@ pub struct Store {
     /// Our server-derived public id (empty until `Welcome` arrives).
     pub me: RwSignal<PlayerId>,
     pub show_profile_editor: RwSignal<bool>,
+    pub show_bot_picker: RwSignal<bool>,
     pub conn: RwSignal<ConnStatus>,
     pub lobby: RwSignal<Option<LobbyState>>,
     /// Live games list, pushed by the server while watching (home screen).
@@ -61,6 +62,7 @@ impl Store {
             profile: RwSignal::new(load_profile()),
             me: RwSignal::new(String::new()),
             show_profile_editor: RwSignal::new(false),
+            show_bot_picker: RwSignal::new(false),
             conn: RwSignal::new(ConnStatus::Idle),
             lobby: RwSignal::new(None),
             sessions: RwSignal::new(None),

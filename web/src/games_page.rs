@@ -52,8 +52,7 @@ pub fn home_page() -> impl IntoView {
                             .cloned()
                             .collect();
                         view! {
-                            <h3>"Games on right now"</h3>
-                            <table>
+                            <table class="games">
                                 <tbody>
                                     {slice
                                         .into_iter()
@@ -75,7 +74,10 @@ pub fn home_page() -> impl IntoView {
                                                     </td>
                                                     <td class="right">
                                                         <a href=href>
-                                                            <button>"Join"</button>
+                                                            <button style=format!(
+                                                                "background: {};",
+                                                                store.profile.get_untracked().colour,
+                                                            )>"Join"</button>
                                                         </a>
                                                     </td>
                                                 </tr>
@@ -112,16 +114,17 @@ pub fn home_page() -> impl IntoView {
                 }
             }}
 
-            {move || {
-                let any = sessions.get().map(|l| !l.is_empty()).unwrap_or(false);
-                any.then(|| view! { <h3 style="margin-top: 28px;">"or start your own lobby"</h3> })
-            }}
             <button
                 class="big"
-                style=move || format!("margin-top: 16px; background: {};", store.profile.get().colour)
+                style=move || {
+                    format!(
+                        "margin-top: 16px; font-size: 24px; background: {};",
+                        store.profile.get().colour,
+                    )
+                }
                 on:click=move |_| create()
             >
-                "Start game\u{00A0}" {rotating}
+                "Start new game\u{00A0}" {rotating}
             </button>
 
             <p style="margin-top: 24px;">

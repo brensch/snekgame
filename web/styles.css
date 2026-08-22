@@ -105,9 +105,13 @@ input:focus, select:focus {
 }
 
 .profile-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 40px;
   border: 2px solid #000;
-  padding: 4px 10px;
+  padding: 0 12px;
   font-size: 18px;
+  line-height: 1;
   cursor: pointer;
   user-select: none;
 }
@@ -167,6 +171,12 @@ td.right, th.right {
 td.kick {
   cursor: pointer;
   width: 40px;
+}
+
+/* home games list: quiet rows, no dividers */
+table.games td {
+  border-bottom: none;
+  padding: 8px 8px 8px 0;
 }
 
 /* players roster: one framed block, uniform 1px separators inside */
