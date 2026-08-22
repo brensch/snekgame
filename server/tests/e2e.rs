@@ -197,7 +197,7 @@ async fn two_players_play_a_full_game() {
                 }
             }
             ServerMsg::Pong(7) => got_pong = true,
-            ServerMsg::GameSaved { id } => {
+            ServerMsg::GameSaved { id, .. } => {
                 saved_id = Some(id);
                 break;
             }
@@ -326,7 +326,12 @@ async fn distributed_compute_round_trip() {
         }))
         .await;
     // Become a compute host, add a bot, go.
-    alice.control(&ClientMsg::Benchmark { sims_per_sec: 50_000 }).await;
+    alice
+        .control(&ClientMsg::Benchmark {
+            sims_per_sec: 50_000,
+            device: "e2e test rig".to_string(),
+        })
+        .await;
     alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Medium)).await;
     alice.control(&ClientMsg::SetReady(true)).await;
     alice.control(&ClientMsg::Start).await;
@@ -350,13 +355,19 @@ async fn distributed_compute_round_trip() {
                 let (dir, _work) = snek_shared::bot::think(&config, &turn, &bot_id, sims, nonce);
                 let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
                 alice
-                    .control(&ClientMsg::BotMove { request_id, dir, proof })
+                    .control(&ClientMsg::BotMove { request_id, dir, proof, elapsed_ms: 12 })
                     .await;
             }
             ServerMsg::Turn(t) if t.game_over() => {
                 game_over = true;
             }
-            ServerMsg::GameSaved { .. } => break,
+            ServerMsg::GameSaved { compute, .. } => {
+                assert!(
+                    compute.iter().any(|c| c.device == "e2e test rig" && c.moves > 0),
+                    "compute stats missing our device: {compute:?}"
+                );
+                break;
+            }
             _ => {}
         }
     }

@@ -103,6 +103,7 @@ impl Registry {
         session: &str,
         conn_id: u64,
         profile: PlayerProfile,
+        ip: String,
         tx: mpsc::Sender<Frame>,
     ) -> mpsc::Sender<Cmd> {
         loop {
@@ -117,6 +118,7 @@ impl Registry {
             let cmd = Cmd::Connect {
                 conn_id,
                 profile: profile.clone(),
+                ip: ip.clone(),
                 tx: tx.clone(),
             };
             match sender.send(cmd).await {
@@ -149,6 +151,7 @@ pub enum Cmd {
     Connect {
         conn_id: u64,
         profile: PlayerProfile,
+        ip: String,
         tx: mpsc::Sender<Frame>,
     },
     Disconnect {
@@ -163,9 +166,13 @@ pub enum Cmd {
 struct Conn {
     player: PlayerId,
     tx: mpsc::Sender<Frame>,
+    /// Remote IP (device fingerprinting for compute stats).
+    ip: String,
+    /// Self-described device (from the user agent).
+    device: String,
     /// Self-reported search speed; present = eligible to host bot compute.
     sims_per_sec: Option<u32>,
-    /// Audit/timeout strikes; too many bans the conn from hosting.
+    /// Timeout/checksum strikes; too many bans the conn from hosting.
     strikes: u32,
 }
 
@@ -177,11 +184,20 @@ struct PendingCompute {
     nonce: u64,
 }
 
+#[derive(Default)]
+struct ComputeAccum {
+    moves: u32,
+    sims: u64,
+    wall_ms: u64,
+}
+
 struct RunningGame {
     engine: Engine,
     players: Vec<PlayerProfile>,
     turns: Vec<Turn>,
     pending: BTreeMap<PlayerId, Dir>,
+    /// Per-connection compute contributions this game.
+    compute: HashMap<u64, ComputeAccum>,
     started_at_ms: i64,
 }
 
@@ -299,6 +315,7 @@ impl SessionActor {
             Cmd::Connect {
                 conn_id,
                 profile,
+                ip,
                 tx,
             } => {
                 self.empty_deadline = None;
@@ -307,6 +324,8 @@ impl SessionActor {
                     Conn {
                         player: profile.id.clone(),
                         tx,
+                        ip,
+                        device: String::new(),
                         sims_per_sec: None,
                         strikes: 0,
                     },
@@ -429,14 +448,14 @@ impl SessionActor {
                     self.broadcast_lobby().await;
                 }
             }
-            ClientMsg::Benchmark { sims_per_sec } => {
+            ClientMsg::Benchmark { sims_per_sec, device } => {
                 if let Some(conn) = self.conns.get_mut(&conn_id) {
-                    // Clamp against absurd claims; audits keep them honest.
                     conn.sims_per_sec = Some(sims_per_sec.clamp(500, 2_000_000));
+                    conn.device = device.chars().take(80).collect();
                 }
                 self.assign_bots();
             }
-            ClientMsg::BotMove { request_id, dir, proof } => {
+            ClientMsg::BotMove { request_id, dir, proof, elapsed_ms } => {
                 let Some(pending) = self.pending_compute.remove(&request_id) else {
                     return; // stale or bogus
                 };
@@ -452,6 +471,12 @@ impl SessionActor {
                 if proof != bot::bind_proof(pending.nonce, request_id, dir) {
                     self.strike(conn_id, "bad response checksum");
                     return;
+                }
+                if let Some(game) = &mut self.game {
+                    let acc = game.compute.entry(conn_id).or_default();
+                    acc.moves += 1;
+                    acc.sims += pending.sims as u64;
+                    acc.wall_ms += elapsed_ms.min(60_000) as u64;
                 }
                 if let Some(game) = &mut self.game {
                     let current = game.turns.last().map(|t| t.turn_number);
@@ -519,6 +544,7 @@ impl SessionActor {
             players,
             turns: vec![first],
             pending: BTreeMap::new(),
+            compute: HashMap::new(),
             started_at_ms: now_ms(),
         });
         self.ready.clear();
@@ -567,25 +593,9 @@ impl SessionActor {
         for conn_id in late_hosts {
             self.strike(conn_id, "compute request timed out");
         }
-        if !missing.is_empty() {
-            let handles: Vec<_> = missing
-                .into_iter()
-                .map(|id| {
-                    let config = self.config;
-                    let turn = current.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let mv = bot::quick_move(&config, &turn, &id, 2_500);
-                        (id, mv)
-                    })
-                })
-                .collect();
-            let game = self.game.as_mut().unwrap();
-            for handle in handles {
-                if let Ok((id, mv)) = handle.await {
-                    game.pending.insert(id, mv);
-                }
-            }
-        }
+        // Hard lock: the server NEVER searches. Bots whose host didn't
+        // answer simply keep their heading this tick (the engine's default).
+        drop(missing);
         let game = self.game.as_mut().unwrap();
 
         let moves = std::mem::take(&mut game.pending);
@@ -634,10 +644,59 @@ impl SessionActor {
         })
         .await;
 
+        // Per-device compute scoreboard: who thought for the bots, on what.
+        let compute: Vec<(ComputeStat, PlayerId, String, u32)> = game
+            .compute
+            .iter()
+            .filter_map(|(conn_id, acc)| {
+                let conn = self.conns.get(conn_id)?;
+                let name = self
+                    .lobby
+                    .iter()
+                    .find(|p| p.id == conn.player)
+                    .map(|p| format!("{} {}", p.emoji, p.name))
+                    .unwrap_or_else(|| "departed".to_string());
+                Some((
+                    ComputeStat {
+                        name,
+                        device: conn.device.clone(),
+                        moves: acc.moves,
+                        sims: acc.sims,
+                        wall_ms: acc.wall_ms,
+                    },
+                    conn.player.clone(),
+                    conn.ip.clone(),
+                    conn.sims_per_sec.unwrap_or(0),
+                ))
+            })
+            .collect();
+
         match saved {
             Ok(Ok(id)) => {
                 self.last_game_id = Some(id);
-                self.broadcast(control_frame(&ServerMsg::GameSaved { id })).await;
+                let stats: Vec<ComputeStat> =
+                    compute.iter().map(|(s, _, _, _)| s.clone()).collect();
+                let db = self.db.clone();
+                let rows = compute;
+                tokio::task::spawn_blocking(move || {
+                    for (stat, player_id, ip, benchmark) in rows {
+                        if let Err(e) = db.insert_compute_stat(
+                            id,
+                            &player_id,
+                            &stat.name,
+                            &ip,
+                            &stat.device,
+                            benchmark,
+                            stat.moves,
+                            stat.sims,
+                            stat.wall_ms,
+                        ) {
+                            tracing::error!("failed to save compute stat: {e}");
+                        }
+                    }
+                });
+                self.broadcast(control_frame(&ServerMsg::GameSaved { id, compute: stats }))
+                    .await;
             }
             Ok(Err(e)) => tracing::error!("failed to save game: {e}"),
             Err(e) => tracing::error!("save task panicked: {e}"),

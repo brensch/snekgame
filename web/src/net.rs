@@ -461,7 +461,10 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
             let rate = benchmark_sims_per_sec(generation).await;
             if is_current(generation) {
                 if let Some(rate) = rate {
-                    send(&ClientMsg::Benchmark { sims_per_sec: rate });
+                    send(&ClientMsg::Benchmark {
+                        sims_per_sec: rate,
+                        device: device_description(),
+                    });
                 }
             }
         });
@@ -477,6 +480,20 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
     });
 
     Ok(())
+}
+
+/// Short device description from the user agent: the parenthesised
+/// platform segment carries the model on Android and the OS on iOS.
+fn device_description() -> String {
+    let ua = web_sys::window()
+        .map(|w| w.navigator().user_agent().unwrap_or_default())
+        .unwrap_or_default();
+    let inner = ua
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(inner, _)| inner.to_string())
+        .unwrap_or(ua);
+    inner.chars().take(80).collect()
 }
 
 /// ~600ms of genuine search on a synthetic board, yielding between chunks.
@@ -569,6 +586,7 @@ fn apply(store: Store, msg: ServerMsg) {
             countdown_ms,
         } => {
             store.saved_id.set(None);
+            store.compute_stats.set(Vec::new());
             store.view_turn.set(None);
             store.countdown_ends.set(now() + countdown_ms as f64);
             // Pre-select the clockwise default heading on the d-pad.
@@ -615,21 +633,25 @@ fn apply(store: Store, msg: ServerMsg) {
         ServerMsg::ComputeRequest {
             request_id,
             bot_id,
-            bot_name,
             config,
             turn,
             sims,
             nonce,
+            ..
         } => {
-            store.hosting.set(Some((bot_name, now())));
-            // Deterministic search; the proof binds the nonce to the work.
+            // Deterministic search; the checksum binds nonce+request+move.
             spawn_local(async move {
+                let started = now();
                 let (dir, _work) = snek_shared::bot::think(&config, &turn, &bot_id, sims, nonce);
+                let elapsed_ms = (now() - started).max(0.0) as u32;
                 let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
-                send(&ClientMsg::BotMove { request_id, dir, proof });
+                send(&ClientMsg::BotMove { request_id, dir, proof, elapsed_ms });
             });
         }
-        ServerMsg::GameSaved { id } => store.saved_id.set(Some(id)),
+        ServerMsg::GameSaved { id, compute } => {
+            store.saved_id.set(Some(id));
+            store.compute_stats.set(compute);
+        }
         ServerMsg::Error(e) => store.error.set(Some(e)),
         ServerMsg::Pong(_) => {}
     }

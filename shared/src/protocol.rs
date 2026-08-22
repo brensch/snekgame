@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// The client-editable part of a profile. The public player id is derived
 /// server-side (a hash of the client's private secret), so a client can never
@@ -56,12 +56,22 @@ pub enum ClientMsg {
     /// Self-measured search speed (sims/sec), from ~600ms of real search in
     /// the lobby. Makes this connection eligible to host bot compute; the
     /// fastest phones get picked first.
-    Benchmark { sims_per_sec: u32 },
+    Benchmark {
+        sims_per_sec: u32,
+        /// Short device description (parsed from the user agent).
+        device: String,
+    },
     /// Answer to a `ComputeRequest`: the deterministic search result plus
     /// the proof binding the nonce to the work performed. The server
     /// randomly re-runs the identical search to audit; mismatches strike
     /// the host and eventually ban it from computing.
-    BotMove { request_id: u64, dir: Dir, proof: u64 },
+    BotMove {
+        request_id: u64,
+        dir: Dir,
+        proof: u64,
+        /// Wall time this device spent on the search.
+        elapsed_ms: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,8 +111,12 @@ pub enum ServerMsg {
         players: Vec<PlayerProfile>,
         turns: Vec<Turn>,
     },
-    /// The finished game was written to history under this id.
-    GameSaved { id: i64 },
+    /// The finished game was written to history under this id, with the
+    /// per-device compute contributions for the scoreboard.
+    GameSaved {
+        id: i64,
+        compute: Vec<ComputeStat>,
+    },
     /// Active-games list push (for WatchGames subscribers).
     Sessions(Vec<SessionSummary>),
     /// Run the bot search for `bot_id` on this device: exactly `sims`
@@ -140,6 +154,16 @@ pub struct SessionSummary {
     pub players: u32,
     pub bots: u32,
     pub playing: bool,
+}
+
+/// One compute host's contribution to a finished game.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComputeStat {
+    pub name: String,
+    pub device: String,
+    pub moves: u32,
+    pub sims: u64,
+    pub wall_ms: u64,
 }
 
 /// One page of history. `next` is the keyset cursor for the next (older)

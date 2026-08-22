@@ -28,7 +28,21 @@ impl Db {
             );
             -- rowid order IS finish order (rows insert at game end), so the
             -- primary key serves list ordering; no secondary index needed.
-            DROP INDEX IF EXISTS idx_games_finished;",
+            DROP INDEX IF EXISTS idx_games_finished;
+            -- Per-device compute contributions (bots think on player phones).
+            CREATE TABLE IF NOT EXISTS compute_stats (
+                id            INTEGER PRIMARY KEY,
+                game_id       INTEGER NOT NULL,
+                player_id     TEXT NOT NULL,
+                name          TEXT NOT NULL,
+                ip            TEXT NOT NULL,
+                device        TEXT NOT NULL,
+                benchmark_sims_per_sec INTEGER NOT NULL,
+                moves         INTEGER NOT NULL,
+                total_sims    INTEGER NOT NULL,
+                total_wall_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_compute_game ON compute_stats (game_id);",
         )?;
         // Lobby names never existed. Shed the column from older databases.
         let _ = conn.execute_batch("ALTER TABLE games DROP COLUMN session;");
@@ -101,6 +115,40 @@ impl Db {
             None
         };
         Ok(HistoryPage { entries, next })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_compute_stat(
+        &self,
+        game_id: i64,
+        player_id: &str,
+        name: &str,
+        ip: &str,
+        device: &str,
+        benchmark: u32,
+        moves: u32,
+        total_sims: u64,
+        total_wall_ms: u64,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO compute_stats
+             (game_id, player_id, name, ip, device, benchmark_sims_per_sec,
+              moves, total_sims, total_wall_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                game_id,
+                player_id,
+                name,
+                ip,
+                device,
+                benchmark,
+                moves,
+                total_sims as i64,
+                total_wall_ms as i64,
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn get_game_meta(&self, id: i64) -> rusqlite::Result<Option<HistoryEntry>> {

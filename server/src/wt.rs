@@ -175,7 +175,8 @@ async fn join_session(
 
     let conn_id = registry.new_conn_id();
     let (tx, mut rx) = conn_channel();
-    let actor = registry.connect(&session, conn_id, profile, tx).await;
+    let ip = connection.remote_address().ip().to_string();
+    let actor = registry.connect(&session, conn_id, profile, ip, tx).await;
 
     // Outbound: control frames -> stream; snapshots -> datagram x2.
     let out_conn = connection.clone();

@@ -100,11 +100,6 @@ pub fn bind_proof(nonce: u64, request_id: u64, dir: Dir) -> u64 {
     fnv1a(&[nonce, request_id, dir_index(dir) as u64, 0x736e_656b])
 }
 
-/// A quick server-side move (fallbacks and audits): same search, small sims.
-pub fn quick_move(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32) -> Dir {
-    think(config, turn, me, sims, 0).0
-}
-
 fn dir_index(d: Dir) -> usize {
     DIRS.iter().position(|&x| x == d).unwrap_or(0)
 }
