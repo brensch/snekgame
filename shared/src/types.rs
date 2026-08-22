@@ -149,6 +149,13 @@ pub struct Winner {
     pub length: u16,
 }
 
+/// A game is drawn when nobody outlasted everyone else — the top survival
+/// count is shared. Winners are still ranked data; presentation decides
+/// whether anyone gets a medal.
+pub fn is_draw(winners: &[Winner]) -> bool {
+    winners.len() >= 2 && winners[0].survival_turns == winners[1].survival_turns
+}
+
 /// One resolved game tick. BTreeMaps keep serialization deterministic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Turn {

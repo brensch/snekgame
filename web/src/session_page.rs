@@ -6,7 +6,7 @@ use crate::net;
 use crate::store::{ConnStatus, GameView, Store};
 use leptos::prelude::*;
 use snek_shared::protocol::{ClientMsg, LobbyState};
-use snek_shared::{is_bot, BotDifficulty, Dir, GameConfig, Pos, Turn};
+use snek_shared::{is_bot, is_draw, BotDifficulty, Dir, GameConfig, Pos, Turn};
 
 const BOARD_SIZES: &[(&str, u8)] = &[("Small", 11), ("Medium", 13), ("Large", 17)];
 const SPEEDS: &[(&str, u32)] = &[("Chill (2s)", 2000), ("Normal (1s)", 1000), ("Fast (0.5s)", 500)];
@@ -65,6 +65,14 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
         .collect();
 
     let last_game = (!lobby.last_winners.is_empty()).then(|| {
+        if is_draw(&lobby.last_winners) {
+            return view! {
+                <div class="banner rainbow">
+                    "💀 Last game: a draw — nobody made it out"
+                </div>
+            }
+            .into_any();
+        }
         let winner = lobby.last_winners.first().unwrap().clone();
         let name = lobby
             .players
@@ -77,6 +85,7 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                 "🏆 Last game: " {name} " survived " {winner.survival_turns} " turns"
             </div>
         }
+        .into_any()
     });
 
     let ready_button = if !all_ready {
@@ -337,11 +346,17 @@ fn game_view(game: GameView) -> impl IntoView {
     // Results, ranked, once the game is over — under a rain of the winner's
     // emoji, as is tradition.
     let results = over.then(|| {
-        let rain = last_turn
-            .winners
-            .first()
-            .and_then(|w| game.players.iter().find(|p| p.id == w.player))
-            .map(|p| emoji_rain(p.emoji.clone()));
+        let draw = is_draw(&last_turn.winners);
+        // Draws rain skulls; wins rain the winner's emoji.
+        let rain = if draw {
+            Some(emoji_rain("💀".to_string()))
+        } else {
+            last_turn
+                .winners
+                .first()
+                .and_then(|w| game.players.iter().find(|p| p.id == w.player))
+                .map(|p| emoji_rain(p.emoji.clone()))
+        };
         let rows = last_turn
             .winners
             .iter()
@@ -352,7 +367,11 @@ fn game_view(game: GameView) -> impl IntoView {
                     .map(|p| format!("{} {}", p.name, p.emoji))
                     .unwrap_or_else(|| "???".to_string());
                 let colour = p.map(|p| p.colour.clone()).unwrap_or_default();
-                let medal = ["🥇", "🥈", "🥉"].get(i).copied().unwrap_or("💀");
+                let medal = if draw {
+                    "💀" // no winner to allocate
+                } else {
+                    ["🥇", "🥈", "🥉"].get(i).copied().unwrap_or("💀")
+                };
                 view! {
                     <tr style=format!("background: {colour};")>
                         <td>{medal} " " {name}</td>
@@ -381,7 +400,7 @@ fn game_view(game: GameView) -> impl IntoView {
         view! {
             <div>
                 {rain}
-                <h3>"Game over"</h3>
+                <h3>{if draw { "Game over — it's a draw" } else { "Game over" }}</h3>
                 <table class="players">
                     <tbody>{rows}</tbody>
                 </table>

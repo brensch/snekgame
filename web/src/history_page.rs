@@ -7,7 +7,7 @@ use crate::store::Store;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use snek_shared::protocol::HistoryEntry;
-use snek_shared::GameRecord;
+use snek_shared::{is_draw, GameRecord};
 
 /// Player chips ranked by placement + "game #N in <session>" line.
 fn replay_footer(id: i64, meta: &HistoryEntry) -> impl IntoView {
@@ -22,11 +22,16 @@ fn replay_footer(id: i64, meta: &HistoryEntry) -> impl IntoView {
     } else {
         meta.players.iter().collect()
     };
+    let draw = is_draw(&meta.winners);
     let chips = players
         .into_iter()
         .enumerate()
         .map(|(i, p)| {
-            let medal = ["🥇", "🥈", "🥉"].get(i).copied().unwrap_or("💀");
+            let medal = if draw {
+                "💀"
+            } else {
+                ["🥇", "🥈", "🥉"].get(i).copied().unwrap_or("💀")
+            };
             view! {
                 <span class="player-chip" style=format!("background: {};", p.colour)>
                     {medal} " " {p.emoji.clone()} " " {p.name.clone()}
@@ -82,14 +87,18 @@ pub fn history_page() -> impl IntoView {
                                                 .map(|p| format!("{}{}", p.emoji, p.name))
                                                 .collect::<Vec<_>>()
                                                 .join(", ");
-                                            let winner = e
-                                                .winners
-                                                .first()
-                                                .and_then(|w| {
-                                                    e.players.iter().find(|p| p.id == w.player)
-                                                })
-                                                .map(|p| p.colour.clone())
-                                                .unwrap_or_default();
+                                            // Draws get no winner colour.
+                                            let winner = if is_draw(&e.winners) {
+                                                String::new()
+                                            } else {
+                                                e.winners
+                                                    .first()
+                                                    .and_then(|w| {
+                                                        e.players.iter().find(|p| p.id == w.player)
+                                                    })
+                                                    .map(|p| p.colour.clone())
+                                                    .unwrap_or_default()
+                                            };
                                             let id = e.id;
                                             view! {
                                                 <tr
