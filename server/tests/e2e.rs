@@ -752,3 +752,60 @@ async fn answering_late_shrinks_the_thinking_window() {
         "window never backed off for a device answering late: {first_window}ms -> {last_window}ms"
     );
 }
+
+/// Half the tick is the device's, the other half belongs to the two network
+/// legs. A bot that answers correctly but a tick late is defaulted onto its
+/// old heading, which is how one walked into a wall with a good move in
+/// flight.
+#[tokio::test]
+async fn the_thinking_window_is_at_most_half_the_tick() {
+    let dir = std::env::temp_dir().join(format!("snek-window-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("window.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let (_, registry) = snek_server::build(&db_path);
+    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    let mut alice =
+        Client::connect(wt_port, "window-test", "alice-secret-0000", info("alice")).await;
+    let tick_ms = 500u32;
+    alice
+        .control(&ClientMsg::Configure(GameConfig {
+            board_width: 11,
+            board_height: 11,
+            tick_ms,
+        }))
+        .await;
+    alice
+        .control(&ClientMsg::Benchmark {
+            sims_per_sec: 500_000,
+            device: "fast phone".to_string(),
+            cores: 16,
+        })
+        .await;
+    // Hard is the greediest setting, and one bot on a 16-core device is the
+    // case where nothing else trims the window.
+    alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Hard)).await;
+    alice.control(&ClientMsg::SetReady(true)).await;
+    alice.control(&ClientMsg::Start).await;
+
+    let mut saw = 0u32;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline && saw < 3 {
+        if let Ok(ServerMsg::ComputeRequest { think_ms, .. }) =
+            tokio::time::timeout(Duration::from_millis(800), alice.next_msg()).await
+        {
+            saw += 1;
+            assert!(
+                think_ms * 2 <= tick_ms,
+                "asked a device for {think_ms}ms of thinking out of a {tick_ms}ms tick, \
+                 leaving too little for the round trip"
+            );
+        }
+    }
+    assert!(saw > 0, "never saw a compute request");
+}

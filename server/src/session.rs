@@ -222,6 +222,9 @@ struct RetiredCompute {
     conn_id: u64,
     bot_id: PlayerId,
     turn_number: u32,
+    /// Whether a late answer for this request has already cost the host
+    /// some window — answers arrive twice on purpose.
+    penalised: bool,
 }
 
 struct ComputeAccum {
@@ -594,7 +597,19 @@ impl SessionActor {
                             );
                             if let Some(conn) = self.conns.get_mut(&conn_id) {
                                 conn.misses = 0;
-                                conn.think_share = (conn.think_share * 0.7).max(0.45);
+                                if !r.penalised {
+                                    conn.think_share = (conn.think_share * 0.7).max(0.45);
+                                }
+                            }
+                            // Answers are sent twice for redundancy, so the
+                            // second copy must not be read as a second
+                            // failure and shrink the window all over again.
+                            if let Some((_, r)) = self
+                                .retired_compute
+                                .iter_mut()
+                                .find(|(id, _)| *id == request_id)
+                            {
+                                r.penalised = true;
                             }
                         }
                     }
@@ -1068,6 +1083,7 @@ impl SessionActor {
                     conn_id: pc.conn_id,
                     bot_id: pc.bot_id.clone(),
                     turn_number: pc.turn.turn_number,
+                    penalised: false,
                 },
             ));
         }
@@ -1102,7 +1118,15 @@ impl SessionActor {
                 .conns
                 .get(&conn_id)
                 .map_or((1.0, 4), |c| (c.think_share, c.cores));
-            let mut window = (self.config.tick_ms as f64 * 0.7 - 60.0).max(25.0);
+            // Half the tick, and no more. The rest of it belongs to the two
+            // network legs — out to the device and back — plus the slice the
+            // search overshoots its deadline by. At 70% a phone answering in
+            // 302ms of a 500ms tick had under 200ms for both legs, and when
+            // that wasn't enough the answer arrived a tick late, by which
+            // point the bot had already been defaulted onto its old heading.
+            // Three of those in one game, and one of them was a bot holding
+            // Left into a wall with a good move sitting in flight.
+            let mut window = (self.config.tick_ms as f64 * 0.5).max(25.0);
             // Bots on a device think concurrently, one worker each. If they
             // outnumber the threads available, asking each for the full
             // window pins the phone at 100% and makes the whole device feel
