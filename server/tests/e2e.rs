@@ -378,7 +378,7 @@ async fn distributed_compute_round_trip() {
                             think_ms,
                             sims,
                             slices: sims / 128,
-                            fallback: false,
+                            fallback: false, loop_lag_ms: 0,
                         },
                     })
                     .await;
@@ -528,7 +528,7 @@ async fn sleeping_host_pauses_the_game() {
                         proof,
                         tm: snek_shared::protocol::ComputeTelemetry {
                             queue_ms: 0, search_ms: 10, total_ms: 10,
-                            think_ms: 100, sims: 200, slices: 3, fallback: false,
+                            think_ms: 100, sims: 200, slices: 3, fallback: false, loop_lag_ms: 0,
                         },
                     })
                     .await;
@@ -581,7 +581,7 @@ async fn sleeping_host_pauses_the_game() {
                         request_id, dir, proof,
                         tm: snek_shared::protocol::ComputeTelemetry {
                             queue_ms: 0, search_ms: 10, total_ms: 10,
-                            think_ms: 100, sims: 200, slices: 3, fallback: false,
+                            think_ms: 100, sims: 200, slices: 3, fallback: false, loop_lag_ms: 0,
                         },
                     })
                     .await;
@@ -733,7 +733,7 @@ async fn answering_late_shrinks_the_thinking_window() {
                         request_id, dir, proof,
                         tm: snek_shared::protocol::ComputeTelemetry {
                             queue_ms: 300, search_ms: 50, total_ms: think_ms + 700,
-                            think_ms, sims: 64, slices: 1, fallback: false,
+                            think_ms, sims: 64, slices: 1, fallback: false, loop_lag_ms: 0,
                         },
                     })
                     .await;

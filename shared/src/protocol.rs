@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 
 /// The client-editable part of a profile. The public player id is derived
 /// server-side (a hash of the client's private secret), so a client can never
@@ -199,6 +199,12 @@ pub struct ComputeTelemetry {
     pub slices: u32,
     /// Computed on the UI thread because no worker was available.
     pub fallback: bool,
+    /// Worst event-loop stall seen on the device since its last answer. The
+    /// page is single threaded: while it is drawing a board of long snakes,
+    /// an arriving request simply waits, and that wait is invisible to every
+    /// other number here because they only start once the message is picked
+    /// up.
+    pub loop_lag_ms: u32,
 }
 
 /// All-time client-compute statistics (JSON, /api/compute).

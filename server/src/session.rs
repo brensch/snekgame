@@ -214,6 +214,11 @@ struct PendingCompute {
     conn_id: u64,
     turn: Turn,
     nonce: u64,
+    /// When we put it on the wire. The device reports how long it spent
+    /// thinking; the difference is everything else — both network legs and
+    /// whatever the browser did before handing the message to the page.
+    /// Without it a slow link and a slow phone are the same event.
+    issued_at: Instant,
 }
 
 /// The little we need to keep about a request whose tick has passed: just
@@ -222,6 +227,7 @@ struct RetiredCompute {
     conn_id: u64,
     bot_id: PlayerId,
     turn_number: u32,
+    issued_at: Instant,
     /// Whether a late answer for this request has already cost the host
     /// some window — answers arrive twice on purpose.
     penalised: bool,
@@ -233,6 +239,12 @@ struct ComputeAccum {
     wall_ms: u64,
     worst_total_ms: u32,
     worst_queue_ms: u32,
+    /// Issue to answer, measured here. Everything the device didn't spend
+    /// thinking is the wire.
+    worst_round_trip_ms: u32,
+    worst_wire_ms: u32,
+    wire_ms_total: u64,
+    worst_loop_lag_ms: u32,
     min_sims: u32,
     fallbacks: u32,
 }
@@ -245,6 +257,10 @@ impl Default for ComputeAccum {
             wall_ms: 0,
             worst_total_ms: 0,
             worst_queue_ms: 0,
+            worst_round_trip_ms: 0,
+            worst_wire_ms: 0,
+            wire_ms_total: 0,
+            worst_loop_lag_ms: 0,
             min_sims: u32::MAX,
             fallbacks: 0,
         }
@@ -593,6 +609,10 @@ impl SessionActor {
                                 answered_for = r.turn_number, ticks_behind = behind,
                                 total_ms = tm.total_ms, queue_ms = tm.queue_ms,
                                 sims = tm.sims,
+                                loop_lag_ms = tm.loop_lag_ms,
+                                round_trip_ms = r.issued_at.elapsed().as_millis() as u64,
+                                wire_ms = (r.issued_at.elapsed().as_millis() as u64)
+                                    .saturating_sub(tm.total_ms as u64),
                                 "compute answer arrived after its tick had gone"
                             );
                             if let Some(conn) = self.conns.get_mut(&conn_id) {
@@ -635,6 +655,13 @@ impl SessionActor {
                     acc.wall_ms += tm.search_ms.min(60_000) as u64;
                     acc.worst_total_ms = acc.worst_total_ms.max(tm.total_ms);
                     acc.worst_queue_ms = acc.worst_queue_ms.max(tm.queue_ms);
+                    let round_trip = pending.issued_at.elapsed().as_millis() as u32;
+                    acc.worst_round_trip_ms = acc.worst_round_trip_ms.max(round_trip);
+                    acc.worst_wire_ms = acc
+                        .worst_wire_ms
+                        .max(round_trip.saturating_sub(tm.total_ms));
+                    acc.wire_ms_total += round_trip.saturating_sub(tm.total_ms) as u64;
+                    acc.worst_loop_lag_ms = acc.worst_loop_lag_ms.max(tm.loop_lag_ms);
                     acc.min_sims = acc.min_sims.min(tm.sims);
                     if tm.fallback {
                         acc.fallbacks += 1;
@@ -954,6 +981,10 @@ impl SessionActor {
                 min_sims = if acc.min_sims == u32::MAX { 0 } else { acc.min_sims },
                 worst_total_ms = acc.worst_total_ms,
                 worst_queue_ms = acc.worst_queue_ms,
+                worst_round_trip_ms = acc.worst_round_trip_ms,
+                worst_wire_ms = acc.worst_wire_ms,
+                mean_wire_ms = acc.wire_ms_total / acc.moves.max(1) as u64,
+                worst_loop_lag_ms = acc.worst_loop_lag_ms,
                 fallbacks = acc.fallbacks,
                 "compute summary"
             );
@@ -1083,6 +1114,7 @@ impl SessionActor {
                     conn_id: pc.conn_id,
                     bot_id: pc.bot_id.clone(),
                     turn_number: pc.turn.turn_number,
+                    issued_at: pc.issued_at,
                     penalised: false,
                 },
             ));
@@ -1153,6 +1185,7 @@ impl SessionActor {
                     conn_id,
                     turn: turn.clone(),
                     nonce,
+                    issued_at: Instant::now(),
                 },
             );
             let bot_name = self

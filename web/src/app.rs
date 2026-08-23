@@ -52,6 +52,8 @@ pub fn app() -> impl IntoView {
     read_route();
     window_event_listener(ev::hashchange, move |_| read_route());
 
+    net::watch_main_thread();
+
     // --- shared coarse clock + liveness watchdog ---------------------------
     let clock = Interval::new(200, move || {
         store.now_ms.set(net::now());

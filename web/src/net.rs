@@ -19,7 +19,7 @@ use js_sys::Uint8Array;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use snek_shared::protocol::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{WebTransport, WritableStreamDefaultWriter};
@@ -495,6 +495,31 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
     Ok(())
 }
 
+thread_local! {
+    /// Worst gap between when a 50ms heartbeat should have run and when it
+    /// did. Nothing else can see this: while the thread is busy drawing, an
+    /// arriving request just sits in the queue, and every timing we take
+    /// starts after we pick it up.
+    static LOOP_LAG_MS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Start the heartbeat. Sampling costs a timer callback every 50ms.
+pub fn watch_main_thread() {
+    let mut last = now();
+    let beat = Interval::new(50, move || {
+        let t = now();
+        let lag = ((t - last) - 50.0).max(0.0) as u32;
+        last = t;
+        LOOP_LAG_MS.with(|c| c.set(c.get().max(lag)));
+    });
+    beat.forget();
+}
+
+/// Worst stall since the last answer, and reset.
+fn take_loop_lag() -> u32 {
+    LOOP_LAG_MS.with(|c| c.replace(0))
+}
+
 /// Tell the server whether this device can think right now. A hidden page
 /// has its workers suspended — saying nothing would leave its bots holding
 /// their heading into a wall while the phone sleeps.
@@ -710,6 +735,7 @@ fn apply(store: Store, msg: ServerMsg) {
                             sims,
                             slices,
                             fallback: false,
+                            loop_lag_ms: take_loop_lag(),
                         },
                     ),
                     None => {
@@ -742,6 +768,7 @@ fn apply(store: Store, msg: ServerMsg) {
                                 sims,
                                 slices: sims / 64,
                                 fallback: true,
+                                loop_lag_ms: take_loop_lag(),
                             },
                         )
                     }
