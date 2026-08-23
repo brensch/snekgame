@@ -178,6 +178,11 @@ struct Conn {
     /// is budgeted from it — devices are given a deadline and report what
     /// they managed within it.
     recent_sims_per_sec: Option<u32>,
+    /// Fraction of the nominal thinking window this host actually gets.
+    /// The one thing worth controlling is the only thing we can observe
+    /// cleanly: did the answer arrive before the tick? Shrink hard when it
+    /// does not, creep back when it does.
+    think_share: f64,
     /// Protocol abuse only (bad checksum, answering someone else's
     /// request). Three of these stop us trusting the connection.
     strikes: u32,
@@ -190,11 +195,28 @@ struct PendingCompute {
     nonce: u64,
 }
 
-#[derive(Default)]
 struct ComputeAccum {
     moves: u32,
     sims: u64,
     wall_ms: u64,
+    worst_total_ms: u32,
+    worst_queue_ms: u32,
+    min_sims: u32,
+    fallbacks: u32,
+}
+
+impl Default for ComputeAccum {
+    fn default() -> Self {
+        ComputeAccum {
+            moves: 0,
+            sims: 0,
+            wall_ms: 0,
+            worst_total_ms: 0,
+            worst_queue_ms: 0,
+            min_sims: u32::MAX,
+            fallbacks: 0,
+        }
+    }
 }
 
 struct RunningGame {
@@ -334,6 +356,7 @@ impl SessionActor {
                         device: String::new(),
                         sims_per_sec: None,
                         recent_sims_per_sec: None,
+                        think_share: 1.0,
                         strikes: 0,
                     },
                 );
@@ -462,7 +485,7 @@ impl SessionActor {
                 }
                 self.assign_bots();
             }
-            ClientMsg::BotMove { request_id, dir, proof, elapsed_ms, sims } => {
+            ClientMsg::BotMove { request_id, dir, proof, tm } => {
                 let Some(pending) = self.pending_compute.remove(&request_id) else {
                     return; // stale or bogus
                 };
@@ -482,14 +505,37 @@ impl SessionActor {
                 if let Some(game) = &mut self.game {
                     let acc = game.compute.entry(conn_id).or_default();
                     acc.moves += 1;
-                    acc.sims += sims as u64;
-                    acc.wall_ms += elapsed_ms.min(60_000) as u64;
+                    acc.sims += tm.sims as u64;
+                    acc.wall_ms += tm.search_ms.min(60_000) as u64;
+                    acc.worst_total_ms = acc.worst_total_ms.max(tm.total_ms);
+                    acc.worst_queue_ms = acc.worst_queue_ms.max(tm.queue_ms);
+                    acc.min_sims = acc.min_sims.min(tm.sims);
+                    if tm.fallback {
+                        acc.fallbacks += 1;
+                    }
+                }
+                // Anything that explains a bad-looking bot gets said out
+                // loud; the rest is summarised when the game ends. A move
+                // with no slices at all is a *forced* one — a single legal
+                // option, decided without searching — which is correct, not
+                // poor.
+                let forced = tm.slices == 0 && tm.sims == 0;
+                if !forced
+                    && (tm.fallback || tm.sims < 800 || tm.total_ms > self.config.tick_ms)
+                {
+                    tracing::info!(
+                        session = %self.name, conn = conn_id, bot = %pending.bot_id,
+                        think_ms = tm.think_ms, queue_ms = tm.queue_ms,
+                        search_ms = tm.search_ms, total_ms = tm.total_ms,
+                        sims = tm.sims, slices = tm.slices, fallback = tm.fallback,
+                        "compute was poor"
+                    );
                 }
                 // Ranking signal only: how much thinking this device got
                 // done inside its deadline.
-                if elapsed_ms >= 4 && sims > 0 {
+                if tm.search_ms >= 4 && tm.sims > 0 {
                     if let Some(conn) = self.conns.get_mut(&conn_id) {
-                        let rate = (sims as u64 * 1000 / elapsed_ms as u64) as u32;
+                        let rate = (tm.sims as u64 * 1000 / tm.search_ms as u64) as u32;
                         conn.recent_sims_per_sec = Some(match conn.recent_sims_per_sec {
                             Some(prev) => (prev * 7 + rate * 3) / 10,
                             None => rate,
@@ -505,9 +551,20 @@ impl SessionActor {
                             bot = %pending.bot_id,
                             answered_for = pending.turn.turn_number,
                             now_at = current.unwrap_or(0),
-                            elapsed_ms,
+                            total_ms = tm.total_ms,
+                            queue_ms = tm.queue_ms,
+                            sims = tm.sims,
                             "compute answer arrived too late to be used"
                         );
+                        if let Some(conn) = self.conns.get_mut(&conn_id) {
+                            // Floor it well above uselessness: a bot given
+                            // a few dozen milliseconds plays at random,
+                            // which looks worse than the occasional late
+                            // answer it was protecting us from.
+                            conn.think_share = (conn.think_share * 0.7).max(0.45);
+                        }
+                    } else if let Some(conn) = self.conns.get_mut(&conn_id) {
+                        conn.think_share = (conn.think_share + 0.05).min(1.0);
                     }
                     if current == Some(pending.turn.turn_number)
                         && game
@@ -520,6 +577,17 @@ impl SessionActor {
                     }
                 }
 
+            }
+            ClientMsg::ComputeFailed { request_id, reason } => {
+                let bot = self
+                    .pending_compute
+                    .get(&request_id)
+                    .map(|pc| pc.bot_id.clone())
+                    .unwrap_or_default();
+                tracing::info!(
+                    session = %self.name, conn = conn_id, %bot, %reason,
+                    "device could not compute a bot move"
+                );
             }
             ClientMsg::Ping(n) => {
                 self.send_to(conn_id, control_frame(&ServerMsg::Pong(n))).await;
@@ -580,6 +648,7 @@ impl SessionActor {
         // budget restarts from a modest value it can climb from.
         for conn in self.conns.values_mut() {
             conn.strikes = 0;
+            conn.think_share = conn.think_share.max(0.5);
         }
         self.ready.clear();
         self.publish_info();
@@ -713,6 +782,19 @@ impl SessionActor {
         })
         .await;
 
+        // One line per host: how the device actually behaved this game.
+        for (conn_id, acc) in &game.compute {
+            tracing::info!(
+                session = %self.name, conn = conn_id, moves = acc.moves,
+                mean_sims = acc.sims / acc.moves.max(1) as u64,
+                min_sims = if acc.min_sims == u32::MAX { 0 } else { acc.min_sims },
+                worst_total_ms = acc.worst_total_ms,
+                worst_queue_ms = acc.worst_queue_ms,
+                fallbacks = acc.fallbacks,
+                "compute summary"
+            );
+        }
+
         // Per-device compute scoreboard: who thought for the bots, on what.
         let compute: Vec<(ComputeStat, PlayerId, String, u32)> = game
             .compute
@@ -842,15 +924,19 @@ impl SessionActor {
                 continue;
             }
             // Everything a host runs must finish inside the tick, with room
-            // for the round trip. Bots on the same device think in parallel
-            // (a worker each), so the window is not divided between them.
-            let window = (self.config.tick_ms as f64 - 150.0).max(30.0);
+            // for the round trip and for a phone whose main thread is also
+            // drawing the game. Bots on a device think in parallel (a worker
+            // each), so the window is not divided between them — but it is
+            // scaled by how reliably this host has been answering.
+            let share = self.conns.get(&conn_id).map_or(1.0, |c| c.think_share);
+            let window = (self.config.tick_ms as f64 * 0.7 - 60.0).max(25.0);
             let difficulty_factor = match difficulty {
-                BotDifficulty::Easy => 0.15,
-                BotDifficulty::Medium => 0.45,
-                BotDifficulty::Hard => 0.9,
+                BotDifficulty::Easy => 0.2,
+                BotDifficulty::Medium => 0.5,
+                BotDifficulty::Hard => 1.0,
             };
-            let think_ms = (window * difficulty_factor).clamp(20.0, 2_000.0) as u32;
+            let think_ms =
+                (window * difficulty_factor * share).clamp(20.0, 2_000.0) as u32;
             let request_id = self.next_request_id;
             self.next_request_id += 1;
             let nonce = rand::random::<u64>();

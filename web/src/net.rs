@@ -523,7 +523,7 @@ async fn benchmark_sims_per_sec(generation: u64) -> Option<u32> {
     // hosts. Everything after this is deadline-driven, so nothing is
     // predicted from it.
     const PROBE_MS: u32 = 300;
-    let (_dir, _proof, sims) =
+    let (_dir, _proof, sims, _slices, _began, _search) =
         crate::botworker::compute(config, turn, a.clone(), PROBE_MS, 0).await?;
     if !is_current(generation) {
         return None;
@@ -677,24 +677,73 @@ fn apply(store: Store, msg: ServerMsg) {
             }
             let bot_label = bot_id.clone();
             spawn_local(async move {
-                let started = now();
                 let requested_for = turn.turn_number;
-                let Some((dir, _work, sims)) =
-                    crate::botworker::compute(config, turn, bot_id, think_ms, nonce).await
-                else {
-                    return;
+                let arrived = now();
+                let (dir, tm) = match crate::botworker::compute(
+                    config,
+                    turn.clone(),
+                    bot_id.clone(),
+                    think_ms,
+                    nonce,
+                )
+                .await
+                {
+                    Some((dir, _proof, sims, slices, began_ms, search_ms)) => (
+                        dir,
+                        ComputeTelemetry {
+                            queue_ms: (began_ms - arrived).max(0.0) as u32,
+                            search_ms,
+                            total_ms: (now() - arrived).max(0.0) as u32,
+                            think_ms,
+                            sims,
+                            slices,
+                            fallback: false,
+                        },
+                    ),
+                    None => {
+                        // The worker is gone. Say so — silence here is
+                        // indistinguishable from a dead client — then take
+                        // a short, bounded turn on this thread so the bot
+                        // still plays. A brief hitch beats a snake driving
+                        // into a wall.
+                        send(&ClientMsg::ComputeFailed {
+                            request_id,
+                            reason: "worker unavailable".into(),
+                        });
+                        let mut search =
+                            snek_shared::bot::begin(&config, &turn, &bot_id, u32::MAX, nonce);
+                        let cutoff = now() + (think_ms as f64).min(60.0);
+                        let mut sims = 0u32;
+                        while !search.step(64) {
+                            sims += 64;
+                            if now() >= cutoff {
+                                break;
+                            }
+                        }
+                        (
+                            search.result().0,
+                            ComputeTelemetry {
+                                queue_ms: 0,
+                                search_ms: (now() - cutoff + 60.0).max(0.0) as u32,
+                                total_ms: (now() - arrived).max(0.0) as u32,
+                                think_ms,
+                                sims,
+                                slices: sims / 64,
+                                fallback: true,
+                            },
+                        )
+                    }
                 };
-                let latest = LATEST_TURN.with(|c| c.get());
-                let took = (now() - started).max(0.0) as u32;
                 web_sys::console::debug_1(&JsValue::from_str(&format!(
-                    "compute done bot={bot_label} for_turn={requested_for} latest={latest} think_ms={think_ms} took={took} sims={sims}"
+                    "compute bot={bot_label} turn={requested_for} think={}ms queue={}ms search={}ms total={}ms sims={} slices={} fallback={}",
+                    tm.think_ms, tm.queue_ms, tm.search_ms, tm.total_ms, tm.sims,
+                    tm.slices, tm.fallback
                 )));
-                if requested_for < latest {
-                    return; // the tick resolved while we were thinking
-                }
-                let elapsed_ms = (now() - started).max(0.0) as u32;
+                // Always report, even if the tick already resolved: the
+                // server discards a stale move but keeps the timings, and
+                // silence is indistinguishable from a broken client.
                 let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
-                send(&ClientMsg::BotMove { request_id, dir, proof, elapsed_ms, sims });
+                send(&ClientMsg::BotMove { request_id, dir, proof, tm });
             });
         }
         ServerMsg::GameSaved { id, .. } => store.saved_id.set(Some(id)),

@@ -370,8 +370,15 @@ async fn distributed_compute_round_trip() {
                         request_id,
                         dir,
                         proof,
-                        elapsed_ms: think_ms.max(1),
-                        sims,
+                        tm: snek_shared::protocol::ComputeTelemetry {
+                            queue_ms: 0,
+                            search_ms: think_ms.max(1),
+                            total_ms: think_ms.max(1),
+                            think_ms,
+                            sims,
+                            slices: sims / 128,
+                            fallback: false,
+                        },
                     })
                     .await;
             }

@@ -23,8 +23,10 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
 
-/// How long to wait on the worker before rebuilding it.
-const WORKER_TIMEOUT_MS: u32 = 5_000;
+/// How long to wait on the worker before giving up and rebuilding it.
+/// Short: a stalled worker must be discovered inside a tick, not after
+/// several of them have already passed with the bot driving straight.
+const WORKER_TIMEOUT_MS: u32 = 1_500;
 
 #[derive(Serialize, Deserialize)]
 struct Job {
@@ -45,6 +47,11 @@ struct JobResult {
     dir: Dir,
     proof: u64,
     sims: u32,
+    slices: u32,
+    /// When the worker picked the job up (epoch ms) — the difference from
+    /// the request's arrival is time lost to queueing.
+    began_ms: f64,
+    search_ms: u32,
 }
 
 /// Exported into the wasm bundle so the worker can call it. Searches until
@@ -58,9 +65,11 @@ pub fn snek_bot_compute(job: &[u8]) -> Vec<u8> {
     // Enough work per slice to keep clock checks negligible, small enough
     // to land close to the deadline.
     const SLICE: usize = 128;
+    let began_ms = js_sys::Date::now();
     let mut search =
         snek_shared::bot::begin(&job.config, &job.turn, &job.bot_id, u32::MAX, job.nonce);
     let mut sims = 0u32;
+    let mut slices = 0u32;
     loop {
         // Always take one slice, so even a job that queued past its
         // deadline returns a searched move rather than a default.
@@ -68,12 +77,22 @@ pub fn snek_bot_compute(job: &[u8]) -> Vec<u8> {
             break; // nothing left to search
         }
         sims += SLICE as u32;
+        slices += 1;
         if js_sys::Date::now() >= job.deadline_ms {
             break;
         }
     }
     let (dir, proof) = search.result();
-    postcard::to_allocvec(&JobResult { dir, proof, sims }).unwrap_or_default()
+    let search_ms = (js_sys::Date::now() - began_ms).max(0.0) as u32;
+    postcard::to_allocvec(&JobResult {
+        dir,
+        proof,
+        sims,
+        slices,
+        began_ms,
+        search_ms,
+    })
+    .unwrap_or_default()
 }
 
 thread_local! {
@@ -220,7 +239,7 @@ pub async fn compute(
     bot_id: PlayerId,
     think_ms: u32,
     nonce: u64,
-) -> Option<(Dir, u64, u32)> {
+) -> Option<(Dir, u64, u32, u32, f64, u32)> {
     if UNAVAILABLE.with(|u| u.get()) {
         return None;
     }
@@ -277,5 +296,12 @@ pub async fn compute(
         return None;
     }
     let result = postcard::from_bytes::<JobResult>(&bytes).ok()?;
-    Some((result.dir, result.proof, result.sims))
+    Some((
+        result.dir,
+        result.proof,
+        result.sims,
+        result.slices,
+        result.began_ms,
+        result.search_ms,
+    ))
 }

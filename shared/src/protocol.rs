@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 /// The client-editable part of a profile. The public player id is derived
 /// server-side (a hash of the client's private secret), so a client can never
@@ -50,6 +50,10 @@ pub enum ClientMsg {
     /// Remove a player (or bot) from the lobby (anyone can kick, like tac).
     Kick(PlayerId),
     Ping(u32),
+    /// This device could not produce a move for a compute request. Sent so
+    /// the failure is visible server-side instead of looking identical to
+    /// a silent client.
+    ComputeFailed { request_id: u64, reason: String },
     /// Alternative first message: subscribe to the active-games list
     /// instead of joining a session (used by the home screen).
     WatchGames,
@@ -69,11 +73,7 @@ pub enum ClientMsg {
         request_id: u64,
         dir: Dir,
         proof: u64,
-        /// Wall time this device spent on the search.
-        elapsed_ms: u32,
-        /// Simulations it managed in that time — the honest measure of how
-        /// much thinking this device contributed.
-        sims: u32,
+        tm: ComputeTelemetry,
     },
 }
 
@@ -168,6 +168,30 @@ pub struct ComputeStat {
     pub moves: u32,
     pub sims: u64,
     pub wall_ms: u64,
+}
+
+/// What a device actually did with a compute request. Reported for every
+/// move so a bot's behaviour is explainable from the server logs instead
+/// of inferred: a bot that plays badly either got few simulations, waited
+/// too long for a thread, or fell back to the UI thread — and this says
+/// which.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ComputeTelemetry {
+    /// Request arrival -> the worker actually starting on it.
+    pub queue_ms: u32,
+    /// Time the worker spent searching.
+    pub search_ms: u32,
+    /// Arrival -> reply sent, i.e. everything the server's tick budget is
+    /// really spent on.
+    pub total_ms: u32,
+    /// Deadline the device was given.
+    pub think_ms: u32,
+    pub sims: u32,
+    /// Search slices completed — deadline granularity. One slice means the
+    /// device barely searched at all.
+    pub slices: u32,
+    /// Computed on the UI thread because no worker was available.
+    pub fallback: bool,
 }
 
 /// All-time client-compute statistics (JSON, /api/compute).
