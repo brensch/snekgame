@@ -87,7 +87,7 @@ pub fn think(
         }
         _ => {}
     }
-    search(&board, me_idx, sims as usize, nonce)
+    search(&board, me_idx, sims as usize, nonce, EVAL)
 }
 
 /// The response checksum a compute host must include: binds the server's
@@ -433,7 +433,11 @@ impl Node {
     }
 }
 
-fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64) -> (Dir, u64) {
+type EvalFn = fn(&FastBoard) -> [f32; MAX_SNAKES];
+/// The production evaluation.
+const EVAL: EvalFn = evaluate;
+
+fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64, eval: EvalFn) -> (Dir, u64) {
     let mut nodes = vec![Node::new(root.clone())];
     let mut path: Vec<(usize, [usize; MAX_SNAKES])> = Vec::with_capacity(64);
     let mut sims = 0usize;
@@ -443,7 +447,7 @@ fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64) -> (Dir, u64
         let mut cur = 0usize;
         let leaf_vals = loop {
             if nodes[cur].terminal {
-                break evaluate(&nodes[cur].board);
+                break eval(&nodes[cur].board);
             }
             let n = nodes[cur].board.snakes.len();
             let mut cidx = [0usize; MAX_SNAKES];
@@ -461,7 +465,7 @@ fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64) -> (Dir, u64
                     let moves: Vec<Dir> =
                         (0..n).map(|i| nodes[cur].cands[i][cidx[i]]).collect();
                     child.step(&moves);
-                    let vals = evaluate(&child);
+                    let vals = eval(&child);
                     let id = nodes.len();
                     nodes.push(Node::new(child));
                     nodes[cur].children.insert(key, id);
@@ -512,7 +516,64 @@ fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64) -> (Dir, u64
 const UNCLAIMED: u8 = u8::MAX;
 const CONTESTED: u8 = u8::MAX - 1;
 
+/// Length-awareness experiments, ablated: `growth` makes food urgency
+/// scale with a length deficit (not just hunger); `length_heavy` shifts
+/// weight from health onto relative length. `evaluate` is the incumbent.
+#[derive(Clone, Copy, PartialEq)]
+struct Tuning {
+    /// Strength of length-deficit food urgency (0.0 = hunger only).
+    growth: f32,
+    length_heavy: bool,
+}
+
+/// Shipping tuning. `growth: 0.7` earned its place in the arena: 82W-54L-4D
+/// over 140 games against `LEGACY` across 11x11 and 13x13 (~60%, p≈0.008),
+/// with longer snakes on average. `length_heavy` stays off — re-weighting
+/// relative length at health's expense lost 18W-40L and produced *shorter*
+/// snakes (it starved). See `arena_ablation` / `arena_confirm_growth`.
+const TUNING: Tuning = Tuning { growth: 0.7, length_heavy: false };
+/// The pre-tuning evaluation, kept as the arena's benchmark opponent.
+#[cfg(test)]
+const LEGACY: Tuning = Tuning { growth: 0.0, length_heavy: false };
+#[cfg(test)]
+const GROWTH_05: Tuning = Tuning { growth: 0.5, length_heavy: false };
+#[cfg(test)]
+const GROWTH_10: Tuning = Tuning { growth: 1.0, length_heavy: false };
+#[cfg(test)]
+const LENGTH_HEAVY_ONLY: Tuning = Tuning { growth: 0.0, length_heavy: true };
+#[cfg(test)]
+const BOTH: Tuning = Tuning { growth: 0.7, length_heavy: true };
+
 fn evaluate(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, TUNING)
+}
+
+#[cfg(test)]
+fn evaluate_legacy(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, LEGACY)
+}
+
+#[cfg(test)]
+fn evaluate_growth_05(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, GROWTH_05)
+}
+
+#[cfg(test)]
+fn evaluate_growth_10(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, GROWTH_10)
+}
+
+#[cfg(test)]
+fn evaluate_length_heavy(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, LENGTH_HEAVY_ONLY)
+}
+
+#[cfg(test)]
+fn evaluate_v2(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, BOTH)
+}
+
+fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
     let mut vals = [-1.0f32; MAX_SNAKES];
     if board.is_terminal() {
         match board.winner() {
@@ -632,7 +693,15 @@ fn evaluate(board: &FastBoard) -> [f32; MAX_SNAKES] {
         let length = ((len - longest_other) / 4.0).clamp(-1.0, 1.0);
         // Hunger: the race between health and the nearest food we can win,
         // weighted by how hungry we actually are.
-        let urgency = ((100.0 - s.health as f32) / 60.0).clamp(0.0, 1.0);
+        let hunger = ((100.0 - s.health as f32) / 60.0).clamp(0.0, 1.0);
+        let urgency = if tuning.growth > 0.0 {
+            // Shorter (or merely equal — ties die too) than the biggest
+            // rival: food matters even on full health.
+            let growth_need = ((longest_other + 2.0 - len) / 4.0).clamp(0.0, 1.0);
+            hunger.max(tuning.growth * growth_need)
+        } else {
+            hunger
+        };
         let margin = if food_dist[i] == u16::MAX {
             -1.0
         } else {
@@ -642,9 +711,14 @@ fn evaluate(board: &FastBoard) -> [f32; MAX_SNAKES] {
         // Trap: a reachable region smaller than the body is a death sentence.
         let reach = reachable_cells(board, i, &blocked_until);
         let trap = ((reach as f32 - len) / len).clamp(-1.0, 0.0);
+        let (w_health, w_length) = if tuning.length_heavy {
+            (0.05, W_LENGTH + 0.05)
+        } else {
+            (W_HEALTH, W_LENGTH)
+        };
         vals[i] = (W_AREA * area_score
-            + W_HEALTH * health
-            + W_LENGTH * length
+            + w_health * health
+            + w_length * length
             + W_FOOD * food
             + W_TRAP * trap)
             .clamp(-1.0, 1.0);
@@ -826,6 +900,185 @@ mod tests {
         assert_eq!(board.snakes[1].head(), 57);
         assert!(board.is_terminal());
         assert_eq!(board.winner(), Some(1));
+    }
+
+    fn think_with(
+        config: &GameConfig,
+        turn: &Turn,
+        me: &PlayerId,
+        sims: u32,
+        eval: EvalFn,
+    ) -> Dir {
+        let order: Vec<&PlayerId> = turn.alive.iter().collect();
+        let Some(me_idx) = order.iter().position(|p| *p == me) else {
+            return Dir::Up;
+        };
+        let board = FastBoard::from_turn(config, turn, &order);
+        let cands = safe_candidates(&board, me_idx);
+        match cands.len() {
+            0 => Dir::Up,
+            1 => cands[0],
+            _ => search(&board, me_idx, sims as usize, 0, eval).0,
+        }
+    }
+
+    fn arena_config() -> GameConfig {
+        board_config(11)
+    }
+
+    fn board_config(size: u8) -> GameConfig {
+        GameConfig {
+            board_width: size,
+            board_height: size,
+            tick_ms: 1000,
+        }
+    }
+
+    /// One deterministic duel. Returns (challenger_score, incumbent_score)
+    /// where a score is (survival_turns, final_length) — length breaks the
+    /// "both alive at the cap" ties that make survival-only tests blind.
+    fn duel(
+        challenger: EvalFn,
+        incumbent: EvalFn,
+        sims: u32,
+        seed: u64,
+        swap: bool,
+        board: u8,
+    ) -> ((u32, usize), (u32, usize)) {
+        let cfg = board_config(board);
+        let a: PlayerId = "a".into();
+        let b: PlayerId = "b".into();
+        let mut engine = Engine::new(cfg, vec![a.clone(), b.clone()], seed);
+        let mut turn = engine.first_turn();
+        for _ in 0..250 {
+            if turn.game_over() {
+                break;
+            }
+            let mut moves = BTreeMap::new();
+            for p in [&a, &b] {
+                if !turn.alive.contains(p) {
+                    continue;
+                }
+                let is_challenger = (p == &a) ^ swap;
+                let eval = if is_challenger { challenger } else { incumbent };
+                moves.insert(p.clone(), think_with(&cfg, &turn, p, sims, eval));
+            }
+            turn = engine.next_turn(&turn, &moves);
+        }
+        let score = |p: &PlayerId| {
+            let survived = turn
+                .winners
+                .iter()
+                .find(|w| &w.player == p)
+                .map(|w| w.survival_turns)
+                .unwrap_or(turn.turn_number);
+            let len = turn.snakes.get(p).map(|s| s.len()).unwrap_or(0);
+            (survived, len)
+        };
+        if swap {
+            (score(&b), score(&a))
+        } else {
+            (score(&a), score(&b))
+        }
+    }
+
+    /// Head-to-head arena, parallel across cores. Run with
+    /// `--ignored --nocapture` to see the score.
+    fn run_arena(name: &str, challenger: EvalFn, incumbent: EvalFn, seeds: u64, sims: u32) {
+        run_arena_on(name, challenger, incumbent, seeds, sims, 11)
+    }
+
+    fn run_arena_on(
+        name: &str,
+        challenger: EvalFn,
+        incumbent: EvalFn,
+        seeds: u64,
+        sims: u32,
+        board: u8,
+    ) {
+        let jobs: Vec<(u64, bool)> = (0..seeds)
+            .flat_map(|s| [(100 + s, false), (100 + s, true)])
+            .collect();
+        let results: Vec<((u32, usize), (u32, usize))> = std::thread::scope(|scope| {
+            let chunks: Vec<_> = jobs
+                .chunks(jobs.len().div_ceil(12).max(1))
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|&(seed, swap)| {
+                                duel(challenger, incumbent, sims, seed, swap, board)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            chunks.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        });
+
+        let (mut wins, mut losses, mut draws) = (0, 0, 0);
+        let (mut ch_len, mut in_len) = (0usize, 0usize);
+        for (ch, inc) in &results {
+            ch_len += ch.1;
+            in_len += inc.1;
+            match ch.cmp(inc) {
+                std::cmp::Ordering::Greater => wins += 1,
+                std::cmp::Ordering::Less => losses += 1,
+                std::cmp::Ordering::Equal => draws += 1,
+            }
+        }
+        let n = results.len();
+        println!(
+            "ARENA {name}: {wins}W {losses}L {draws}D of {n} @ {sims} sims, {board}x{board} \
+             | mean final length {:.1} vs {:.1}",
+            ch_len as f32 / n as f32,
+            in_len as f32 / n as f32,
+        );
+    }
+
+    /// Do the two evals even disagree? (Sanity check for arena power.)
+    #[test]
+    #[ignore]
+    fn evals_disagree_often_enough() {
+        let cfg = arena_config();
+        let a: PlayerId = "a".into();
+        let b: PlayerId = "b".into();
+        let mut engine = Engine::new(cfg, vec![a.clone(), b.clone()], 7);
+        let mut turn = engine.first_turn();
+        let (mut same, mut diff) = (0, 0);
+        for _ in 0..60 {
+            if turn.game_over() {
+                break;
+            }
+            let m1 = think_with(&cfg, &turn, &a, 1_200, evaluate_legacy);
+            let m2 = think_with(&cfg, &turn, &a, 1_200, evaluate);
+            if m1 == m2 { same += 1 } else { diff += 1 }
+            let mut moves = BTreeMap::new();
+            moves.insert(a.clone(), m1);
+            if turn.alive.contains(&b) {
+                moves.insert(b.clone(), think_with(&cfg, &turn, &b, 1_200, evaluate));
+            }
+            turn = engine.next_turn(&turn, &moves);
+        }
+        println!("EVAL DISAGREEMENT: {diff} differ, {same} same");
+    }
+
+    #[test]
+    #[ignore]
+    fn arena_ablation() {
+        run_arena("growth-urgency only", evaluate, evaluate_legacy, 30, 1_200);
+        run_arena("length-heavy only  ", evaluate_length_heavy, evaluate_legacy, 30, 1_200);
+        run_arena("both               ", evaluate_v2, evaluate_legacy, 30, 1_200);
+    }
+
+    /// Confirmation: does growth-urgency hold up at higher power, on the
+    /// default board, and across strengths?
+    #[test]
+    #[ignore]
+    fn arena_confirm_growth() {
+        run_arena_on("shipped 0.7 @13x13", evaluate, evaluate_legacy, 40, 1_200, 13);
+        run_arena("growth 0.5        ", evaluate_growth_05, evaluate_legacy, 30, 1_200);
+        run_arena("growth 1.0        ", evaluate_growth_10, evaluate_legacy, 30, 1_200);
     }
 
     /// fast_ln tracks real ln closely enough for UCB.
