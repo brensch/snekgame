@@ -524,25 +524,78 @@ struct Tuning {
     /// Strength of length-deficit food urgency (0.0 = hunger only).
     growth: f32,
     length_heavy: bool,
+    /// Treat "not strictly longer than the biggest rival" as maximum
+    /// growth urgency: +1 is the head-on threshold (equal length kills
+    /// both, +1 wins outright), so parity is not good enough.
+    bully_target: bool,
+    /// Multiplier on growth urgency while everyone is still short — the
+    /// early game is when a length lead is cheapest to win and most
+    /// punishing to hold (1.0 = off).
+    early_boost: f32,
+    /// Explicit value for standing at the head-on threshold: rewards being
+    /// strictly longer, penalises exact parity (mutual death) (0.0 = off).
+    dominance: f32,
+    /// Longest snake on the board below which the early boost applies.
+    early_until: f32,
 }
 
-/// Shipping tuning. `growth: 0.7` earned its place in the arena: 82W-54L-4D
-/// over 140 games against `LEGACY` across 11x11 and 13x13 (~60%, p≈0.008),
-/// with longer snakes on average. `length_heavy` stays off — re-weighting
-/// relative length at health's expense lost 18W-40L and produced *shorter*
-/// snakes (it starved). See `arena_ablation` / `arena_confirm_growth`.
-const TUNING: Tuning = Tuning { growth: 0.7, length_heavy: false };
+/// Shipping tuning, every value earned in the arena (see the `arena_*`
+/// tests; all figures are two-seat deterministic duels vs the previous
+/// shipping eval):
+///
+/// - `growth: 0.7` — food urgency scales with length deficit, not just
+///   hunger: 82W-54L-4D over 140 games (~60%, p≈0.008). 0.5 was a wash,
+///   1.0 suicidal.
+/// - `early_boost: 1.6` until length 9 — press hard for the head-on lead
+///   while snakes are short, then stop: 84W-48L-8D over 140 games
+///   (~64%, p≈0.001), and noticeably longer snakes. Carrying the
+///   aggression to length 13 instead *loses* 18W-36L.
+/// - `length_heavy` off — re-weighting relative length at health's expense
+///   lost 18W-40L and starved into *shorter* snakes.
+/// - `bully_target` off — demanding a strict lead before easing off lost
+///   22W-28L: the same over-aggression that sank `growth: 1.0`.
+/// - `dominance` off — an explicit head-on-standing term was noise
+///   (30W-26L, inside the margin).
+const TUNING: Tuning = Tuning {
+    growth: 0.7,
+    length_heavy: false,
+    bully_target: false,
+    early_boost: 1.6,
+    dominance: 0.0,
+    early_until: 9.0,
+};
 /// The pre-tuning evaluation, kept as the arena's benchmark opponent.
 #[cfg(test)]
-const LEGACY: Tuning = Tuning { growth: 0.0, length_heavy: false };
+const LEGACY: Tuning = Tuning {
+    growth: 0.0,
+    length_heavy: false,
+    bully_target: false,
+    early_boost: 1.0,
+    dominance: 0.0,
+    early_until: 9.0,
+};
 #[cfg(test)]
-const GROWTH_05: Tuning = Tuning { growth: 0.5, length_heavy: false };
+const GROWTH_05: Tuning = Tuning { growth: 0.5, ..LEGACY };
 #[cfg(test)]
-const GROWTH_10: Tuning = Tuning { growth: 1.0, length_heavy: false };
+const GROWTH_10: Tuning = Tuning { growth: 1.0, ..LEGACY };
 #[cfg(test)]
-const LENGTH_HEAVY_ONLY: Tuning = Tuning { growth: 0.0, length_heavy: true };
+const LENGTH_HEAVY_ONLY: Tuning = Tuning { length_heavy: true, ..LEGACY };
 #[cfg(test)]
-const BOTH: Tuning = Tuning { growth: 0.7, length_heavy: true };
+const BOTH: Tuning = Tuning { growth: 0.7, length_heavy: true, ..LEGACY };
+/// Bully candidates, each isolated against the shipped tuning.
+#[cfg(test)]
+const BULLY: Tuning = Tuning { bully_target: true, ..TUNING };
+/// The tuning before the early-game boost, kept as a benchmark.
+#[cfg(test)]
+const PRE_EARLY: Tuning = Tuning { early_boost: 1.0, ..TUNING };
+#[cfg(test)]
+const EARLY: Tuning = Tuning { early_boost: 1.6, ..TUNING };
+#[cfg(test)]
+const DOMINANCE: Tuning = Tuning { dominance: 0.10, ..TUNING };
+#[cfg(test)]
+const EARLY_T7: Tuning = Tuning { early_boost: 1.6, early_until: 7.0, ..TUNING };
+#[cfg(test)]
+const EARLY_T13: Tuning = Tuning { early_boost: 1.6, early_until: 13.0, ..TUNING };
 
 fn evaluate(board: &FastBoard) -> [f32; MAX_SNAKES] {
     evaluate_impl(board, TUNING)
@@ -551,6 +604,36 @@ fn evaluate(board: &FastBoard) -> [f32; MAX_SNAKES] {
 #[cfg(test)]
 fn evaluate_legacy(board: &FastBoard) -> [f32; MAX_SNAKES] {
     evaluate_impl(board, LEGACY)
+}
+
+#[cfg(test)]
+fn evaluate_bully(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, BULLY)
+}
+
+#[cfg(test)]
+fn evaluate_early(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, EARLY)
+}
+
+#[cfg(test)]
+fn evaluate_dominance(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, DOMINANCE)
+}
+
+#[cfg(test)]
+fn evaluate_pre_early(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, PRE_EARLY)
+}
+
+#[cfg(test)]
+fn evaluate_early_t7(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, EARLY_T7)
+}
+
+#[cfg(test)]
+fn evaluate_early_t13(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, EARLY_T13)
 }
 
 #[cfg(test)]
@@ -697,8 +780,24 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
         let urgency = if tuning.growth > 0.0 {
             // Shorter (or merely equal — ties die too) than the biggest
             // rival: food matters even on full health.
-            let growth_need = ((longest_other + 2.0 - len) / 4.0).clamp(0.0, 1.0);
-            hunger.max(tuning.growth * growth_need)
+            let growth_need = if tuning.bully_target {
+                // Parity is worthless: full urgency until strictly ahead,
+                // tapering once the head-on lead is banked.
+                if len <= longest_other {
+                    1.0
+                } else {
+                    ((longest_other + 2.0 - len) / 2.0).clamp(0.0, 1.0)
+                }
+            } else {
+                ((longest_other + 2.0 - len) / 4.0).clamp(0.0, 1.0)
+            };
+            // Early game: leads are cheap to take and expensive to concede.
+            let early = if len.max(longest_other) < tuning.early_until {
+                tuning.early_boost
+            } else {
+                1.0
+            };
+            hunger.max((tuning.growth * early).min(1.0) * growth_need)
         } else {
             hunger
         };
@@ -716,11 +815,26 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
         } else {
             (W_HEALTH, W_LENGTH)
         };
+        // Head-on standing: strictly longer wins the collision, exact
+        // parity kills us both, shorter simply loses it.
+        let dominance = if tuning.dominance > 0.0 {
+            let standing = if len > longest_other {
+                1.0
+            } else if len == longest_other {
+                -1.0
+            } else {
+                -0.5
+            };
+            tuning.dominance * standing
+        } else {
+            0.0
+        };
         vals[i] = (W_AREA * area_score
             + w_health * health
             + w_length * length
             + W_FOOD * food
-            + W_TRAP * trap)
+            + W_TRAP * trap
+            + dominance)
             .clamp(-1.0, 1.0);
     }
     vals
@@ -1069,6 +1183,24 @@ mod tests {
         run_arena("growth-urgency only", evaluate, evaluate_legacy, 30, 1_200);
         run_arena("length-heavy only  ", evaluate_length_heavy, evaluate_legacy, 30, 1_200);
         run_arena("both               ", evaluate_v2, evaluate_legacy, 30, 1_200);
+    }
+
+    /// Bully candidates: each isolated against the shipped tuning.
+    #[test]
+    #[ignore]
+    fn arena_bully_candidates() {
+        run_arena_on("bully-target  ", evaluate_bully, evaluate_pre_early, 30, 1_200, 13);
+        run_arena_on("early-boost   ", evaluate_early, evaluate_pre_early, 30, 1_200, 13);
+        run_arena_on("dominance-step", evaluate_dominance, evaluate_pre_early, 30, 1_200, 13);
+    }
+
+    /// How long should "early" last, and does the boost hold up?
+    #[test]
+    #[ignore]
+    fn arena_early_sweep() {
+        run_arena_on("early until 9  (shipped)", evaluate, evaluate_pre_early, 40, 1_200, 13);
+        run_arena_on("early until 7           ", evaluate_early_t7, evaluate_pre_early, 30, 1_200, 13);
+        run_arena_on("early until 13          ", evaluate_early_t13, evaluate_pre_early, 30, 1_200, 13);
     }
 
     /// Confirmation: does growth-urgency hold up at higher power, on the
