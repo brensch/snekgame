@@ -64,20 +64,36 @@ pub fn snek_bot_compute(job: &[u8]) -> Vec<u8> {
     };
     // Enough work per slice to keep clock checks negligible, small enough
     // to land close to the deadline.
-    const SLICE: usize = 128;
+    // The deadline can only be honoured to the granularity of one slice,
+    // so the slice has to track how expensive a simulation currently is.
+    // A fixed 128 was ~19ms early on but several hundred late in a game
+    // (four long snakes make every rollout dearer), which overran the
+    // deadline, pushed into the next tick, and left the following job
+    // queued behind it with time for a single slice — a spiral that gets
+    // worse exactly as the board gets crowded.
+    const TARGET_SLICE_MS: f64 = 4.0;
     let began_ms = js_sys::Date::now();
     let mut search =
         snek_shared::bot::begin(&job.config, &job.turn, &job.bot_id, u32::MAX, job.nonce);
     let mut sims = 0u32;
     let mut slices = 0u32;
+    let mut slice = 32usize;
     loop {
+        let before = js_sys::Date::now();
         // Always take one slice, so even a job that queued past its
         // deadline returns a searched move rather than a default.
-        if search.step(SLICE) {
+        if search.step(slice) {
             break; // nothing left to search
         }
-        sims += SLICE as u32;
+        sims += slice as u32;
         slices += 1;
+        let took = js_sys::Date::now() - before;
+        if took > 0.5 {
+            let scaled = slice as f64 * TARGET_SLICE_MS / took;
+            slice = scaled.clamp(8.0, 2_048.0) as usize;
+        } else if took == 0.0 {
+            slice = (slice * 2).min(2_048);
+        }
         if js_sys::Date::now() >= job.deadline_ms {
             break;
         }
