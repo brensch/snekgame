@@ -437,12 +437,46 @@ type EvalFn = fn(&FastBoard) -> [f32; MAX_SNAKES];
 /// The production evaluation.
 const EVAL: EvalFn = evaluate;
 
-fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64, eval: EvalFn) -> (Dir, u64) {
-    let mut nodes = vec![Node::new(root.clone())];
-    let mut path: Vec<(usize, [usize; MAX_SNAKES])> = Vec::with_capacity(64);
-    let mut sims = 0usize;
+/// A search that can be run in pieces. The browser drives it in small
+/// chunks, yielding to the event loop between them, so a phone hosting bot
+/// compute still renders and dispatches taps; the server just runs it in
+/// one go. Chunking cannot change the answer — simulations are sequential
+/// and deterministic, so N+M sims is bit-identical to one run of N+M.
+pub struct Search {
+    nodes: Vec<Node>,
+    path: Vec<(usize, [usize; MAX_SNAKES])>,
+    me: usize,
+    remaining: usize,
+    nonce: u64,
+    eval: EvalFn,
+    /// Set when the position needed no search at all.
+    immediate: Option<(Dir, u64)>,
+}
 
-    while sims < max_sims.min(MAX_SIMS) {
+impl Search {
+    /// Run at most `chunk` simulations. Returns true when finished.
+    pub fn step(&mut self, chunk: usize) -> bool {
+        if self.immediate.is_some() {
+            return true;
+        }
+        let n = chunk.min(self.remaining);
+        for _ in 0..n {
+            self.simulate();
+        }
+        self.remaining -= n;
+        self.remaining == 0
+    }
+
+    /// The chosen move and its proof. Valid once `step` has returned true.
+    pub fn result(&self) -> (Dir, u64) {
+        if let Some(done) = self.immediate {
+            return done;
+        }
+        readout(&self.nodes, self.me, self.nonce)
+    }
+
+    fn simulate(&mut self) {
+        let (nodes, path, eval) = (&mut self.nodes, &mut self.path, self.eval);
         path.clear();
         let mut cur = 0usize;
         let leaf_vals = loop {
@@ -473,7 +507,7 @@ fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64, eval: EvalFn
                 }
             }
         };
-        for &(nid, cidx) in &path {
+        for &(nid, cidx) in path.iter() {
             let node = &mut nodes[nid];
             node.total += 1.0;
             for i in 0..node.board.snakes.len() {
@@ -481,10 +515,12 @@ fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64, eval: EvalFn
                 node.values[i][cidx[i]] += leaf_vals[i];
             }
         }
-        sims += 1;
     }
+}
 
-    // Argmax visits (Q breaks ties).
+/// Argmax visits (Q breaks ties), plus the proof binding the nonce to the
+/// work actually performed.
+fn readout(nodes: &[Node], me: usize, nonce: u64) -> (Dir, u64) {
     let root_node = &nodes[0];
     let q = |c: usize| {
         let n = root_node.visits[me][c];
@@ -501,12 +537,68 @@ fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64, eval: EvalFn
         }
     }
     let dir = root_node.cands[me][best];
-    // Proof binds the nonce to the work actually performed.
     let mut words: Vec<u64> = vec![nonce, dir_index(dir) as u64];
     for c in 0..root_node.cands[me].len() {
         words.push(root_node.visits[me][c] as u64);
     }
     (dir, fnv1a(&words))
+}
+
+fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64, eval: EvalFn) -> (Dir, u64) {
+    let mut s = Search {
+        nodes: vec![Node::new(root.clone())],
+        path: Vec::with_capacity(64),
+        me,
+        remaining: max_sims.min(MAX_SIMS),
+        nonce,
+        eval,
+        immediate: None,
+    };
+    while !s.step(usize::MAX) {}
+    s.result()
+}
+
+/// Start a search that the caller drives with [`Search::step`]. Trivial
+/// positions (boxed in, or a single legal move) finish immediately.
+pub fn begin(
+    config: &GameConfig,
+    turn: &Turn,
+    me: &PlayerId,
+    sims: u32,
+    nonce: u64,
+) -> Search {
+    let finished = |immediate: (Dir, u64)| Search {
+        nodes: Vec::new(),
+        path: Vec::new(),
+        me: 0,
+        remaining: 0,
+        nonce,
+        eval: EVAL,
+        immediate: Some(immediate),
+    };
+
+    let order: Vec<&PlayerId> = turn.alive.iter().collect();
+    let Some(me_idx) = order.iter().position(|p| *p == me) else {
+        return finished((Dir::Up, fnv1a(&[nonce, 0])));
+    };
+    let board = FastBoard::from_turn(config, turn, &order);
+    let cands = safe_candidates(&board, me_idx);
+    match cands.len() {
+        0 => finished((Dir::Up, fnv1a(&[nonce, 1]))),
+        1 => {
+            let d = cands[0];
+            finished((d, fnv1a(&[nonce, 2, dir_index(d) as u64])))
+        }
+        _ => Search {
+            nodes: vec![Node::new(board)],
+            path: Vec::with_capacity(64),
+            me: me_idx,
+            remaining: (sims as usize).min(MAX_SIMS),
+            nonce,
+            eval: EVAL,
+            immediate: None,
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -982,6 +1074,26 @@ mod tests {
             let mut moves = BTreeMap::new();
             moves.insert(me.clone(), mv);
             turn = engine.next_turn(&turn, &moves);
+        }
+    }
+
+    /// Chunking must be invisible: a search driven in small pieces (as the
+    /// browser does, yielding between them) must give bit-identical
+    /// results to one uninterrupted run.
+    #[test]
+    fn chunked_search_matches_unchunked() {
+        let a: PlayerId = "a".into();
+        let mut engine = Engine::new(config(), vec![a.clone(), "b".into()], 11);
+        let turn = engine.first_turn();
+        let whole = think(&config(), &turn, &a, 3_000, 4242);
+        for chunk in [1usize, 7, 128, 999] {
+            let mut s = begin(&config(), &turn, &a, 3_000, 4242);
+            let mut guard = 0;
+            while !s.step(chunk) {
+                guard += 1;
+                assert!(guard < 100_000, "chunked search failed to finish");
+            }
+            assert_eq!(s.result(), whole, "chunk size {chunk} changed the result");
         }
     }
 

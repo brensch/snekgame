@@ -20,6 +20,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use snek_shared::protocol::*;
 use std::cell::RefCell;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{WebTransport, WritableStreamDefaultWriter};
@@ -59,6 +60,9 @@ struct Conn {
 
 thread_local! {
     static ACTIVE: RefCell<Option<Conn>> = const { RefCell::new(None) };
+    /// This device's measured search speed, used to size compute chunks so
+    /// each one costs a few milliseconds of main-thread time.
+    static SIMS_PER_SEC: std::cell::Cell<u32> = const { std::cell::Cell::new(20_000) };
     /// When the last server message arrived (any kind — pongs count).
     static LAST_RX: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
@@ -467,6 +471,7 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
             let rate = benchmark_sims_per_sec(generation).await;
             if is_current(generation) {
                 if let Some(rate) = rate {
+                    SIMS_PER_SEC.with(|c| c.set(rate));
                     send(&ClientMsg::Benchmark {
                         sims_per_sec: rate,
                         device: device_description(),
@@ -486,6 +491,26 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
     });
 
     Ok(())
+}
+
+/// Hand the thread back to the browser so it can paint a frame and flush
+/// input, then resume. A `MessageChannel` round trip is used rather than a
+/// zero timeout because browsers clamp nested timers to ~4ms, which would
+/// dominate a search made of many small slices.
+async fn yield_to_browser() {
+    let (tx, rx) = futures_channel::oneshot::channel::<()>();
+    let channel = web_sys::MessageChannel::new().unwrap();
+    let tx = std::cell::RefCell::new(Some(tx));
+    let cb = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |_| {
+        if let Some(tx) = tx.borrow_mut().take() {
+            let _ = tx.send(());
+        }
+    });
+    channel.port1().set_onmessage(Some(cb.as_ref().unchecked_ref()));
+    let _ = channel.port2().post_message(&JsValue::NULL);
+    let _ = rx.await;
+    channel.port1().set_onmessage(None);
+    drop(cb);
 }
 
 /// Short device description from the user agent: the parenthesised
@@ -514,17 +539,19 @@ async fn benchmark_sims_per_sec(generation: u64) -> Option<u32> {
     let mut engine = Engine::new(config, vec![a.clone(), "bench-b".into()], 1);
     let turn = engine.first_turn();
 
-    const CHUNK: u32 = 1_500;
+    // Small slices with a yield between them: the benchmark must measure
+    // the device, not freeze it.
+    const CHUNK: u32 = 250;
     let start = now();
     let mut total: u64 = 0;
     while now() - start < 600.0 {
         if !is_current(generation) {
             return None;
         }
-        let _ = snek_shared::bot::think(&config, &turn, &a, CHUNK, 0);
+        let mut search = snek_shared::bot::begin(&config, &turn, &a, CHUNK, 0);
+        while !search.step(CHUNK as usize) {}
         total += CHUNK as u64;
-        // Yield so input/rendering stay responsive during the benchmark.
-        gloo_timers::future::TimeoutFuture::new(0).await;
+        yield_to_browser().await;
     }
     let elapsed = (now() - start).max(1.0);
     Some(((total as f64) * 1000.0 / elapsed) as u32)
@@ -650,10 +677,19 @@ fn apply(store: Store, msg: ServerMsg) {
             nonce,
             ..
         } => {
-            // Deterministic search; the checksum binds nonce+request+move.
+            // Deterministic search, run in slices with a yield between
+            // each: wasm futures share the UI thread, so an uninterrupted
+            // search would freeze rendering and swallow taps for its whole
+            // duration. Chunking is bit-identical to running it in one go.
             spawn_local(async move {
                 let started = now();
-                let (dir, _work) = snek_shared::bot::think(&config, &turn, &bot_id, sims, nonce);
+                let mut search = snek_shared::bot::begin(&config, &turn, &bot_id, sims, nonce);
+                // ~4ms of work per slice at this device's measured speed.
+                let chunk = (SIMS_PER_SEC.with(|c| c.get()) / 250).clamp(24, 4_000) as usize;
+                while !search.step(chunk) {
+                    yield_to_browser().await;
+                }
+                let (dir, _work) = search.result();
                 let elapsed_ms = (now() - started).max(0.0) as u32;
                 let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
                 send(&ClientMsg::BotMove { request_id, dir, proof, elapsed_ms });

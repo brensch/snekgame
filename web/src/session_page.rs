@@ -332,11 +332,18 @@ fn game_view(game: GameView) -> impl IntoView {
     let last_turn = game.turns.last().unwrap().clone();
     let over = last_turn.game_over();
 
-    // Countdown overlay before the first tick.
-    let countdown = {
+    // Countdown overlay before the first tick. Read the clock *inside* a
+    // closure: otherwise this whole view (board SVG included) re-renders
+    // five times a second with the shared clock.
+    let show_countdown = !over && turn_count == 1;
+    let countdown = move || {
+        if !show_countdown {
+            return None;
+        }
         let remaining = store.countdown_ends.get() - store.now_ms.get();
-        (!over && turn_count == 1 && remaining > 0.0)
-            .then(|| view! { <div class="overlay">{format!("{:.0}", (remaining / 1000.0).ceil())}</div> })
+        (remaining > 0.0).then(|| {
+            view! { <div class="overlay">{format!("{:.0}", (remaining / 1000.0).ceil())}</div> }
+        })
     };
 
     // Direction input: tap a cell relative to my head.
