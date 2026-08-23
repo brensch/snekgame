@@ -185,9 +185,16 @@ struct Conn {
     think_share: f64,
     /// Logical cores this device reported.
     cores: u32,
-    /// False while the page is hidden: its workers are suspended, so it
-    /// must not be given bots to think for.
-    available: bool,
+    /// What the device last said about itself. A hidden page suspends its
+    /// workers, and it keeps saying so by *not* saying otherwise: only an
+    /// explicit "I'm back" clears this. A hidden page can still get the odd
+    /// message out, and treating those as proof of life un-paused the game
+    /// immediately after it paused.
+    declared_available: bool,
+    /// What we've inferred from silence, when the device never got a word
+    /// out — a screen can cut power to the page mid-message. Any message at
+    /// all clears this, so an inference can never become a permanent ban.
+    presumed_asleep: bool,
     /// Consecutive compute requests this device didn't answer at all. A
     /// screen going off can suspend the page before its "I'm hidden"
     /// message escapes, so silence has to be readable as absence too.
@@ -367,7 +374,8 @@ impl SessionActor {
                         recent_sims_per_sec: None,
                         think_share: 1.0,
                         cores: 4,
-                        available: true,
+                        declared_available: true,
+                        presumed_asleep: false,
                         misses: 0,
                         strikes: 0,
                     },
@@ -415,17 +423,16 @@ impl SessionActor {
             Some(c) => c.player.clone(),
             None => return,
         };
-        // Anything at all from a device proves it is awake and running, so
-        // it stops being treated as asleep. Without this, a device parked by
-        // a couple of missed ticks would never be given another request and
-        // so could never prove otherwise — a permanent ban by silence.
-        // `HostAvailable { can_compute: false }` is matched below and has
-        // the last word.
+        // Anything at all from a device disproves an *inference* that it
+        // went quiet — without this, a device parked by a couple of missed
+        // ticks would never be sent another request and so could never prove
+        // otherwise, a permanent ban by silence. It deliberately does not
+        // override what the device said about itself.
         let was_asleep = if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.misses = 0;
-            let was = !conn.available;
-            conn.available = true;
-            was
+            let was = conn.presumed_asleep;
+            conn.presumed_asleep = false;
+            was && conn.declared_available
         } else {
             false
         };
@@ -518,13 +525,13 @@ impl SessionActor {
             }
             ClientMsg::HostAvailable { can_compute } => {
                 if let Some(conn) = self.conns.get_mut(&conn_id) {
-                    if conn.available != can_compute {
+                    if conn.declared_available != can_compute {
                         tracing::info!(
                             session = %self.name, conn = conn_id, can_compute,
                             "compute host availability changed"
                         );
                     }
-                    conn.available = can_compute;
+                    conn.declared_available = can_compute;
                 }
                 self.assign_bots();
                 // A host coming back can restart a game paused for want of
@@ -800,8 +807,8 @@ impl SessionActor {
         for conn_id in silent {
             if let Some(conn) = self.conns.get_mut(&conn_id) {
                 conn.misses += 1;
-                if conn.misses >= 2 && conn.available {
-                    conn.available = false;
+                if conn.misses >= 2 && !conn.presumed_asleep {
+                    conn.presumed_asleep = true;
                     tracing::info!(
                         session = %self.name, conn = conn_id,
                         "device silent for two ticks — treating it as asleep"
@@ -950,7 +957,7 @@ impl SessionActor {
         let mut hosts: Vec<(u64, u32)> = self
             .conns
             .iter()
-            .filter(|(_, c)| c.strikes < 3 && c.available)
+            .filter(|(_, c)| c.strikes < 3 && c.declared_available && !c.presumed_asleep)
             .filter_map(|(&id, c)| {
                 c.recent_sims_per_sec
                     .or(c.sims_per_sec)

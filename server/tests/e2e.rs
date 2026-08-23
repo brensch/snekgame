@@ -542,9 +542,13 @@ async fn sleeping_host_pauses_the_game() {
     alice.control(&ClientMsg::HostAvailable { can_compute: false }).await;
 
     // At most the tick already in flight may land; after that, silence.
+    // The pings matter: a hidden page still gets the odd message out, and
+    // treating any traffic as proof of life un-paused the game the moment
+    // it paused.
     let mut after_sleep = 0u32;
     let deadline = std::time::Instant::now() + Duration::from_millis(1_500);
     while std::time::Instant::now() < deadline {
+        alice.control(&ClientMsg::Ping(1)).await;
         match tokio::time::timeout(Duration::from_millis(400), alice.next_msg()).await {
             Ok(ServerMsg::Turn(_)) => after_sleep += 1,
             Ok(_) => {}
