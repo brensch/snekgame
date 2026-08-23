@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 
 /// The client-editable part of a profile. The public player id is derived
 /// server-side (a hash of the client's private secret), so a client can never
@@ -50,6 +50,10 @@ pub enum ClientMsg {
     /// Remove a player (or bot) from the lobby (anyone can kick, like tac).
     Kick(PlayerId),
     Ping(u32),
+    /// Whether this device can currently compute. A backgrounded page or
+    /// a locked screen suspends its workers, so it must say so — otherwise
+    /// its bots quietly hold their heading into a wall.
+    HostAvailable { can_compute: bool },
     /// This device could not produce a move for a compute request. Sent so
     /// the failure is visible server-side instead of looking identical to
     /// a silent client.
@@ -64,6 +68,9 @@ pub enum ClientMsg {
         sims_per_sec: u32,
         /// Short device description (parsed from the user agent).
         device: String,
+        /// Logical cores, so the server never asks a device for more
+        /// concurrent thinking than it has threads to do it with.
+        cores: u32,
     },
     /// Answer to a `ComputeRequest`: the deterministic search result plus
     /// the proof binding the nonce to the work performed. The server

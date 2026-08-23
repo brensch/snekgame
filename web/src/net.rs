@@ -474,6 +474,9 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
                     send(&ClientMsg::Benchmark {
                         sims_per_sec: rate,
                         device: device_description(),
+                        cores: web_sys::window()
+                            .map(|w| w.navigator().hardware_concurrency() as u32)
+                            .unwrap_or(4),
                     });
                 }
             }
@@ -490,6 +493,15 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
     });
 
     Ok(())
+}
+
+/// Tell the server whether this device can think right now. A hidden page
+/// has its workers suspended — saying nothing would leave its bots holding
+/// their heading into a wall while the phone sleeps.
+pub fn report_availability(visible: bool) {
+    send(&ClientMsg::HostAvailable {
+        can_compute: visible,
+    });
 }
 
 /// Short device description from the user agent: the parenthesised
@@ -706,7 +718,7 @@ fn apply(store: Store, msg: ServerMsg) {
                         // a short, bounded turn on this thread so the bot
                         // still plays. A brief hitch beats a snake driving
                         // into a wall.
-                        send(&ClientMsg::ComputeFailed {
+                        send_datagram(&ClientMsg::ComputeFailed {
                             request_id,
                             reason: "worker unavailable".into(),
                         });
@@ -743,7 +755,15 @@ fn apply(store: Store, msg: ServerMsg) {
                 // server discards a stale move but keeps the timings, and
                 // silence is indistinguishable from a broken client.
                 let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
-                send(&ClientMsg::BotMove { request_id, dir, proof, tm });
+                // Datagrams, not the control stream: a bot move is only
+                // useful for one tick, and on the reliable stream a single
+                // lost packet head-of-line blocks every bot's answer at
+                // once — which is exactly how three independent workers end
+                // up defaulting on the same turn. Sent twice; the server
+                // ignores the duplicate.
+                let msg = ClientMsg::BotMove { request_id, dir, proof, tm };
+                send_datagram(&msg);
+                send_datagram(&msg);
             });
         }
         ServerMsg::GameSaved { id, .. } => store.saved_id.set(Some(id)),

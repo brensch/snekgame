@@ -234,7 +234,12 @@ async fn join_session(
                 Some(ClientMsg::Ping(n)) => {
                     let _ = dgram_conn.send_datagram(encode(&ServerMsg::Pong(n)));
                 }
-                Some(msg @ ClientMsg::Move(_)) => {
+                // Everything latency-critical arrives here: player input
+                // and bot answers alike. Duplicates are harmless — the
+                // session drops any request id it has already retired.
+                Some(msg @ (ClientMsg::Move(_)
+                    | ClientMsg::BotMove { .. }
+                    | ClientMsg::ComputeFailed { .. })) => {
                     if dgram_actor.send(Cmd::Msg { conn_id, msg }).await.is_err() {
                         break;
                     }

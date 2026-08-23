@@ -183,6 +183,15 @@ struct Conn {
     /// cleanly: did the answer arrive before the tick? Shrink hard when it
     /// does not, creep back when it does.
     think_share: f64,
+    /// Logical cores this device reported.
+    cores: u32,
+    /// False while the page is hidden: its workers are suspended, so it
+    /// must not be given bots to think for.
+    available: bool,
+    /// Consecutive compute requests this device didn't answer at all. A
+    /// screen going off can suspend the page before its "I'm hidden"
+    /// message escapes, so silence has to be readable as absence too.
+    misses: u32,
     /// Protocol abuse only (bad checksum, answering someone else's
     /// request). Three of these stop us trusting the connection.
     strikes: u32,
@@ -357,6 +366,9 @@ impl SessionActor {
                         sims_per_sec: None,
                         recent_sims_per_sec: None,
                         think_share: 1.0,
+                        cores: 4,
+                        available: true,
+                        misses: 0,
                         strikes: 0,
                     },
                 );
@@ -403,6 +415,24 @@ impl SessionActor {
             Some(c) => c.player.clone(),
             None => return,
         };
+        // Anything at all from a device proves it is awake and running, so
+        // it stops being treated as asleep. Without this, a device parked by
+        // a couple of missed ticks would never be given another request and
+        // so could never prove otherwise — a permanent ban by silence.
+        // `HostAvailable { can_compute: false }` is matched below and has
+        // the last word.
+        let was_asleep = if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.misses = 0;
+            let was = !conn.available;
+            conn.available = true;
+            was
+        } else {
+            false
+        };
+        if was_asleep {
+            tracing::info!(session = %self.name, conn = conn_id, "device is awake again");
+            self.assign_bots();
+        }
         match msg {
             // Identity is fixed to the connection: whatever a client sends,
             // profile changes only ever apply to *its own* public id.
@@ -478,12 +508,32 @@ impl SessionActor {
                     self.broadcast_lobby().await;
                 }
             }
-            ClientMsg::Benchmark { sims_per_sec, device } => {
+            ClientMsg::Benchmark { sims_per_sec, device, cores } => {
                 if let Some(conn) = self.conns.get_mut(&conn_id) {
                     conn.sims_per_sec = Some(sims_per_sec.clamp(500, 2_000_000));
                     conn.device = device.chars().take(80).collect();
+                    conn.cores = cores.clamp(1, 64);
                 }
                 self.assign_bots();
+            }
+            ClientMsg::HostAvailable { can_compute } => {
+                if let Some(conn) = self.conns.get_mut(&conn_id) {
+                    if conn.available != can_compute {
+                        tracing::info!(
+                            session = %self.name, conn = conn_id, can_compute,
+                            "compute host availability changed"
+                        );
+                    }
+                    conn.available = can_compute;
+                }
+                self.assign_bots();
+                // A host coming back can restart a game paused for want of
+                // one.
+                if can_compute && self.game.is_some() && self.next_tick.is_none() {
+                    self.next_tick = Some(
+                        Instant::now() + Duration::from_millis(self.config.tick_ms as u64),
+                    );
+                }
             }
             ClientMsg::BotMove { request_id, dir, proof, tm } => {
                 let Some(pending) = self.pending_compute.remove(&request_id) else {
@@ -557,6 +607,7 @@ impl SessionActor {
                             "compute answer arrived too late to be used"
                         );
                         if let Some(conn) = self.conns.get_mut(&conn_id) {
+                            conn.misses = 0;
                             // Floor it well above uselessness: a bot given
                             // a few dozen milliseconds plays at random,
                             // which looks worse than the occasional late
@@ -564,6 +615,7 @@ impl SessionActor {
                             conn.think_share = (conn.think_share * 0.7).max(0.45);
                         }
                     } else if let Some(conn) = self.conns.get_mut(&conn_id) {
+                        conn.misses = 0;
                         conn.think_share = (conn.think_share + 0.05).min(1.0);
                     }
                     if current == Some(pending.turn.turn_number)
@@ -675,6 +727,19 @@ impl SessionActor {
             return;
         }
 
+        // Nobody able to think for the bots either — every host's page is
+        // hidden or its screen is off, so their workers are suspended.
+        // Freezing is honest; ticking on would just march every bot into a
+        // wall while the phone sleeps.
+        if !self.bots.is_empty() && self.bot_hosts.is_empty() {
+            tracing::info!(
+                session = %self.name,
+                "no device can compute right now — pausing until one returns"
+            );
+            self.next_tick = None;
+            return;
+        }
+
         // Distributed compute reconciliation: hosts whose requests never
         // came back get a strike and their bots fail over to the next
         // phone. (No server fallback — bots without an answer coast.)
@@ -696,6 +761,7 @@ impl SessionActor {
         }
         late_hosts.sort_unstable();
         late_hosts.dedup();
+        let mut silent: Vec<u64> = Vec::new();
         // Anything alive without a move this tick coasts straight ahead —
         // the visible symptom of a compute failure. Say exactly why.
         for bot_id in self.bots.keys() {
@@ -707,11 +773,14 @@ impl SessionActor {
                 .values()
                 .find(|pc| &pc.bot_id == bot_id && pc.turn.turn_number == current.turn_number);
             match (pending, self.bot_hosts.get(bot_id)) {
-                (Some(pc), _) => tracing::info!(
-                    session = %self.name, bot = %bot_id, turn = current.turn_number,
-                    conn = pc.conn_id,
-                    "no answer before the tick — bot holds its heading"
-                ),
+                (Some(pc), _) => {
+                    tracing::info!(
+                        session = %self.name, bot = %bot_id, turn = current.turn_number,
+                        conn = pc.conn_id,
+                        "no answer before the tick — bot holds its heading"
+                    );
+                    silent.push(pc.conn_id);
+                }
                 (None, None) => tracing::info!(
                     session = %self.name, bot = %bot_id, turn = current.turn_number,
                     "no host assigned — bot holds its heading"
@@ -723,6 +792,25 @@ impl SessionActor {
                 ),
             }
         }
+        // Two ticks of total silence and we stop believing the device is
+        // there. It says so itself when it comes back — any message at all
+        // clears this.
+        silent.sort_unstable();
+        silent.dedup();
+        for conn_id in silent {
+            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.misses += 1;
+                if conn.misses >= 2 && conn.available {
+                    conn.available = false;
+                    tracing::info!(
+                        session = %self.name, conn = conn_id,
+                        "device silent for two ticks — treating it as asleep"
+                    );
+                }
+            }
+        }
+        self.assign_bots();
+
         // Hard lock: the server NEVER searches. Bots whose host didn't
         // answer simply keep their heading this tick (the engine's default).
         drop(missing);
@@ -862,7 +950,7 @@ impl SessionActor {
         let mut hosts: Vec<(u64, u32)> = self
             .conns
             .iter()
-            .filter(|(_, c)| c.strikes < 3)
+            .filter(|(_, c)| c.strikes < 3 && c.available)
             .filter_map(|(&id, c)| {
                 c.recent_sims_per_sec
                     .or(c.sims_per_sec)
@@ -879,6 +967,12 @@ impl SessionActor {
         for (i, bot_id) in bot_ids.into_iter().enumerate() {
             self.bot_hosts
                 .insert(bot_id.clone(), hosts[i % hosts.len()].0);
+        }
+        // A host appearing (or waking) restarts a game paused for want of
+        // one.
+        if self.game.is_some() && self.next_tick.is_none() && !self.bot_hosts.is_empty() {
+            self.next_tick =
+                Some(Instant::now() + Duration::from_millis(self.config.tick_ms as u64));
         }
     }
 
@@ -926,10 +1020,23 @@ impl SessionActor {
             // Everything a host runs must finish inside the tick, with room
             // for the round trip and for a phone whose main thread is also
             // drawing the game. Bots on a device think in parallel (a worker
-            // each), so the window is not divided between them — but it is
-            // scaled by how reliably this host has been answering.
-            let share = self.conns.get(&conn_id).map_or(1.0, |c| c.think_share);
-            let window = (self.config.tick_ms as f64 * 0.7 - 60.0).max(25.0);
+            // each), so the window is shared between them only when they
+            // outnumber the device's threads — and it is always scaled by
+            // how reliably this host has been answering.
+            let (share, cores) = self
+                .conns
+                .get(&conn_id)
+                .map_or((1.0, 4), |c| (c.think_share, c.cores));
+            let mut window = (self.config.tick_ms as f64 * 0.7 - 60.0).max(25.0);
+            // Bots on a device think concurrently, one worker each. If they
+            // outnumber the threads available, asking each for the full
+            // window pins the phone at 100% and makes the whole device feel
+            // slow — so share the available thread-time instead.
+            let mine = load.get(&conn_id).copied().unwrap_or(1).max(1) as f64;
+            let threads = (cores.saturating_sub(1)).max(1) as f64;
+            if mine > threads {
+                window *= threads / mine;
+            }
             let difficulty_factor = match difficulty {
                 BotDifficulty::Easy => 0.2,
                 BotDifficulty::Medium => 0.5,

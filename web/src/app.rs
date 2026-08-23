@@ -69,7 +69,16 @@ pub fn app() -> impl IntoView {
     {
         use wasm_bindgen::closure::Closure;
         use wasm_bindgen::JsCast;
-        let cb = Closure::<dyn FnMut()>::new(move || net::nudge(store));
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            let visible = web_sys::window()
+                .and_then(|w| w.document())
+                .map(|d| !d.hidden())
+                .unwrap_or(true);
+            net::report_availability(visible);
+            if visible {
+                net::nudge(store);
+            }
+        });
         if let Some(w) = web_sys::window() {
             let _ = w.add_event_listener_with_callback("focus", cb.as_ref().unchecked_ref());
             let _ = w.add_event_listener_with_callback("online", cb.as_ref().unchecked_ref());

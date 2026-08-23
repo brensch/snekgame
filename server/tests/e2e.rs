@@ -330,6 +330,7 @@ async fn distributed_compute_round_trip() {
         .control(&ClientMsg::Benchmark {
             sims_per_sec: 50_000,
             device: "e2e test rig".to_string(),
+            cores: 8,
         })
         .await;
     alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Medium)).await;
@@ -471,4 +472,119 @@ async fn tick_cadence_is_steady() {
         max_dev < 60.0,
         "cadence wobble too big: {max_dev:.1}ms (deltas {deltas:?})"
     );
+}
+
+/// A phone whose screen goes off suspends its workers. The game must stop
+/// rather than march every bot into a wall, and pick straight back up when
+/// the device wakes.
+#[tokio::test]
+async fn sleeping_host_pauses_the_game() {
+    let dir = std::env::temp_dir().join(format!("snek-sleep-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("sleep.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let (_, registry) = snek_server::build(&db_path);
+    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    let mut alice =
+        Client::connect(wt_port, "sleep-test", "alice-secret-0000", info("alice")).await;
+    alice
+        .control(&ClientMsg::Configure(GameConfig {
+            board_width: 11,
+            board_height: 11,
+            tick_ms: 200,
+        }))
+        .await;
+    alice
+        .control(&ClientMsg::Benchmark {
+            sims_per_sec: 50_000,
+            device: "sleepy phone".to_string(),
+            cores: 8,
+        })
+        .await;
+    alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Easy)).await;
+    alice.control(&ClientMsg::SetReady(true)).await;
+    alice.control(&ClientMsg::Start).await;
+
+    // Play normally for a few turns, answering compute like a browser would.
+    let mut turns = 0u32;
+    while turns < 3 {
+        match tokio::time::timeout(Duration::from_secs(5), alice.next_msg()).await {
+            Ok(ServerMsg::Turn(_)) => turns += 1,
+            Ok(ServerMsg::ComputeRequest { request_id, bot_id, config, turn, nonce, .. }) => {
+                let mut search =
+                    snek_shared::bot::begin(&config, &turn, &bot_id, 200, nonce);
+                while !search.step(64) {}
+                let (dir, _) = search.result();
+                let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
+                alice
+                    .control(&ClientMsg::BotMove {
+                        request_id,
+                        dir,
+                        proof,
+                        tm: snek_shared::protocol::ComputeTelemetry {
+                            queue_ms: 0, search_ms: 10, total_ms: 10,
+                            think_ms: 100, sims: 200, slices: 3, fallback: false,
+                        },
+                    })
+                    .await;
+            }
+            Ok(_) => {}
+            Err(_) => panic!("game never got going"),
+        }
+    }
+
+    // Screen off.
+    alice.control(&ClientMsg::HostAvailable { can_compute: false }).await;
+
+    // At most the tick already in flight may land; after that, silence.
+    let mut after_sleep = 0u32;
+    let deadline = std::time::Instant::now() + Duration::from_millis(1_500);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(400), alice.next_msg()).await {
+            Ok(ServerMsg::Turn(_)) => after_sleep += 1,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(
+        after_sleep <= 1,
+        "game kept ticking with no device able to think: {after_sleep} turns while asleep"
+    );
+
+    // Screen on: the game resumes.
+    alice.control(&ClientMsg::HostAvailable { can_compute: true }).await;
+    let mut resumed = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), alice.next_msg()).await {
+            Ok(ServerMsg::Turn(_)) => {
+                resumed = true;
+                break;
+            }
+            Ok(ServerMsg::ComputeRequest { request_id, bot_id, config, turn, nonce, .. }) => {
+                let mut search =
+                    snek_shared::bot::begin(&config, &turn, &bot_id, 200, nonce);
+                while !search.step(64) {}
+                let (dir, _) = search.result();
+                let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
+                alice
+                    .control(&ClientMsg::BotMove {
+                        request_id, dir, proof,
+                        tm: snek_shared::protocol::ComputeTelemetry {
+                            queue_ms: 0, search_ms: 10, total_ms: 10,
+                            think_ms: 100, sims: 200, slices: 3, fallback: false,
+                        },
+                    })
+                    .await;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(resumed, "game never resumed after the device woke up");
 }

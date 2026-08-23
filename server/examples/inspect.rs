@@ -13,13 +13,16 @@ fn main() {
     for p in &record.players {
         println!("  {} = {} {}", p.id, p.emoji, p.name);
     }
-    for turn in record.turns.iter().rev().take(3).rev() {
+    for turn in record.turns.iter().rev().take(2).rev() {
         println!("--- turn {} alive={:?} moves={:?}", turn.turn_number, turn.alive, turn.moves);
         for (pid, s) in &turn.snakes {
             println!("    snake {pid}: {:?}", s);
         }
         for c in &turn.clashes {
             println!("    clash @{} {:?} {:?}", c.pos, c.reason, c.players);
+        }
+        if turn.game_over() {
+            println!("    winners: {:?}", turn.winners);
         }
     }
 }
