@@ -499,6 +499,16 @@ impl SessionActor {
 
                 if let Some(game) = &mut self.game {
                     let current = game.turns.last().map(|t| t.turn_number);
+                    if current != Some(pending.turn.turn_number) {
+                        tracing::info!(
+                            session = %self.name,
+                            bot = %pending.bot_id,
+                            answered_for = pending.turn.turn_number,
+                            now_at = current.unwrap_or(0),
+                            elapsed_ms,
+                            "compute answer arrived too late to be used"
+                        );
+                    }
                     if current == Some(pending.turn.turn_number)
                         && game
                             .turns
@@ -617,14 +627,32 @@ impl SessionActor {
         }
         late_hosts.sort_unstable();
         late_hosts.dedup();
-        for conn_id in late_hosts {
-            // With deadlines, lateness means the network dropped it, not
-            // that we asked for too much. Nothing to tune — just note it.
-            tracing::debug!(
-                session = %self.name,
-                conn = conn_id,
-                "compute answer did not arrive in time"
-            );
+        // Anything alive without a move this tick coasts straight ahead —
+        // the visible symptom of a compute failure. Say exactly why.
+        for bot_id in self.bots.keys() {
+            if !current.alive.contains(bot_id) || game.pending.contains_key(bot_id) {
+                continue;
+            }
+            let pending = self
+                .pending_compute
+                .values()
+                .find(|pc| &pc.bot_id == bot_id && pc.turn.turn_number == current.turn_number);
+            match (pending, self.bot_hosts.get(bot_id)) {
+                (Some(pc), _) => tracing::info!(
+                    session = %self.name, bot = %bot_id, turn = current.turn_number,
+                    conn = pc.conn_id,
+                    "no answer before the tick — bot holds its heading"
+                ),
+                (None, None) => tracing::info!(
+                    session = %self.name, bot = %bot_id, turn = current.turn_number,
+                    "no host assigned — bot holds its heading"
+                ),
+                (None, Some(conn)) => tracing::info!(
+                    session = %self.name, bot = %bot_id, turn = current.turn_number,
+                    conn = conn,
+                    "no request outstanding — bot holds its heading"
+                ),
+            }
         }
         // Hard lock: the server NEVER searches. Bots whose host didn't
         // answer simply keep their heading this tick (the engine's default).

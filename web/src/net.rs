@@ -524,7 +524,7 @@ async fn benchmark_sims_per_sec(generation: u64) -> Option<u32> {
     // predicted from it.
     const PROBE_MS: u32 = 300;
     let (_dir, _proof, sims) =
-        crate::botworker::compute(config, turn, a, PROBE_MS, 0).await?;
+        crate::botworker::compute(config, turn, a.clone(), PROBE_MS, 0).await?;
     if !is_current(generation) {
         return None;
     }
@@ -599,6 +599,16 @@ fn apply(store: Store, msg: ServerMsg) {
             countdown_ms,
         } => {
             LATEST_TURN.with(|c| c.set(turn.turn_number));
+            // Boot a worker for every bot now, during the countdown. Each
+            // worker compiles its own wasm instance on first use (~100ms+);
+            // paying that inside a move's deadline is what makes the first
+            // ticks of a game miss.
+            for bot in players.iter().filter(|p| snek_shared::is_bot(&p.id)) {
+                let (cfg, t, id) = (config, turn.clone(), bot.id.clone());
+                spawn_local(async move {
+                    let _ = crate::botworker::compute(cfg, t, id, 1, 0).await;
+                });
+            }
             store.saved_id.set(None);
             store.view_turn.set(None);
             store.countdown_ends.set(now() + countdown_ms as f64);
@@ -659,8 +669,13 @@ fn apply(store: Store, msg: ServerMsg) {
             // — and if one somehow arrives, staying silent makes the server
             // hand that bot to another phone.
             if turn.turn_number < LATEST_TURN.with(|c| c.get()) {
+                web_sys::console::debug_1(&JsValue::from_str(&format!(
+                    "compute skipped as stale bot={bot_id} turn={}",
+                    turn.turn_number
+                )));
                 return; // superseded before we even started
             }
+            let bot_label = bot_id.clone();
             spawn_local(async move {
                 let started = now();
                 let requested_for = turn.turn_number;
@@ -669,7 +684,12 @@ fn apply(store: Store, msg: ServerMsg) {
                 else {
                     return;
                 };
-                if requested_for < LATEST_TURN.with(|c| c.get()) {
+                let latest = LATEST_TURN.with(|c| c.get());
+                let took = (now() - started).max(0.0) as u32;
+                web_sys::console::debug_1(&JsValue::from_str(&format!(
+                    "compute done bot={bot_label} for_turn={requested_for} latest={latest} think_ms={think_ms} took={took} sims={sims}"
+                )));
+                if requested_for < latest {
                     return; // the tick resolved while we were thinking
                 }
                 let elapsed_ms = (now() - started).max(0.0) as u32;
