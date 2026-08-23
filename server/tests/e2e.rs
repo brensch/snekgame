@@ -667,3 +667,88 @@ async fn a_silent_host_recovers_on_keepalives_alone() {
         "keepalives did not revive the host — the game is stuck for good"
     );
 }
+
+/// Lateness is the only clean signal that a device is being asked for more
+/// thinking than it can deliver in a tick, so a late answer has to be
+/// recognised when it arrives. It wasn't: requests were forgotten the
+/// instant their tick resolved, so the answer looked like noise, the window
+/// never shrank, and the device kept being overcommitted every single turn.
+#[tokio::test]
+async fn answering_late_shrinks_the_thinking_window() {
+    let dir = std::env::temp_dir().join(format!("snek-late-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("late.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let (_, registry) = snek_server::build(&db_path);
+    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    let mut alice =
+        Client::connect(wt_port, "late-test", "alice-secret-0000", info("alice")).await;
+    alice
+        .control(&ClientMsg::Configure(GameConfig {
+            board_width: 11,
+            board_height: 11,
+            tick_ms: 200,
+        }))
+        .await;
+    alice
+        .control(&ClientMsg::Benchmark {
+            sims_per_sec: 50_000,
+            device: "struggling phone".to_string(),
+            cores: 8,
+        })
+        .await;
+    alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Hard)).await;
+    alice.control(&ClientMsg::SetReady(true)).await;
+    alice.control(&ClientMsg::Start).await;
+
+    let mut first_window = 0u32;
+    let mut last_window = 0u32;
+    let mut answered = 0u32;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline && answered < 6 {
+        match tokio::time::timeout(Duration::from_millis(500), alice.next_msg()).await {
+            Ok(ServerMsg::ComputeRequest { request_id, bot_id, config, turn, think_ms, nonce, .. }) => {
+                if first_window == 0 {
+                    first_window = think_ms;
+                }
+                last_window = think_ms;
+                answered += 1;
+                // A phone that overshoots its deadline every time: the
+                // answer is correct but lands after the tick has gone.
+                let mut search = snek_shared::bot::begin(&config, &turn, &bot_id, 64, nonce);
+                while !search.step(64) {}
+                let (dir, _) = search.result();
+                let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
+                // Overshoot the window by enough that the tick it belonged
+                // to has certainly resolved, whatever cadence the server
+                // settled on.
+                tokio::time::sleep(Duration::from_millis(think_ms as u64 + 700)).await;
+                alice
+                    .control(&ClientMsg::BotMove {
+                        request_id, dir, proof,
+                        tm: snek_shared::protocol::ComputeTelemetry {
+                            queue_ms: 300, search_ms: 50, total_ms: think_ms + 700,
+                            think_ms, sims: 64, slices: 1, fallback: false,
+                        },
+                    })
+                    .await;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(answered >= 4, "never got enough compute requests: {answered}");
+    // One backoff is the whole point: it proves lateness is heard at all.
+    // Repeated lateness keeps compounding it down to the 0.45 floor, but a
+    // bot that isn't being steered dies quickly, which ends the game before
+    // many rounds of it can land.
+    assert!(
+        last_window < first_window,
+        "window never backed off for a device answering late: {first_window}ms -> {last_window}ms"
+    );
+}

@@ -216,6 +216,14 @@ struct PendingCompute {
     nonce: u64,
 }
 
+/// The little we need to keep about a request whose tick has passed: just
+/// enough to recognise a late answer and say whose it was.
+struct RetiredCompute {
+    conn_id: u64,
+    bot_id: PlayerId,
+    turn_number: u32,
+}
+
 struct ComputeAccum {
     moves: u32,
     sims: u64,
@@ -268,6 +276,11 @@ struct SessionActor {
     bot_hosts: HashMap<PlayerId, u64>,
     /// outstanding compute requests: id -> (bot, conn, inputs for audit).
     pending_compute: HashMap<u64, PendingCompute>,
+    /// Requests whose tick has already resolved, kept briefly so a late
+    /// answer is still recognisable. Dropping them on sight made lateness
+    /// invisible — and lateness is the one signal the thinking window is
+    /// adjusted from, so a struggling device was never asked for less.
+    retired_compute: std::collections::VecDeque<(u64, RetiredCompute)>,
     next_request_id: u64,
     next_tick: Option<Instant>,
     /// Set when the last connection drops; the actor tidies itself away
@@ -295,6 +308,7 @@ impl SessionActor {
             game: None,
             bot_hosts: HashMap::new(),
             pending_compute: HashMap::new(),
+            retired_compute: std::collections::VecDeque::new(),
             next_request_id: 1,
             next_tick: None,
             empty_deadline: None,
@@ -555,7 +569,36 @@ impl SessionActor {
             }
             ClientMsg::BotMove { request_id, dir, proof, tm } => {
                 let Some(pending) = self.pending_compute.remove(&request_id) else {
-                    return; // stale or bogus
+                    // Not outstanding: either an answer we have already
+                    // given up waiting for, or noise. A late answer is worth
+                    // hearing — it says this device is trying to do more
+                    // than it can in the time it has.
+                    if let Some((_, r)) = self
+                        .retired_compute
+                        .iter()
+                        .find(|(id, _)| *id == request_id)
+                    {
+                        if r.conn_id == conn_id {
+                            let behind = self
+                                .game
+                                .as_ref()
+                                .and_then(|g| g.turns.last())
+                                .map(|t| t.turn_number.saturating_sub(r.turn_number))
+                                .unwrap_or(0);
+                            tracing::info!(
+                                session = %self.name, bot = %r.bot_id, conn = conn_id,
+                                answered_for = r.turn_number, ticks_behind = behind,
+                                total_ms = tm.total_ms, queue_ms = tm.queue_ms,
+                                sims = tm.sims,
+                                "compute answer arrived after its tick had gone"
+                            );
+                            if let Some(conn) = self.conns.get_mut(&conn_id) {
+                                conn.misses = 0;
+                                conn.think_share = (conn.think_share * 0.7).max(0.45);
+                            }
+                        }
+                    }
+                    return;
                 };
                 if pending.conn_id != conn_id {
                     // Someone answered a request that wasn't theirs.
@@ -1016,7 +1059,21 @@ impl SessionActor {
         if turn.game_over() {
             return;
         }
-        self.pending_compute.clear();
+        // Retire rather than forget: an answer that misses its tick still
+        // has to be recognisable when it turns up.
+        for (id, pc) in self.pending_compute.drain() {
+            self.retired_compute.push_back((
+                id,
+                RetiredCompute {
+                    conn_id: pc.conn_id,
+                    bot_id: pc.bot_id.clone(),
+                    turn_number: pc.turn.turn_number,
+                },
+            ));
+        }
+        while self.retired_compute.len() > 32 {
+            self.retired_compute.pop_front();
+        }
         // How many bots each host carries this turn (splits their budget).
         let mut load: HashMap<u64, u32> = HashMap::new();
         for (bot_id, conn_id) in &self.bot_hosts {
