@@ -223,32 +223,55 @@ impl Engine {
         positions
     }
 
-    /// Port of initializeFood: one in the centre plus one diagonal to each
-    /// snek's head.
-    fn initial_food(&self, snakes: &BTreeMap<PlayerId, Vec<Pos>>) -> Vec<Pos> {
+    /// Official battlesnake `PlaceFoodFixed`: one food exactly two moves
+    /// diagonally from each snek — never toward the centre, never in a
+    /// corner, picked at random among the legal diagonals — plus one in the
+    /// dead centre "for dramatic purposes".
+    fn initial_food(&mut self, snakes: &BTreeMap<PlayerId, Vec<Pos>>) -> Vec<Pos> {
         let (w, h) = (self.width(), self.height());
+        let (cx, cy) = ((w - 1) / 2, (h - 1) / 2);
         let mut occupied: Vec<Pos> = snakes.values().flatten().copied().collect();
-        let mut food = Vec::new();
+        let mut food: Vec<Pos> = Vec::new();
 
-        let centre = self.pos(w / 2, h / 2);
-        if !occupied.contains(&centre) {
-            food.push(centre);
-            occupied.push(centre);
+        let heads: Vec<(i16, i16)> = snakes.values().map(|s| self.xy(s[0])).collect();
+        for (hx, hy) in heads {
+            let mut available: Vec<Pos> = Vec::new();
+            for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                let (fx, fy) = (hx + dx, hy + dy);
+                // Playable area only — our perimeter ring is wall.
+                if fx < 1 || fy < 1 || fx > w - 2 || fy > h - 2 {
+                    continue;
+                }
+                let p = self.pos(fx, fy);
+                if food.contains(&p) || occupied.contains(&p) {
+                    continue;
+                }
+                // Must sit further from the centre than the head on an axis.
+                let away = (fx < hx && hx < cx)
+                    || (cx < hx && hx < fx)
+                    || (fy < hy && hy < cy)
+                    || (cy < hy && hy < fy);
+                if !away {
+                    continue;
+                }
+                // Never in a corner of the playable area.
+                if (fx == 1 || fx == w - 2) && (fy == 1 || fy == h - 2) {
+                    continue;
+                }
+                available.push(p);
+            }
+            if !available.is_empty() {
+                let pick = self.rng.below(available.len());
+                let p = available[pick];
+                food.push(p);
+                occupied.push(p);
+            }
         }
 
-        for snake in snakes.values() {
-            let (hx, hy) = self.xy(snake[0]);
-            for (dx, dy) in [(1, 1), (1, -1), (-1, 1), (-1, -1)] {
-                let (fx, fy) = (hx + dx, hy + dy);
-                if fx >= 1 && fx < w - 1 && fy >= 1 && fy < h - 1 {
-                    let p = self.pos(fx, fy);
-                    if !occupied.contains(&p) {
-                        food.push(p);
-                        occupied.push(p);
-                        break;
-                    }
-                }
-            }
+        // Always one in the dead centre.
+        let centre = self.pos(cx, cy);
+        if !occupied.contains(&centre) {
+            food.push(centre);
         }
         food
     }
@@ -516,6 +539,53 @@ mod tests {
 
     fn moves(pairs: &[(&str, Dir)]) -> BTreeMap<PlayerId, Dir> {
         pairs.iter().map(|(p, d)| (p.to_string(), *d)).collect()
+    }
+
+    /// Official battlesnake start food: one per snek exactly two moves
+    /// diagonally away, never toward the centre, never in a corner, plus
+    /// one dead centre.
+    #[test]
+    fn start_food_follows_battlesnake_rules() {
+        let cfg = config();
+        let players: Vec<PlayerId> = (0..4).map(|i| format!("p{i}")).collect();
+        let mut e = Engine::new(cfg, players, 3);
+        let t = e.first_turn();
+        let (w, h) = (cfg.board_width as i16, cfg.board_height as i16);
+        let (cx, cy) = ((w - 1) / 2, (h - 1) / 2);
+        let xy = |p: Pos| (p as i16 % w, p as i16 / w);
+
+        assert!(
+            t.food.contains(&((cy * w + cx) as Pos)),
+            "centre food is mandatory"
+        );
+        assert_eq!(t.food.len(), 5, "one per snek plus the centre: {:?}", t.food);
+
+        let heads: Vec<(i16, i16)> = t.snakes.values().map(|s| xy(s[0])).collect();
+        for &f in &t.food {
+            let (fx, fy) = xy(f);
+            if (fx, fy) == (cx, cy) {
+                continue;
+            }
+            // Never a corner of the playable area.
+            assert!(
+                !((fx == 1 || fx == w - 2) && (fy == 1 || fy == h - 2)),
+                "food {:?} sits in a corner",
+                (fx, fy)
+            );
+            // Exactly two moves diagonally from some head, and away from centre.
+            let owner = heads
+                .iter()
+                .find(|&&(hx, hy)| (fx - hx).abs() == 1 && (fy - hy).abs() == 1)
+                .copied();
+            let (hx, hy) = owner.unwrap_or_else(|| {
+                panic!("food {:?} is not diagonal to any head", (fx, fy))
+            });
+            let away = (fx < hx && hx < cx)
+                || (cx < hx && hx < fx)
+                || (fy < hy && hy < cy)
+                || (cy < hy && hy < fy);
+            assert!(away, "food {:?} sits toward the centre", (fx, fy));
+        }
     }
 
     #[test]

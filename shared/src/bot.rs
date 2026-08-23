@@ -537,34 +537,70 @@ struct Tuning {
     dominance: f32,
     /// Longest snake on the board below which the early boost applies.
     early_until: f32,
+    /// Continuous food model: appetite (baseline + hunger + length
+    /// deficit) times a smooth proximity gradient, instead of the old
+    /// saturating can-I-reach-it-before-starving term.
+    gradient_food: bool,
+    /// Appetite of a healthy snake at parity — what makes it eat
+    /// opportunistically while doing space control.
+    appetite_base: f32,
+    /// Distance scale of the proximity gradient (cells).
+    food_scale: f32,
+    /// Weight of food we only *tie* the race to (contested) versus food we
+    /// outright own. Contested food is risky, not invisible — at a
+    /// symmetric start the centre food is contested by everyone.
+    contested_food: f32,
 }
 
-/// Shipping tuning, every value earned in the arena (see the `arena_*`
-/// tests; all figures are two-seat deterministic duels vs the previous
-/// shipping eval):
+/// Shipping tuning: one continuous appetite, no thresholds. Every value
+/// earned in two-seat deterministic duels (see the `arena_*` tests).
 ///
-/// - `growth: 0.7` — food urgency scales with length deficit, not just
-///   hunger: 82W-54L-4D over 140 games (~60%, p≈0.008). 0.5 was a wash,
-///   1.0 suicidal.
-/// - `early_boost: 1.6` until length 9 — press hard for the head-on lead
-///   while snakes are short, then stop: 84W-48L-8D over 140 games
-///   (~64%, p≈0.001), and noticeably longer snakes. Carrying the
-///   aggression to length 13 instead *loses* 18W-36L.
-/// - `length_heavy` off — re-weighting relative length at health's expense
-///   lost 18W-40L and starved into *shorter* snakes.
-/// - `bully_target` off — demanding a strict lead before easing off lost
-///   22W-28L: the same over-aggression that sank `growth: 1.0`.
-/// - `dominance` off — an explicit head-on-standing term was noise
-///   (30W-26L, inside the margin).
+/// The food term is `appetite × proximity`, where appetite = a baseline
+/// (opportunistic eating while doing space control) + hunger + length
+/// deficit, and proximity is a smooth `1/(1+d/scale)` pull. The old term
+/// asked "can I reach food before starving?", which saturated at 1.0 for
+/// every distance under ~75 — the search had no slope to climb, which is
+/// why a healthy snake never ate. Early-game aggression now *emerges*
+/// from the deficit term rather than a hard-coded turn window.
+///
+/// - `appetite_base: 0.45` — 64W-16L-0D over 80 games vs the previous
+///   tuning, snakes 20.7 vs 16.4 long; also 40W-20L on 11x11. 0.22 and
+///   0.32 were weaker, 0.60 slightly past the peak.
+/// - `contested_food: 0.6` — food we only *tie* the race to is risky, not
+///   invisible. At a symmetric start the centre food is contested by
+///   everyone, so the old code could not see it at all: 54W-24L with it
+///   visible versus 30W-20L blind.
+/// - `food_scale: 5.0` — cells over which the pull decays.
+///
+/// The pre-gradient knobs below it (`growth`, `early_boost`, `dominance`,
+/// `length_heavy`, `bully_target`) are inert here and survive only as
+/// arena benchmarks documenting what lost.
 const TUNING: Tuning = Tuning {
-    growth: 0.7,
+    growth: 0.0,
     length_heavy: false,
     bully_target: false,
-    early_boost: 1.6,
+    early_boost: 1.0,
     dominance: 0.0,
     early_until: 9.0,
+    gradient_food: true,
+    appetite_base: 0.45,
+    food_scale: 5.0,
+    contested_food: 0.6,
 };
-/// The pre-tuning evaluation, kept as the arena's benchmark opponent.
+
+/// The threshold-based tuning this replaced (growth urgency + a 1.6x boost
+/// under length 9), kept as the arena's benchmark opponent.
+#[cfg(test)]
+const PRE_GRADIENT: Tuning = Tuning {
+    growth: 0.7,
+    early_boost: 1.6,
+    gradient_food: false,
+    appetite_base: 0.0,
+    contested_food: 0.0,
+    ..TUNING
+};
+
+/// The original evaluation, before any length awareness.
 #[cfg(test)]
 const LEGACY: Tuning = Tuning {
     growth: 0.0,
@@ -573,32 +609,33 @@ const LEGACY: Tuning = Tuning {
     early_boost: 1.0,
     dominance: 0.0,
     early_until: 9.0,
+    gradient_food: false,
+    appetite_base: 0.0,
+    food_scale: 5.0,
+    contested_food: 0.0,
 };
+
+// Experiments, each isolated against the tuning it challenged.
 #[cfg(test)]
-const GROWTH_05: Tuning = Tuning { growth: 0.5, ..LEGACY };
+const APPETITE_022: Tuning = Tuning { appetite_base: 0.22, ..TUNING };
 #[cfg(test)]
-const GROWTH_10: Tuning = Tuning { growth: 1.0, ..LEGACY };
+const APPETITE_060: Tuning = Tuning { appetite_base: 0.60, ..TUNING };
+#[cfg(test)]
+const BLIND_CONTESTED: Tuning = Tuning { contested_food: 0.0, ..TUNING };
 #[cfg(test)]
 const LENGTH_HEAVY_ONLY: Tuning = Tuning { length_heavy: true, ..LEGACY };
 #[cfg(test)]
-const BOTH: Tuning = Tuning { growth: 0.7, length_heavy: true, ..LEGACY };
-/// Bully candidates, each isolated against the shipped tuning.
+const GROWTH_ONLY: Tuning = Tuning { growth: 0.7, ..LEGACY };
 #[cfg(test)]
-const BULLY: Tuning = Tuning { bully_target: true, ..TUNING };
-/// The tuning before the early-game boost, kept as a benchmark.
-#[cfg(test)]
-const PRE_EARLY: Tuning = Tuning { early_boost: 1.0, ..TUNING };
-#[cfg(test)]
-const EARLY: Tuning = Tuning { early_boost: 1.6, ..TUNING };
-#[cfg(test)]
-const DOMINANCE: Tuning = Tuning { dominance: 0.10, ..TUNING };
-#[cfg(test)]
-const EARLY_T7: Tuning = Tuning { early_boost: 1.6, early_until: 7.0, ..TUNING };
-#[cfg(test)]
-const EARLY_T13: Tuning = Tuning { early_boost: 1.6, early_until: 13.0, ..TUNING };
+const BULLY: Tuning = Tuning { bully_target: true, ..PRE_GRADIENT };
 
 fn evaluate(board: &FastBoard) -> [f32; MAX_SNAKES] {
     evaluate_impl(board, TUNING)
+}
+
+#[cfg(test)]
+fn evaluate_pre_gradient(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, PRE_GRADIENT)
 }
 
 #[cfg(test)]
@@ -607,43 +644,23 @@ fn evaluate_legacy(board: &FastBoard) -> [f32; MAX_SNAKES] {
 }
 
 #[cfg(test)]
-fn evaluate_bully(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, BULLY)
+fn evaluate_appetite_022(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, APPETITE_022)
 }
 
 #[cfg(test)]
-fn evaluate_early(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, EARLY)
+fn evaluate_appetite_060(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, APPETITE_060)
 }
 
 #[cfg(test)]
-fn evaluate_dominance(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, DOMINANCE)
+fn evaluate_blind_contested(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, BLIND_CONTESTED)
 }
 
 #[cfg(test)]
-fn evaluate_pre_early(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, PRE_EARLY)
-}
-
-#[cfg(test)]
-fn evaluate_early_t7(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, EARLY_T7)
-}
-
-#[cfg(test)]
-fn evaluate_early_t13(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, EARLY_T13)
-}
-
-#[cfg(test)]
-fn evaluate_growth_05(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, GROWTH_05)
-}
-
-#[cfg(test)]
-fn evaluate_growth_10(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, GROWTH_10)
+fn evaluate_growth_only(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, GROWTH_ONLY)
 }
 
 #[cfg(test)]
@@ -652,8 +669,8 @@ fn evaluate_length_heavy(board: &FastBoard) -> [f32; MAX_SNAKES] {
 }
 
 #[cfg(test)]
-fn evaluate_v2(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, BOTH)
+fn evaluate_bully(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_impl(board, BULLY)
 }
 
 fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
@@ -696,6 +713,13 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
     // same-turn contests void the cell and stop both floods.
     let mut owner = vec![UNCLAIMED; cells];
     let mut arrival = vec![0u16; cells];
+    // Food lookup + earliest arrival at any food a snake reaches first *or
+    // ties for*; contested food is discounted later, never ignored.
+    let mut is_food = vec![false; cells];
+    for &f in &board.food {
+        is_food[f as usize] = true;
+    }
+    let mut food_any = [u16::MAX; MAX_SNAKES];
     let mut race_order = alive.clone();
     race_order.sort_by_key(|&i| std::cmp::Reverse(board.snakes[i].len()));
     let mut frontier: Vec<Vec<usize>> = vec![Vec::new(); board.snakes.len()];
@@ -727,6 +751,9 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
                             owner[nc] = i as u8;
                             arrival[nc] = t;
                             next[i].push(nc);
+                            if is_food[nc] {
+                                food_any[i] = food_any[i].min(t);
+                            }
                         }
                         o if o != CONTESTED
                             && o != i as u8
@@ -734,6 +761,11 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
                             && board.snakes[o as usize].len() == my_len =>
                         {
                             owner[nc] = CONTESTED;
+                            if is_food[nc] {
+                                // Both can be here at t; both should see it.
+                                food_any[i] = food_any[i].min(t);
+                                food_any[o as usize] = food_any[o as usize].min(t);
+                            }
                         }
                         _ => {}
                     }
@@ -801,12 +833,40 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
         } else {
             hunger
         };
+        let _ = urgency;
         let margin = if food_dist[i] == u16::MAX {
             -1.0
         } else {
             ((s.health as f32 - food_dist[i] as f32) / 25.0).clamp(-1.0, 1.0)
         };
-        let food = urgency * margin;
+        let food = if tuning.gradient_food {
+            // Appetite: a healthy snake at parity still wants food a bit
+            // (that is opportunistic eating), more when hungry, more when
+            // behind on length. Everything continuous — no switches.
+            let deficit = ((longest_other + 1.0 - len) / 4.0).clamp(0.0, 1.0);
+            let appetite =
+                (tuning.appetite_base + 0.60 * hunger + 0.50 * deficit).min(1.0);
+            // Prefer food we own outright; fall back to food we merely tie
+            // the race to, at a discount.
+            let (dist, share) = if food_dist[i] != u16::MAX {
+                (food_dist[i], 1.0)
+            } else {
+                (food_any[i], tuning.contested_food)
+            };
+            match dist {
+                // Nothing reachable at all: bad in proportion to hunger.
+                u16::MAX => -0.5 * hunger,
+                _ if share <= 0.0 => -0.5 * hunger,
+                d if (d as f32) > s.health as f32 => -1.0, // cannot make it
+                d => {
+                    // Smooth pull, so there is always a slope to climb.
+                    let attraction = 1.0 / (1.0 + d as f32 / tuning.food_scale);
+                    appetite * attraction * share
+                }
+            }
+        } else {
+            urgency * margin
+        };
         // Trap: a reachable region smaller than the body is a death sentence.
         let reach = reachable_cells(board, i, &blocked_until);
         let trap = ((reach as f32 - len) / len).clamp(-1.0, 0.0);
@@ -1164,7 +1224,7 @@ mod tests {
             if turn.game_over() {
                 break;
             }
-            let m1 = think_with(&cfg, &turn, &a, 1_200, evaluate_legacy);
+            let m1 = think_with(&cfg, &turn, &a, 1_200, evaluate_pre_gradient);
             let m2 = think_with(&cfg, &turn, &a, 1_200, evaluate);
             if m1 == m2 { same += 1 } else { diff += 1 }
             let mut moves = BTreeMap::new();
@@ -1180,27 +1240,41 @@ mod tests {
     #[test]
     #[ignore]
     fn arena_ablation() {
-        run_arena("growth-urgency only", evaluate, evaluate_legacy, 30, 1_200);
+        run_arena("growth-urgency only", evaluate_growth_only, evaluate_legacy, 30, 1_200);
         run_arena("length-heavy only  ", evaluate_length_heavy, evaluate_legacy, 30, 1_200);
-        run_arena("both               ", evaluate_v2, evaluate_legacy, 30, 1_200);
     }
 
     /// Bully candidates: each isolated against the shipped tuning.
     #[test]
     #[ignore]
     fn arena_bully_candidates() {
-        run_arena_on("bully-target  ", evaluate_bully, evaluate_pre_early, 30, 1_200, 13);
-        run_arena_on("early-boost   ", evaluate_early, evaluate_pre_early, 30, 1_200, 13);
-        run_arena_on("dominance-step", evaluate_dominance, evaluate_pre_early, 30, 1_200, 13);
+        run_arena_on("bully-target", evaluate_bully, evaluate_pre_gradient, 30, 1_200, 13);
+    }
+
+    /// Does a continuous appetite + proximity gradient beat the shipped
+    /// threshold-based tuning? (And how hungry should a healthy snake be?)
+    #[test]
+    #[ignore]
+    fn arena_gradient_food() {
+        // The shipped model against the tuning it replaced.
+        run_arena_on("shipped (gradient)  ", evaluate, evaluate_pre_gradient, 40, 1_200, 13);
+        run_arena_on("contested food blind", evaluate_blind_contested, evaluate_pre_gradient, 30, 1_200, 13);
+        run_arena_on("appetite 0.22       ", evaluate_appetite_022, evaluate_pre_gradient, 30, 1_200, 13);
+        run_arena_on("appetite 0.60       ", evaluate_appetite_060, evaluate_pre_gradient, 30, 1_200, 13);
+    }
+
+    /// Where does appetite peak now that contested food is visible?
+    #[test]
+    #[ignore]
+    fn arena_appetite_sweep() {
+        run_arena_on("shipped @11x11", evaluate, evaluate_pre_gradient, 30, 1_200, 11);
     }
 
     /// How long should "early" last, and does the boost hold up?
     #[test]
     #[ignore]
     fn arena_early_sweep() {
-        run_arena_on("early until 9  (shipped)", evaluate, evaluate_pre_early, 40, 1_200, 13);
-        run_arena_on("early until 7           ", evaluate_early_t7, evaluate_pre_early, 30, 1_200, 13);
-        run_arena_on("early until 13          ", evaluate_early_t13, evaluate_pre_early, 30, 1_200, 13);
+        run_arena_on("pre-gradient vs legacy", evaluate_pre_gradient, evaluate_legacy, 30, 1_200, 13);
     }
 
     /// Confirmation: does growth-urgency hold up at higher power, on the
@@ -1209,8 +1283,7 @@ mod tests {
     #[ignore]
     fn arena_confirm_growth() {
         run_arena_on("shipped 0.7 @13x13", evaluate, evaluate_legacy, 40, 1_200, 13);
-        run_arena("growth 0.5        ", evaluate_growth_05, evaluate_legacy, 30, 1_200);
-        run_arena("growth 1.0        ", evaluate_growth_10, evaluate_legacy, 30, 1_200);
+
     }
 
     /// fast_ln tracks real ln closely enough for UCB.
