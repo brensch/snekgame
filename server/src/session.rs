@@ -161,6 +161,11 @@ pub enum Cmd {
         conn_id: u64,
         msg: ClientMsg,
     },
+    /// A keepalive reached us. Cheaper than a full message and, for a
+    /// device that is only watching, the sole evidence it is still there.
+    Alive {
+        conn_id: u64,
+    },
 }
 
 struct Conn {
@@ -415,6 +420,28 @@ impl SessionActor {
                 self.broadcast_lobby().await;
             }
             Cmd::Msg { conn_id, msg } => self.client_msg(conn_id, msg).await,
+            Cmd::Alive { conn_id } => self.mark_alive(conn_id),
+        }
+    }
+
+    /// Anything at all from a device disproves an *inference* that it went
+    /// quiet — without this, a device parked by a couple of missed ticks
+    /// would never be sent another request and so could never prove
+    /// otherwise, a permanent ban by silence. It deliberately does not
+    /// override what the device said about itself.
+    fn mark_alive(&mut self, conn_id: u64) {
+        let was_asleep = match self.conns.get_mut(&conn_id) {
+            Some(conn) => {
+                conn.misses = 0;
+                let was = conn.presumed_asleep;
+                conn.presumed_asleep = false;
+                was && conn.declared_available
+            }
+            None => return,
+        };
+        if was_asleep {
+            tracing::info!(session = %self.name, conn = conn_id, "device is awake again");
+            self.assign_bots();
         }
     }
 
@@ -423,23 +450,7 @@ impl SessionActor {
             Some(c) => c.player.clone(),
             None => return,
         };
-        // Anything at all from a device disproves an *inference* that it
-        // went quiet — without this, a device parked by a couple of missed
-        // ticks would never be sent another request and so could never prove
-        // otherwise, a permanent ban by silence. It deliberately does not
-        // override what the device said about itself.
-        let was_asleep = if let Some(conn) = self.conns.get_mut(&conn_id) {
-            conn.misses = 0;
-            let was = conn.presumed_asleep;
-            conn.presumed_asleep = false;
-            was && conn.declared_available
-        } else {
-            false
-        };
-        if was_asleep {
-            tracing::info!(session = %self.name, conn = conn_id, "device is awake again");
-            self.assign_bots();
-        }
+        self.mark_alive(conn_id);
         match msg {
             // Identity is fixed to the connection: whatever a client sends,
             // profile changes only ever apply to *its own* public id.

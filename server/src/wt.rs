@@ -232,7 +232,16 @@ async fn join_session(
         while let Ok(datagram) = dgram_conn.receive_datagram().await {
             match decode::<ClientMsg>(&datagram) {
                 Some(ClientMsg::Ping(n)) => {
+                    // Pong here, where it is cheapest. The actor still needs
+                    // to hear about it: a keepalive is the only traffic a
+                    // spectating device produces, so it is the only thing
+                    // that can prove a host we wrote off as asleep is in
+                    // fact fine. Without this, that guess is unfalsifiable
+                    // and the game stays paused forever.
                     let _ = dgram_conn.send_datagram(encode(&ServerMsg::Pong(n)));
+                    if dgram_actor.send(Cmd::Alive { conn_id }).await.is_err() {
+                        break;
+                    }
                 }
                 // Everything latency-critical arrives here: player input
                 // and bot answers alike. Duplicates are harmless — the

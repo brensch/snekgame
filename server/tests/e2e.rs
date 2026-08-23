@@ -592,3 +592,78 @@ async fn sleeping_host_pauses_the_game() {
     }
     assert!(resumed, "game never resumed after the device woke up");
 }
+
+/// A host we *guess* has gone to sleep must be able to prove us wrong. A
+/// device that is only watching sends nothing but keepalives, so if those
+/// don't count as evidence the guess is unfalsifiable: it gets no compute
+/// requests, produces no other traffic, and the game stays paused forever.
+#[tokio::test]
+async fn a_silent_host_recovers_on_keepalives_alone() {
+    let dir = std::env::temp_dir().join(format!("snek-revive-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("revive.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let (_, registry) = snek_server::build(&db_path);
+    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    let mut alice =
+        Client::connect(wt_port, "revive-test", "alice-secret-0000", info("alice")).await;
+    alice
+        .control(&ClientMsg::Configure(GameConfig {
+            board_width: 11,
+            board_height: 11,
+            tick_ms: 200,
+        }))
+        .await;
+    alice
+        .control(&ClientMsg::Benchmark {
+            sims_per_sec: 50_000,
+            device: "stalling phone".to_string(),
+            cores: 8,
+        })
+        .await;
+    alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Easy)).await;
+    alice.control(&ClientMsg::SetReady(true)).await;
+    alice.control(&ClientMsg::Start).await;
+
+    // Never answer a single compute request: the server should give up on
+    // this host after two ticks of silence and pause the game.
+    let mut turns_seen = 0u32;
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(300), alice.next_msg()).await {
+            Ok(ServerMsg::Turn(_)) => turns_seen += 1,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    let paused_at = turns_seen;
+    assert!(
+        paused_at < 25,
+        "server kept ticking a game nobody could think for: {paused_at} turns"
+    );
+
+    // The only traffic a watching device produces. This must revive it.
+    for _ in 0..6 {
+        alice.conn.send_datagram(encode(&ClientMsg::Ping(7))).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let mut resumed = 0u32;
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < deadline && resumed == 0 {
+        match tokio::time::timeout(Duration::from_millis(300), alice.next_msg()).await {
+            Ok(ServerMsg::Turn(_)) => resumed += 1,
+            Ok(ServerMsg::ComputeRequest { .. }) => resumed += 1,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(
+        resumed > 0,
+        "keepalives did not revive the host — the game is stuck for good"
+    );
+}
