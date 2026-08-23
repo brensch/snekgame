@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// The client-editable part of a profile. The public player id is derived
 /// server-side (a hash of the client's private secret), so a client can never
@@ -71,6 +71,9 @@ pub enum ClientMsg {
         proof: u64,
         /// Wall time this device spent on the search.
         elapsed_ms: u32,
+        /// Simulations it managed in that time — the honest measure of how
+        /// much thinking this device contributed.
+        sims: u32,
     },
 }
 
@@ -119,16 +122,17 @@ pub enum ServerMsg {
     },
     /// Active-games list push (for WatchGames subscribers).
     Sessions(Vec<SessionSummary>),
-    /// Run the bot search for `bot_id` on this device: exactly `sims`
-    /// simulations from `turn`, echoing `nonce` inside the proof. Due back
-    /// before the next tick.
+    /// Run the bot search for `bot_id` on this device and answer within
+    /// `think_ms`. The search is anytime: think until the deadline, then
+    /// return the best move found. The device watches its own clock, so
+    /// there is nothing for the server to predict about its speed.
     ComputeRequest {
         request_id: u64,
         bot_id: PlayerId,
         bot_name: String,
         config: GameConfig,
         turn: Turn,
-        sims: u32,
+        think_ms: u32,
         nonce: u64,
     },
     Error(String),

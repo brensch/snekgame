@@ -61,6 +61,10 @@ thread_local! {
     static ACTIVE: RefCell<Option<Conn>> = const { RefCell::new(None) };
     /// When the last server message arrived (any kind — pongs count).
     static LAST_RX: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    /// Newest turn we have seen. Compute requests older than this are
+    /// already obsolete — the tick they were for has resolved — so running
+    /// them would only push the queue further behind.
+    static LATEST_TURN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 fn mark_rx() {
@@ -514,20 +518,17 @@ async fn benchmark_sims_per_sec(generation: u64) -> Option<u32> {
     let mut engine = Engine::new(config, vec![a.clone(), "bench-b".into()], 1);
     let turn = engine.first_turn();
 
-    // Measured on the worker — the same thread that will do the real work,
-    // and no UI stalls while measuring. No worker, no volunteering.
-    const CHUNK: u32 = 250;
-    let start = now();
-    let mut total: u64 = 0;
-    while now() - start < 600.0 {
-        if !is_current(generation) {
-            return None;
-        }
-        crate::botworker::compute(config, turn.clone(), a.clone(), CHUNK, 0).await?;
-        total += CHUNK as u64;
+    // One timed search on the worker: it both proves a worker can run here
+    // (no worker, no volunteering) and gives an initial speed for ranking
+    // hosts. Everything after this is deadline-driven, so nothing is
+    // predicted from it.
+    const PROBE_MS: u32 = 300;
+    let (_dir, _proof, sims) =
+        crate::botworker::compute(config, turn, a, PROBE_MS, 0).await?;
+    if !is_current(generation) {
+        return None;
     }
-    let elapsed = (now() - start).max(1.0);
-    Some(((total as f64) * 1000.0 / elapsed) as u32)
+    Some(((sims as f64) * 1000.0 / PROBE_MS as f64) as u32)
 }
 
 fn schedule_reconnect(store: Store, generation: u64) {
@@ -597,6 +598,7 @@ fn apply(store: Store, msg: ServerMsg) {
             turn,
             countdown_ms,
         } => {
+            LATEST_TURN.with(|c| c.set(turn.turn_number));
             store.saved_id.set(None);
             store.view_turn.set(None);
             store.countdown_ends.set(now() + countdown_ms as f64);
@@ -614,6 +616,7 @@ fn apply(store: Store, msg: ServerMsg) {
             }));
         }
         ServerMsg::Turn(turn) => {
+            LATEST_TURN.with(|c| c.set(c.get().max(turn.turn_number)));
             // Datagram-class: dedup the redundant copies, drop stale
             // reorderings, accept gaps (snapshots are full state).
             let me = store.me.get_untracked();
@@ -646,7 +649,7 @@ fn apply(store: Store, msg: ServerMsg) {
             bot_id,
             config,
             turn,
-            sims,
+            think_ms,
             nonce,
             ..
         } => {
@@ -655,16 +658,23 @@ fn apply(store: Store, msg: ServerMsg) {
             // benchmarks, so it is never assigned a bot in the first place
             // — and if one somehow arrives, staying silent makes the server
             // hand that bot to another phone.
+            if turn.turn_number < LATEST_TURN.with(|c| c.get()) {
+                return; // superseded before we even started
+            }
             spawn_local(async move {
                 let started = now();
-                let Some((dir, _work)) =
-                    crate::botworker::compute(config, turn, bot_id, sims, nonce).await
+                let requested_for = turn.turn_number;
+                let Some((dir, _work, sims)) =
+                    crate::botworker::compute(config, turn, bot_id, think_ms, nonce).await
                 else {
                     return;
                 };
+                if requested_for < LATEST_TURN.with(|c| c.get()) {
+                    return; // the tick resolved while we were thinking
+                }
                 let elapsed_ms = (now() - started).max(0.0) as u32;
                 let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
-                send(&ClientMsg::BotMove { request_id, dir, proof, elapsed_ms });
+                send(&ClientMsg::BotMove { request_id, dir, proof, elapsed_ms, sims });
             });
         }
         ServerMsg::GameSaved { id, .. } => store.saved_id.set(Some(id)),

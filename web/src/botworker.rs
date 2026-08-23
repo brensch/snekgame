@@ -5,6 +5,9 @@
 //! it is sliced. A dedicated Web Worker is an actual OS thread: the search
 //! runs at full speed with the main thread completely untouched.
 //!
+//! Each bot gets its own worker (up to a core budget), so several bots
+//! think in parallel rather than queueing on one thread.
+//!
 //! The worker is a tiny inline module that imports *this same* wasm bundle
 //! (trunk publishes its URL in a `modulepreload` link) and calls the
 //! exported [`snek_bot_compute`]. Everything crosses the boundary as
@@ -29,7 +32,7 @@ struct Job {
     config: GameConfig,
     turn: Turn,
     bot_id: PlayerId,
-    sims: u32,
+    think_ms: u32,
     nonce: u64,
 }
 
@@ -37,29 +40,91 @@ struct Job {
 struct JobResult {
     dir: Dir,
     proof: u64,
+    sims: u32,
 }
 
-/// Exported into the wasm bundle so the worker can call it. Runs the full
-/// deterministic search — no chunking needed, nothing else lives on this
-/// thread.
+/// Exported into the wasm bundle so the worker can call it. Searches until
+/// its deadline and returns the best move found — MCTS is anytime, so the
+/// clock decides when to stop rather than a predicted simulation count.
 #[wasm_bindgen]
 pub fn snek_bot_compute(job: &[u8]) -> Vec<u8> {
     let Some(job) = postcard::from_bytes::<Job>(job).ok() else {
         return Vec::new();
     };
-    let (dir, proof) =
-        snek_shared::bot::think(&job.config, &job.turn, &job.bot_id, job.sims, job.nonce);
-    postcard::to_allocvec(&JobResult { dir, proof }).unwrap_or_default()
+    // Enough work per slice to keep clock checks negligible, small enough
+    // to land close to the deadline.
+    const SLICE: usize = 128;
+    let started = js_sys::Date::now();
+    let deadline = job.think_ms as f64;
+    let mut search =
+        snek_shared::bot::begin(&job.config, &job.turn, &job.bot_id, u32::MAX, job.nonce);
+    let mut sims = 0u32;
+    loop {
+        if search.step(SLICE) {
+            break; // nothing left to search
+        }
+        sims += SLICE as u32;
+        if js_sys::Date::now() - started >= deadline {
+            break;
+        }
+    }
+    let (dir, proof) = search.result();
+    postcard::to_allocvec(&JobResult { dir, proof, sims }).unwrap_or_default()
 }
 
 thread_local! {
-    static WORKER: RefCell<Option<web_sys::Worker>> = const { RefCell::new(None) };
+    /// One worker per bot, up to the core budget: bots then think in
+    /// parallel on separate cores instead of queueing behind each other on
+    /// one. Workers are kept for the life of the page — booting a wasm
+    /// instance is far too expensive to do per tick.
+    static WORKERS: RefCell<Vec<web_sys::Worker>> = const { RefCell::new(Vec::new()) };
+    /// Which worker each bot is pinned to.
+    static SLOTS: RefCell<HashMap<PlayerId, usize>> = RefCell::new(HashMap::new());
     static PENDING: RefCell<HashMap<u64, oneshot::Sender<Vec<u8>>>> =
         RefCell::new(HashMap::new());
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     /// Set once we know a worker cannot be created here; stops us retrying
     /// on every single move.
     static UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// How many workers we are willing to run: leave a core for the UI, and
+/// do not go wild on a many-core desktop either.
+fn worker_budget() -> usize {
+    let cores = web_sys::window()
+        .map(|w| w.navigator().hardware_concurrency() as usize)
+        .unwrap_or(4);
+    cores.saturating_sub(1).clamp(1, 4)
+}
+
+/// The worker this bot thinks on, creating one if the budget allows.
+/// Bots beyond the budget share, round robin.
+fn worker_for(bot_id: &PlayerId) -> Option<web_sys::Worker> {
+    let existing = SLOTS.with(|s| s.borrow().get(bot_id).copied());
+    if let Some(slot) = existing {
+        let w = WORKERS.with(|w| w.borrow().get(slot).cloned());
+        if w.is_some() {
+            return w;
+        }
+        SLOTS.with(|s| {
+            s.borrow_mut().remove(bot_id);
+        });
+    }
+    let len = WORKERS.with(|w| w.borrow().len());
+    let slot = if len < worker_budget() {
+        let worker = spawn_worker()?;
+        WORKERS.with(|w| {
+            let mut w = w.borrow_mut();
+            w.push(worker);
+            w.len() - 1
+        })
+    } else {
+        SLOTS.with(|s| s.borrow().len()) % len
+    };
+    SLOTS.with(|s| {
+        s.borrow_mut().insert(bot_id.clone(), slot);
+    });
+    WORKERS.with(|w| w.borrow().get(slot).cloned())
 }
 
 /// This bundle's JS glue and wasm URLs, as published by trunk, made
@@ -156,7 +221,8 @@ self.onmessage = async (e) => {{
     // A worker that dies takes its pending jobs with it; drop the handle so
     // the next request builds a fresh one.
     let on_error = Closure::<dyn FnMut(JsValue)>::new(move |_| {
-        WORKER.with(|w| *w.borrow_mut() = None);
+        WORKERS.with(|w| w.borrow_mut().clear());
+        SLOTS.with(|s| s.borrow_mut().clear());
         PENDING.with(|p| p.borrow_mut().clear());
     });
     worker.set_onerror(Some(on_error.as_ref().unchecked_ref()));
@@ -171,20 +237,13 @@ pub async fn compute(
     config: GameConfig,
     turn: Turn,
     bot_id: PlayerId,
-    sims: u32,
+    think_ms: u32,
     nonce: u64,
-) -> Option<(Dir, u64)> {
+) -> Option<(Dir, u64, u32)> {
     if UNAVAILABLE.with(|u| u.get()) {
         return None;
     }
-    let worker = WORKER.with(|w| {
-        let mut w = w.borrow_mut();
-        if w.is_none() {
-            *w = spawn_worker();
-        }
-        w.clone()
-    });
-    let Some(worker) = worker else {
+    let Some(worker) = worker_for(&bot_id) else {
         UNAVAILABLE.with(|u| u.set(true));
         return None;
     };
@@ -193,7 +252,7 @@ pub async fn compute(
         config,
         turn,
         bot_id,
-        sims,
+        think_ms,
         nonce,
     })
     .ok()?;
@@ -211,7 +270,8 @@ pub async fn compute(
     let _ = Reflect::set(&msg, &"job".into(), &Uint8Array::from(job.as_slice()));
     if worker.post_message(&msg).is_err() {
         PENDING.with(|p| p.borrow_mut().remove(&id));
-        WORKER.with(|w| *w.borrow_mut() = None);
+        WORKERS.with(|w| w.borrow_mut().clear());
+        SLOTS.with(|s| s.borrow_mut().clear());
         return None;
     }
 
@@ -226,7 +286,8 @@ pub async fn compute(
         futures_util::future::Either::Left((Ok(bytes), _)) => bytes,
         _ => {
             PENDING.with(|p| p.borrow_mut().remove(&id));
-            WORKER.with(|w| *w.borrow_mut() = None);
+            WORKERS.with(|w| w.borrow_mut().clear());
+            SLOTS.with(|s| s.borrow_mut().clear());
             return None;
         }
     };
@@ -234,5 +295,5 @@ pub async fn compute(
         return None;
     }
     let result = postcard::from_bytes::<JobResult>(&bytes).ok()?;
-    Some((result.dir, result.proof))
+    Some((result.dir, result.proof, result.sims))
 }

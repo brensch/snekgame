@@ -345,17 +345,34 @@ async fn distributed_compute_round_trip() {
                 bot_id,
                 config,
                 turn,
-                sims,
+                think_ms,
                 nonce,
                 ..
             } => {
                 compute_requests += 1;
-                // Exactly what the browser does: deterministic search, then
-                // the nonce+request binding checksum.
-                let (dir, _work) = snek_shared::bot::think(&config, &turn, &bot_id, sims, nonce);
+                // What the browser does: search until the deadline, then
+                // answer with the nonce+request binding checksum.
+                let deadline =
+                    std::time::Instant::now() + Duration::from_millis(think_ms as u64);
+                let mut search =
+                    snek_shared::bot::begin(&config, &turn, &bot_id, u32::MAX, nonce);
+                let mut sims = 0u32;
+                while !search.step(128) {
+                    sims += 128;
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                let (dir, _work) = search.result();
                 let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
                 alice
-                    .control(&ClientMsg::BotMove { request_id, dir, proof, elapsed_ms: 12 })
+                    .control(&ClientMsg::BotMove {
+                        request_id,
+                        dir,
+                        proof,
+                        elapsed_ms: think_ms.max(1),
+                        sims,
+                    })
                     .await;
             }
             ServerMsg::Turn(t) if t.game_over() => {

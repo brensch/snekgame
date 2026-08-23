@@ -170,9 +170,16 @@ struct Conn {
     ip: String,
     /// Self-described device (from the user agent).
     device: String,
-    /// Self-reported search speed; present = eligible to host bot compute.
+    /// Self-reported search speed from the lobby benchmark; present =
+    /// eligible to host bot compute.
     sims_per_sec: Option<u32>,
-    /// Timeout/checksum strikes; too many bans the conn from hosting.
+    /// Simulations per second the device most recently achieved, used only
+    /// to rank hosts (fastest phone gets first pick of the bots). Nothing
+    /// is budgeted from it — devices are given a deadline and report what
+    /// they managed within it.
+    recent_sims_per_sec: Option<u32>,
+    /// Protocol abuse only (bad checksum, answering someone else's
+    /// request). Three of these stop us trusting the connection.
     strikes: u32,
 }
 
@@ -180,7 +187,6 @@ struct PendingCompute {
     bot_id: PlayerId,
     conn_id: u64,
     turn: Turn,
-    sims: u32,
     nonce: u64,
 }
 
@@ -327,6 +333,7 @@ impl SessionActor {
                         ip,
                         device: String::new(),
                         sims_per_sec: None,
+                        recent_sims_per_sec: None,
                         strikes: 0,
                     },
                 );
@@ -455,7 +462,7 @@ impl SessionActor {
                 }
                 self.assign_bots();
             }
-            ClientMsg::BotMove { request_id, dir, proof, elapsed_ms } => {
+            ClientMsg::BotMove { request_id, dir, proof, elapsed_ms, sims } => {
                 let Some(pending) = self.pending_compute.remove(&request_id) else {
                     return; // stale or bogus
                 };
@@ -475,9 +482,21 @@ impl SessionActor {
                 if let Some(game) = &mut self.game {
                     let acc = game.compute.entry(conn_id).or_default();
                     acc.moves += 1;
-                    acc.sims += pending.sims as u64;
+                    acc.sims += sims as u64;
                     acc.wall_ms += elapsed_ms.min(60_000) as u64;
                 }
+                // Ranking signal only: how much thinking this device got
+                // done inside its deadline.
+                if elapsed_ms >= 4 && sims > 0 {
+                    if let Some(conn) = self.conns.get_mut(&conn_id) {
+                        let rate = (sims as u64 * 1000 / elapsed_ms as u64) as u32;
+                        conn.recent_sims_per_sec = Some(match conn.recent_sims_per_sec {
+                            Some(prev) => (prev * 7 + rate * 3) / 10,
+                            None => rate,
+                        });
+                    }
+                }
+
                 if let Some(game) = &mut self.game {
                     let current = game.turns.last().map(|t| t.turn_number);
                     if current == Some(pending.turn.turn_number)
@@ -547,6 +566,11 @@ impl SessionActor {
             compute: HashMap::new(),
             started_at_ms: now_ms(),
         });
+        // Never let one bad game poison the next: trust resets, and the
+        // budget restarts from a modest value it can climb from.
+        for conn in self.conns.values_mut() {
+            conn.strikes = 0;
+        }
         self.ready.clear();
         self.publish_info();
         self.next_tick =
@@ -594,7 +618,13 @@ impl SessionActor {
         late_hosts.sort_unstable();
         late_hosts.dedup();
         for conn_id in late_hosts {
-            self.strike(conn_id, "compute request timed out");
+            // With deadlines, lateness means the network dropped it, not
+            // that we asked for too much. Nothing to tune — just note it.
+            tracing::debug!(
+                session = %self.name,
+                conn = conn_id,
+                "compute answer did not arrive in time"
+            );
         }
         // Hard lock: the server NEVER searches. Bots whose host didn't
         // answer simply keep their heading this tick (the engine's default).
@@ -723,7 +753,11 @@ impl SessionActor {
             .conns
             .iter()
             .filter(|(_, c)| c.strikes < 3)
-            .filter_map(|(&id, c)| c.sims_per_sec.map(|r| (id, r)))
+            .filter_map(|(&id, c)| {
+                c.recent_sims_per_sec
+                    .or(c.sims_per_sec)
+                    .map(|rate| (id, rate))
+            })
             .collect();
         hosts.sort_by_key(|&(id, r)| (std::cmp::Reverse(r), id));
         self.bot_hosts.clear();
@@ -738,16 +772,16 @@ impl SessionActor {
         }
     }
 
-    /// A host misbehaved (timeout / bad audit / wrong request). Three
-    /// strikes bans it from hosting and its bots move to the next phone.
+    /// A host misbehaved at the protocol level (bad checksum, answering a
+    /// request that was not its own). Three of these stop us trusting it.
     fn strike(&mut self, conn_id: u64, why: &'static str) {
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.strikes += 1;
             tracing::info!(session = %self.name, conn = conn_id, why, strikes = conn.strikes,
                 "compute host strike");
-            if conn.strikes >= 3 {
-                conn.sims_per_sec = None; // no longer eligible
-            }
+            // Eligibility is checked against `strikes`, which a new game
+            // resets — never null the benchmark, or the device could never
+            // host again for the life of the connection.
         }
         self.assign_bots();
     }
@@ -776,13 +810,19 @@ impl SessionActor {
             let Some(&conn_id) = self.bot_hosts.get(bot_id) else {
                 continue; // no hosts: tick() falls back server-side
             };
-            let Some(conn) = self.conns.get(&conn_id) else { continue };
-            let rate = conn.sims_per_sec.unwrap_or(10_000) as u64;
-            let share = load.get(&conn_id).copied().unwrap_or(1).max(1) as u64;
-            // difficulty ms of thinking at this phone's speed, split across
-            // its bots, capped so it always fits inside a tick.
-            let think_ms = (bot::budget_ms(difficulty) as u64).min(self.config.tick_ms as u64 / 2);
-            let sims = (rate * think_ms / 1000 / share).clamp(300, 60_000) as u32;
+            if !self.conns.contains_key(&conn_id) {
+                continue;
+            }
+            // Everything a host runs must finish inside the tick, with room
+            // for the round trip. Bots on the same device think in parallel
+            // (a worker each), so the window is not divided between them.
+            let window = (self.config.tick_ms as f64 - 150.0).max(30.0);
+            let difficulty_factor = match difficulty {
+                BotDifficulty::Easy => 0.15,
+                BotDifficulty::Medium => 0.45,
+                BotDifficulty::Hard => 0.9,
+            };
+            let think_ms = (window * difficulty_factor).clamp(20.0, 2_000.0) as u32;
             let request_id = self.next_request_id;
             self.next_request_id += 1;
             let nonce = rand::random::<u64>();
@@ -792,7 +832,6 @@ impl SessionActor {
                     bot_id: bot_id.clone(),
                     conn_id,
                     turn: turn.clone(),
-                    sims,
                     nonce,
                 },
             );
@@ -810,7 +849,7 @@ impl SessionActor {
                     bot_name,
                     config: self.config,
                     turn: turn.clone(),
-                    sims,
+                    think_ms,
                     nonce,
                 }),
             ));
