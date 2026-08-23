@@ -21,6 +21,9 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
 
+/// How long to wait on the worker before rebuilding it.
+const WORKER_TIMEOUT_MS: u32 = 5_000;
+
 #[derive(Serialize, Deserialize)]
 struct Job {
     config: GameConfig,
@@ -59,18 +62,33 @@ thread_local! {
     static UNAVAILABLE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The URL of this bundle's JS glue, as published by trunk.
+/// This bundle's JS glue and wasm URLs, as published by trunk, made
+/// **fully qualified**. A blob-URL module has no origin to resolve a
+/// path-absolute specifier like `/snek-web-abc.js` against, so importing
+/// one fails on load — which looks exactly like "the worker never
+/// answers".
 fn bundle_urls() -> Option<(String, String)> {
-    let doc = web_sys::window()?.document()?;
-    let glue = doc
-        .query_selector("link[rel=modulepreload]")
-        .ok()??
-        .get_attribute("href")?;
+    let window = web_sys::window()?;
+    let origin = window.location().origin().ok()?;
+    let doc = window.document()?;
+    let absolute = |href: String| {
+        if href.starts_with("http") {
+            href
+        } else {
+            format!("{origin}{href}")
+        }
+    };
+    let glue = absolute(
+        doc.query_selector("link[rel=modulepreload]")
+            .ok()??
+            .get_attribute("href")?,
+    );
     let wasm = doc
         .query_selector("link[rel=preload][as=fetch]")
         .ok()
         .flatten()
         .and_then(|l| l.get_attribute("href"))
+        .map(absolute)
         .unwrap_or_else(|| glue.replace(".js", "_bg.wasm"));
     Some((glue, wasm))
 }
@@ -79,12 +97,22 @@ fn spawn_worker() -> Option<web_sys::Worker> {
     let (glue, wasm) = bundle_urls()?;
     // A module worker that boots the same bundle and answers jobs.
     let script = format!(
-        r#"import init, * as bindings from '{glue}';
-const ready = init({{ module_or_path: '{wasm}' }});
+        r#"let ready = null;
+const boot = async () => {{
+  const b = await import('{glue}');
+  await b.default({{ module_or_path: '{wasm}' }});
+  return b;
+}};
 self.onmessage = async (e) => {{
-  await ready;
-  const out = bindings.snek_bot_compute(new Uint8Array(e.data.job));
-  self.postMessage({{ id: e.data.id, out }}, [out.buffer]);
+  try {{
+    ready = ready || boot();
+    const b = await ready;
+    const out = b.snek_bot_compute(new Uint8Array(e.data.job));
+    self.postMessage({{ id: e.data.id, out }}, [out.buffer]);
+  }} catch (err) {{
+    // Surface the reason instead of dying silently.
+    self.postMessage({{ id: e.data.id, error: String((err && err.stack) || err) }});
+  }}
 }};"#
     );
     let parts = js_sys::Array::of1(&JsValue::from_str(&script));
@@ -104,6 +132,14 @@ self.onmessage = async (e) => {{
                 .ok()
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0) as u64;
+            if let Some(err) = Reflect::get(&data, &"error".into())
+                .ok()
+                .and_then(|v| v.as_string())
+            {
+                web_sys::console::error_1(&JsValue::from_str(&format!(
+                    "bot worker failed: {err}"
+                )));
+            }
             let bytes = Reflect::get(&data, &"out".into())
                 .ok()
                 .and_then(|v| v.dyn_into::<Uint8Array>().ok())
@@ -179,7 +215,24 @@ pub async fn compute(
         return None;
     }
 
-    let bytes = rx.await.ok()?;
+    // A worker that goes quiet must not strand the caller forever: time it
+    // out and rebuild it on the next request.
+    let bytes = match futures_util::future::select(
+        rx,
+        Box::pin(gloo_timers::future::TimeoutFuture::new(WORKER_TIMEOUT_MS)),
+    )
+    .await
+    {
+        futures_util::future::Either::Left((Ok(bytes), _)) => bytes,
+        _ => {
+            PENDING.with(|p| p.borrow_mut().remove(&id));
+            WORKER.with(|w| *w.borrow_mut() = None);
+            return None;
+        }
+    };
+    if bytes.is_empty() {
+        return None;
+    }
     let result = postcard::from_bytes::<JobResult>(&bytes).ok()?;
     Some((result.dir, result.proof))
 }
