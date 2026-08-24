@@ -127,9 +127,22 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
     let food_now = current_food.clone();
     let food_for_shuffle = current_food.clone();
     let food_picker = view! {
-        <div class="row" style="margin-top: 10px; align-items: center;">
-            <label style="flex: 1 1 auto;">
-                "Food"
+        <div style="margin-top: 10px;">
+            // Heading and shuffle on one line, the hand full width beneath —
+            // the same shape as the profile editor's emoji picker.
+            <div class="row" style="align-items: center;">
+                <label style="flex: 1 1 auto;">"Food"</label>
+                <button
+                    class="mini"
+                    style="flex: 0 0 auto;"
+                    on:click=move |_| {
+                        food_hand.set(palette::random_food_set(8, &food_for_shuffle));
+                    }
+                >
+                    "🎲 shuffle"
+                </button>
+            </div>
+            <div>
                 <div class="food-hand">
                     {move || {
                         let picked = food_now.clone();
@@ -161,16 +174,7 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                             .collect_view()
                     }}
                 </div>
-            </label>
-            <button
-                class="mini"
-                style="flex: 0 0 auto;"
-                on:click=move |_| {
-                    food_hand.set(palette::random_food_set(8, &food_for_shuffle));
-                }
-            >
-                "🎲 shuffle"
-            </button>
+            </div>
         </div>
     };
 
@@ -441,14 +445,16 @@ fn game_view(game: GameView) -> impl IntoView {
     // tournament. The server owns the state, so every screen agrees.
     let pause_button = (!over && !show_countdown).then(|| {
         view! {
-            <button
-                class="mini"
-                on:click=move |_| {
-                    net::send(&ClientMsg::SetPaused(!store.paused.get()));
-                }
-            >
-                {move || if store.paused.get() { "▶️ resume" } else { "⏸️ pause" }}
-            </button>
+            <div class="pause-row">
+                <button
+                    class="mini"
+                    on:click=move |_| {
+                        net::send(&ClientMsg::SetPaused(!store.paused.get()));
+                    }
+                >
+                    {move || if store.paused.get() { "▶️ resume" } else { "⏸️ pause" }}
+                </button>
+            </div>
         }
     });
 
@@ -530,17 +536,15 @@ fn game_view(game: GameView) -> impl IntoView {
 
     view! {
         <div>
-            <div class="row" style="align-items: center;">
-                <p style="flex: 1 1 auto; margin: 0;">
-                    "Turn " {turn.turn_number}
-                    {move || store.paused.get().then_some(" — held ⏸️")}
-                    {spectating.then_some(" — spectating (next game starts from the lobby)")}
-                    {i_died.then_some(" — you died 💀 watch the rest")}
-                </p>
-                {pause_button}
-            </div>
+            <p>
+                "Turn " {turn.turn_number}
+                {move || store.paused.get().then_some(" — held ⏸️")}
+                {spectating.then_some(" — spectating (next game starts from the lobby)")}
+                {i_died.then_some(" — you died 💀 watch the rest")}
+            </p>
             {board_view(game.config, game.players.clone(), &turn, me.clone(), on_cell)}
             {show_dpad.then(dpad)}
+            {pause_button}
             {countdown}
             {results}
         </div>

@@ -310,14 +310,16 @@ button.mini {
   font-size: 24px;
 }
 
-.emoji-grid .pick {
+.emoji-grid .pick,
+.food-hand .pick {
   border: 2px solid transparent;
   padding: 4px;
   cursor: pointer;
   text-align: center;
 }
 
-.emoji-grid .pick.selected {
+.emoji-grid .pick.selected,
+.food-hand .pick.selected {
   border-color: #000;
   box-shadow: 2px 2px 0 #000;
   background: #fff;
@@ -508,15 +510,28 @@ tr.clickable {
   animation: shake 0.5s ease infinite;
 }
 
-/* The lobby's hand of foods. Same cells as the profile emoji grid, but a
-   single row that scrolls — it is a choice, not a catalogue. */
+/* The lobby's hand of foods: one scrolling row, since it is a choice and
+   not a catalogue. The picks themselves are the app's emoji-picker cells,
+   sized up for a thumb — a second look for the same job would be one look
+   too many. */
 .food-hand {
   display: flex;
-  gap: 6px;
+  gap: 8px;
   overflow-x: auto;
-  padding: 4px 2px;
+  padding: 6px 4px;
   margin-top: 4px;
 }
+
 .food-hand .pick {
   flex: 0 0 auto;
+  min-width: 40px;
+  font-size: 24px;
+  line-height: 1.2;
+}
+
+/* Under the d-pad, where the thumb already is. */
+.pause-row {
+  display: flex;
+  justify-content: center;
+  margin-top: 12px;
 }
