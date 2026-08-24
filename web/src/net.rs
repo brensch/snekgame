@@ -496,6 +496,31 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
 }
 
 thread_local! {
+    /// Requests already taken up. Each one is sent three times — twice as a
+    /// datagram and once on the stream — so a lost packet cannot hold it up.
+    /// Only the copy that gets here first is worth searching.
+    static HANDLED: RefCell<std::collections::VecDeque<u64>> =
+        RefCell::new(std::collections::VecDeque::new());
+}
+
+/// True the first time this request is seen, false for its other copies.
+fn first_sighting(request_id: u64) -> bool {
+    HANDLED.with(|h| {
+        let mut h = h.borrow_mut();
+        if h.contains(&request_id) {
+            return false;
+        }
+        h.push_back(request_id);
+        // A handful of ticks is plenty: copies arrive within milliseconds of
+        // each other, and ids only ever go up.
+        while h.len() > 32 {
+            h.pop_front();
+        }
+        true
+    })
+}
+
+thread_local! {
     /// Worst gap between when a 50ms heartbeat should have run and when it
     /// did. Nothing else can see this: while the thread is busy drawing, an
     /// arriving request just sits in the queue, and every timing we take
@@ -708,6 +733,9 @@ fn apply(store: Store, msg: ServerMsg) {
             // benchmarks, so it is never assigned a bot in the first place
             // — and if one somehow arrives, staying silent makes the server
             // hand that bot to another phone.
+            if !first_sighting(request_id) {
+                return; // another copy of this request got here first
+            }
             if turn.turn_number < LATEST_TURN.with(|c| c.get()) {
                 web_sys::console::debug_1(&JsValue::from_str(&format!(
                     "compute skipped as stale bot={bot_id} turn={}",

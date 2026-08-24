@@ -9,6 +9,7 @@ use wtransport::{ClientConfig, Connection, Endpoint, Identity, RecvStream, SendS
 
 struct Client {
     conn: Connection,
+    seen_requests: std::collections::HashSet<u64>,
     send: SendStream,
     /// Stream + datagram messages merged by reader tasks (cancel-safe).
     rx: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
@@ -88,7 +89,7 @@ impl Client {
                 }
             }
         });
-        Client { conn, send, rx }
+        Client { conn, seen_requests: std::collections::HashSet::new(), send, rx }
     }
 
     async fn control(&mut self, msg: &ClientMsg) {
@@ -96,11 +97,25 @@ impl Client {
     }
 
     /// Next message from either the control stream or a datagram.
+    /// Next message, with repeat copies of a compute request dropped. The
+    /// server deliberately sends each request three times — twice as a
+    /// datagram and once on the stream — so that a lost packet cannot delay
+    /// it. A real client takes up the first copy and ignores the rest; a
+    /// test that answered all three would be answering a request that is no
+    /// longer outstanding and reading its own echo as a fresh one.
     async fn next_msg(&mut self) -> ServerMsg {
-        tokio::time::timeout(Duration::from_secs(15), self.rx.recv())
-            .await
-            .expect("timed out waiting for server message")
-            .expect("connection closed")
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(15), self.rx.recv())
+                .await
+                .expect("timed out waiting for server message")
+                .expect("connection closed");
+            if let ServerMsg::ComputeRequest { request_id, .. } = &msg {
+                if !self.seen_requests.insert(*request_id) {
+                    continue;
+                }
+            }
+            return msg;
+        }
     }
 }
 
@@ -898,4 +913,50 @@ async fn pausing_holds_the_game_and_food_is_recorded() {
         }
     }
     assert!(resumed, "game never resumed after the hold was lifted");
+}
+
+/// A compute request only escapes head-of-line blocking if it fits in one
+/// datagram — oversized ones fall back to the stream, which is the thing
+/// being avoided. A late-game board is the case that matters: long snakes
+/// are what make the message big, and are exactly when misses hurt.
+#[test]
+fn a_compute_request_fits_in_one_datagram() {
+    use snek_shared::protocol::ServerMsg;
+
+    // The shape the real games have: 13x13, four snakes, long ones. Game
+    // #203 ended with a snake 26 segments long.
+    let config = GameConfig {
+        board_width: 13,
+        board_height: 13,
+        tick_ms: 500,
+        food_emoji: "🍩".to_string(),
+    };
+    let ids: Vec<snek_shared::PlayerId> =
+        (0..4).map(|i| format!("bot-{i}").into()).collect();
+    let mut engine = snek_shared::Engine::new(config.clone(), ids.clone(), 7);
+    let mut turn = engine.first_turn();
+    // Grow everyone to a realistic late-game length.
+    for (_, snake) in turn.snakes.iter_mut() {
+        let head = snake[0];
+        *snake = (0..30).map(|i| head.saturating_sub(i)).collect();
+    }
+
+    let msg = ServerMsg::ComputeRequest {
+        request_id: u64::MAX,
+        bot_id: ids[0].clone(),
+        bot_name: "a reasonably long bot name".to_string(),
+        config,
+        turn,
+        think_ms: 250,
+        nonce: u64::MAX,
+    };
+    let size = postcard::to_allocvec(&msg).unwrap().len();
+    // QUIC datagrams over IPv6 with room for headers: ~1200 bytes is the
+    // conservative floor any path should manage.
+    println!("late-game compute request: {size} bytes");
+    assert!(
+        size <= 1_100,
+        "compute request is {size} bytes and will fall back to the stream, \
+         where one lost packet delays every request behind it"
+    );
 }

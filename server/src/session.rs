@@ -1219,18 +1219,26 @@ impl SessionActor {
                 .find(|p| p.id == *bot_id)
                 .map(|p| p.name.clone())
                 .unwrap_or_default();
-            requests.push((
-                conn_id,
-                control_frame(&ServerMsg::ComputeRequest {
-                    request_id,
-                    bot_id: bot_id.clone(),
-                    bot_name,
-                    config: self.config.clone(),
-                    turn: turn.clone(),
-                    think_ms,
-                    nonce,
-                }),
-            ));
+            // Both ways, datagram first. A request is the last
+            // latency-critical message that rode the reliable stream alone,
+            // and one lost packet there head-of-line blocks every request
+            // behind it: three bots stalled by an identical 570ms, answered
+            // in 115ms of thinking, and the tick was long gone. A datagram
+            // cannot block another datagram. The stream copy still follows
+            // as the guarantee, and the client ignores whichever arrives
+            // second.
+            let bytes: std::sync::Arc<[u8]> = encode(&ServerMsg::ComputeRequest {
+                request_id,
+                bot_id: bot_id.clone(),
+                bot_name,
+                config: self.config.clone(),
+                turn: turn.clone(),
+                think_ms,
+                nonce,
+            })
+            .into();
+            requests.push((conn_id, Frame::Snapshot(bytes.clone())));
+            requests.push((conn_id, Frame::Control(bytes)));
         }
         for (conn_id, frame) in requests {
             self.send_to(conn_id, frame).await;
