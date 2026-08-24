@@ -152,6 +152,7 @@ async fn two_players_play_a_full_game() {
             board_width: 11,
             board_height: 11,
             tick_ms: 250,
+            food_emoji: "🍕".to_string(),
         }))
         .await;
     alice.control(&ClientMsg::SetReady(true)).await;
@@ -323,6 +324,7 @@ async fn distributed_compute_round_trip() {
             board_width: 11,
             board_height: 11,
             tick_ms: 250,
+            food_emoji: "🍕".to_string(),
         }))
         .await;
     // Become a compute host, add a bot, go.
@@ -425,6 +427,7 @@ async fn tick_cadence_is_steady() {
             board_width: 17,
             board_height: 17,
             tick_ms: 500,
+            food_emoji: "🍕".to_string(),
         }))
         .await;
     // A bot adds per-tick work (request issuance) without needing a host.
@@ -497,6 +500,7 @@ async fn sleeping_host_pauses_the_game() {
             board_width: 11,
             board_height: 11,
             tick_ms: 200,
+            food_emoji: "🍕".to_string(),
         }))
         .await;
     alice
@@ -617,6 +621,7 @@ async fn a_silent_host_recovers_on_keepalives_alone() {
             board_width: 11,
             board_height: 11,
             tick_ms: 200,
+            food_emoji: "🍕".to_string(),
         }))
         .await;
     alice
@@ -693,6 +698,7 @@ async fn answering_late_shrinks_the_thinking_window() {
             board_width: 11,
             board_height: 11,
             tick_ms: 200,
+            food_emoji: "🍕".to_string(),
         }))
         .await;
     alice
@@ -778,6 +784,7 @@ async fn the_thinking_window_is_at_most_half_the_tick() {
             board_width: 11,
             board_height: 11,
             tick_ms,
+            food_emoji: "🍕".to_string(),
         }))
         .await;
     alice
@@ -808,4 +815,87 @@ async fn the_thinking_window_is_at_most_half_the_tick() {
         }
     }
     assert!(saw > 0, "never saw a compute request");
+}
+
+/// Pause holds the game where it is, and the food choice made in the lobby
+/// is what the game is played and recorded with.
+#[tokio::test]
+async fn pausing_holds_the_game_and_food_is_recorded() {
+    let dir = std::env::temp_dir().join(format!("snek-pause-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("pause.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let (_, registry) = snek_server::build(&db_path);
+    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    let mut alice =
+        Client::connect(wt_port, "pause-test", "alice-secret-0000", info("alice")).await;
+    alice
+        .control(&ClientMsg::Configure(GameConfig {
+            board_width: 11,
+            board_height: 11,
+            tick_ms: 250,
+            food_emoji: "🌮".to_string(),
+        }))
+        .await;
+    alice.control(&ClientMsg::SetReady(true)).await;
+    let mut bob = Client::connect(wt_port, "pause-test", "bob-secret-000000", info("bob")).await;
+    bob.control(&ClientMsg::SetReady(true)).await;
+    alice.control(&ClientMsg::Start).await;
+
+    // Let it get going, and check the food we chose is what is in play.
+    let mut turns = 0u32;
+    let mut saw_food = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline && turns < 3 {
+        match tokio::time::timeout(Duration::from_millis(600), alice.next_msg()).await {
+            Ok(ServerMsg::Turn(_)) => turns += 1,
+            Ok(ServerMsg::GameStart { config, .. }) => saw_food = Some(config.food_emoji),
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert_eq!(saw_food.as_deref(), Some("🌮"), "game started with the wrong food");
+    assert!(turns >= 1, "game never got going");
+
+    alice.control(&ClientMsg::SetPaused(true)).await;
+    let mut while_held = 0u32;
+    let deadline = std::time::Instant::now() + Duration::from_millis(1_500);
+    while std::time::Instant::now() < deadline {
+        // Traffic while held must not sneak the clock back on.
+        alice.control(&ClientMsg::Ping(3)).await;
+        match tokio::time::timeout(Duration::from_millis(300), alice.next_msg()).await {
+            Ok(ServerMsg::Turn(_)) => while_held += 1,
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(while_held <= 1, "game kept playing while held: {while_held} turns");
+
+    // Bob sees the hold too — it is the game's state, not one screen's.
+    let mut bob_saw_pause = false;
+    for _ in 0..40 {
+        match tokio::time::timeout(Duration::from_millis(100), bob.next_msg()).await {
+            Ok(ServerMsg::Paused(true)) => bob_saw_pause = true,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(bob_saw_pause, "the other player was never told the game was held");
+
+    alice.control(&ClientMsg::SetPaused(false)).await;
+    let mut resumed = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && !resumed {
+        if let Ok(ServerMsg::Turn(_)) =
+            tokio::time::timeout(Duration::from_millis(400), alice.next_msg()).await
+        {
+            resumed = true;
+        }
+    }
+    assert!(resumed, "game never resumed after the hold was lifted");
 }

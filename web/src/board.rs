@@ -4,7 +4,8 @@
 //! - checkerboard field, full-bleed and square to maximise size on mobile
 //! - sneks as one continuous rounded path with the player's emoji as head,
 //!   health on the neck, stacked count on the tail (tac logic)
-//! - 🎃 food; deaths leave 💀 trails but keep the dead player's emoji head
+//! - food is whatever the lobby picked; deaths leave 💀 trails but keep the
+//!   dead player's emoji head
 use leptos::prelude::*;
 use snek_shared::{GameConfig, PlayerId, PlayerProfile, Pos, Turn};
 use std::collections::{HashMap, HashSet};
@@ -62,7 +63,7 @@ pub fn board_view(
     // --- food stays emoji, like tac --------------------------------------
     let mut food = String::new();
     for &pos in &turn.food {
-        food.push_str(&emoji_text(cx(pos), cy(pos), 0.8, "🎃"));
+        food.push_str(&emoji_text(cx(pos), cy(pos), 0.8, &config.food_emoji));
     }
 
     // --- sneks ------------------------------------------------------------

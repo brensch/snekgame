@@ -89,7 +89,7 @@ impl Engine {
     /// Re-run a stored game from its inputs. Returns the reconstructed turns.
     pub fn replay(record: &GameRecord) -> Vec<Turn> {
         let players: Vec<PlayerId> = record.players.iter().map(|p| p.id.clone()).collect();
-        let mut engine = Engine::new(record.config, players, record.seed);
+        let mut engine = Engine::new(record.config.clone(), players, record.seed);
         let mut turns = vec![engine.first_turn()];
         for recorded in &record.turns[1..] {
             let next = engine.next_turn(turns.last().unwrap(), &recorded.moves);
@@ -530,6 +530,7 @@ mod tests {
             board_width: 13,
             board_height: 13,
             tick_ms: 1000,
+            food_emoji: DEFAULT_FOOD.to_string(),
         }
     }
 
@@ -548,7 +549,7 @@ mod tests {
     fn start_food_follows_battlesnake_rules() {
         let cfg = config();
         let players: Vec<PlayerId> = (0..4).map(|i| format!("p{i}")).collect();
-        let mut e = Engine::new(cfg, players, 3);
+        let mut e = Engine::new(cfg.clone(), players, 3);
         let t = e.first_turn();
         let (w, h) = (cfg.board_width as i16, cfg.board_height as i16);
         let (cx, cy) = ((w - 1) / 2, (h - 1) / 2);
@@ -666,7 +667,7 @@ mod tests {
     #[test]
     fn eating_food_grows_and_heals() {
         let cfg = config();
-        let mut e = Engine::new(cfg, vec!["solo".into()], 7);
+        let mut e = Engine::new(cfg.clone(), vec!["solo".into()], 7);
         let t1 = e.first_turn();
         // Walk the snek onto a known food cell.
         let food = t1.food[0];

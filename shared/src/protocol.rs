@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 
 /// The client-editable part of a profile. The public player id is derived
 /// server-side (a hash of the client's private secret), so a client can never
@@ -50,6 +50,8 @@ pub enum ClientMsg {
     /// Remove a player (or bot) from the lobby (anyone can kick, like tac).
     Kick(PlayerId),
     Ping(u32),
+    /// Hold the game where it is, or let it run on again.
+    SetPaused(bool),
     /// Whether this device can currently compute. A backgrounded page or
     /// a locked screen suspends its workers, so it must say so — otherwise
     /// its bots quietly hold their heading into a wall.
@@ -144,6 +146,8 @@ pub enum ServerMsg {
     },
     Error(String),
     Pong(u32),
+    /// The game is held, or running again.
+    Paused(bool),
 }
 
 pub fn encode<T: Serialize>(msg: &T) -> Vec<u8> {

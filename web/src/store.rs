@@ -45,6 +45,9 @@ pub struct Store {
     pub game: RwSignal<Option<GameView>>,
     /// History scrubber position when reviewing a finished game (None = live).
     pub view_turn: RwSignal<Option<usize>>,
+    /// Someone has held the game. Server-owned: we only ever mirror what it
+    /// tells us, so every screen agrees on whether the clock is running.
+    pub paused: RwSignal<bool>,
     /// The direction we're currently steering (highlights the d-pad).
     /// Starts at the clockwise default; corrected from each resolved turn.
     pub selected_dir: RwSignal<Option<Dir>>,
@@ -69,6 +72,7 @@ impl Store {
             sessions: RwSignal::new(None),
             game: RwSignal::new(None),
             view_turn: RwSignal::new(None),
+            paused: RwSignal::new(false),
             selected_dir: RwSignal::new(None),
             saved_id: RwSignal::new(None),
             countdown_ends: RwSignal::new(0.0),

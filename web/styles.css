@@ -507,3 +507,16 @@ tr.clickable {
 .shake {
   animation: shake 0.5s ease infinite;
 }
+
+/* The lobby's hand of foods. Same cells as the profile emoji grid, but a
+   single row that scrolls — it is a choice, not a catalogue. */
+.food-hand {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 4px 2px;
+  margin-top: 4px;
+}
+.food-hand .pick {
+  flex: 0 0 auto;
+}

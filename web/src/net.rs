@@ -550,9 +550,10 @@ async fn benchmark_sims_per_sec(generation: u64) -> Option<u32> {
         board_width: 13,
         board_height: 13,
         tick_ms: 1000,
+        food_emoji: snek_shared::DEFAULT_FOOD.to_string(),
     };
     let a: snek_shared::PlayerId = "bench-a".into();
-    let mut engine = Engine::new(config, vec![a.clone(), "bench-b".into()], 1);
+    let mut engine = Engine::new(config.clone(), vec![a.clone(), "bench-b".into()], 1);
     let turn = engine.first_turn();
 
     // One timed search on the worker: it both proves a worker can run here
@@ -641,7 +642,7 @@ fn apply(store: Store, msg: ServerMsg) {
             // paying that inside a move's deadline is what makes the first
             // ticks of a game miss.
             for bot in players.iter().filter(|p| snek_shared::is_bot(&p.id)) {
-                let (cfg, t, id) = (config, turn.clone(), bot.id.clone());
+                let (cfg, t, id) = (config.clone(), turn.clone(), bot.id.clone());
                 spawn_local(async move {
                     let _ = crate::botworker::compute(cfg, t, id, 1, 0).await;
                 });
@@ -651,10 +652,12 @@ fn apply(store: Store, msg: ServerMsg) {
             store.countdown_ends.set(now() + countdown_ms as f64);
             // Pre-select the clockwise default heading on the d-pad.
             let me = store.me.get_untracked();
+            // A fresh game always runs; never inherit the last one's hold.
+            store.paused.set(false);
             store.selected_dir.set(
                 turn.snakes
                     .get(&me)
-                    .map(|s| snek_shared::clockwise_start_dir(&config, s[0])),
+                    .map(|s| snek_shared::clockwise_start_dir(&config.clone(), s[0])),
             );
             store.game.set(Some(GameView {
                 config,
@@ -717,7 +720,7 @@ fn apply(store: Store, msg: ServerMsg) {
                 let requested_for = turn.turn_number;
                 let arrived = now();
                 let (dir, tm) = match crate::botworker::compute(
-                    config,
+                    config.clone(),
                     turn.clone(),
                     bot_id.clone(),
                     think_ms,
@@ -795,6 +798,7 @@ fn apply(store: Store, msg: ServerMsg) {
         }
         ServerMsg::GameSaved { id, .. } => store.saved_id.set(Some(id)),
         ServerMsg::Error(e) => store.error.set(Some(e)),
+        ServerMsg::Paused(paused) => store.paused.set(paused),
         ServerMsg::Pong(_) => {}
     }
 }

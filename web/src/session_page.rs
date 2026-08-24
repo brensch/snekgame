@@ -3,6 +3,7 @@
 
 use crate::board::board_view;
 use crate::net;
+use crate::palette;
 use crate::store::{ConnStatus, GameView, Store};
 use leptos::prelude::*;
 use snek_shared::protocol::{ClientMsg, LobbyState};
@@ -61,6 +62,7 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
 
     let current_width = lobby.config.board_width;
     let current_tick = lobby.config.tick_ms;
+    let current_food = lobby.config.food_emoji.clone();
 
     let not_ready: Vec<String> = humans
         .iter()
@@ -117,6 +119,61 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
         .into_any()
     };
 
+    // The food on offer this round. Shuffling deals a new hand of snacks;
+    // whatever is currently picked always stays in it.
+    let food_hand = RwSignal::new(palette::random_food_set(8, &current_food));
+    let food_for_board = current_food.clone();
+    let food_for_speed = current_food.clone();
+    let food_now = current_food.clone();
+    let food_for_shuffle = current_food.clone();
+    let food_picker = view! {
+        <div class="row" style="margin-top: 10px; align-items: center;">
+            <label style="flex: 1 1 auto;">
+                "Food"
+                <div class="food-hand">
+                    {move || {
+                        let picked = food_now.clone();
+                        food_hand
+                            .get()
+                            .into_iter()
+                            .map(|f| {
+                                let is_picked = f == picked;
+                                let send = f.clone();
+                                view! {
+                                    <div
+                                        class="pick"
+                                        class:selected=is_picked
+                                        on:click=move |_| {
+                                            net::send(
+                                                &ClientMsg::Configure(GameConfig {
+                                                    board_width: current_width,
+                                                    board_height: current_width,
+                                                    tick_ms: current_tick,
+                                                    food_emoji: send.clone(),
+                                                }),
+                                            );
+                                        }
+                                    >
+                                        {f.clone()}
+                                    </div>
+                                }
+                            })
+                            .collect_view()
+                    }}
+                </div>
+            </label>
+            <button
+                class="mini"
+                style="flex: 0 0 auto;"
+                on:click=move |_| {
+                    food_hand.set(palette::random_food_set(8, &food_for_shuffle));
+                }
+            >
+                "🎲 shuffle"
+            </button>
+        </div>
+    };
+
     let config_row = view! {
         <div class="row">
             <label>
@@ -127,6 +184,7 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                         board_width: val,
                         board_height: val,
                         tick_ms: current_tick,
+                        food_emoji: food_for_board.clone(),
                     }));
                 }>
                     {BOARD_SIZES
@@ -149,6 +207,7 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                         board_width: current_width,
                         board_height: current_width,
                         tick_ms: val,
+                        food_emoji: food_for_speed.clone(),
                     }));
                 }>
                     {SPEEDS
@@ -163,6 +222,12 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                         .collect_view()}
                 </select>
             </label>
+        </div>
+    };
+    let config_row = view! {
+        <div>
+            {config_row}
+            {food_picker}
         </div>
     };
 
@@ -228,7 +293,8 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
             {config_row}
             {move || store.show_bot_picker.get().then(bot_picker)}
             <p class="footnote" style="margin-top: 18px;">
-                "Steer with swipes, taps, arrows or WASD. Eat 🎃 to grow and "
+                "Steer with swipes, taps, arrows or WASD. Eat " {current_food.clone()}
+                " to grow and "
                 "refill health; you lose 1 health per turn. Walls, bodies and "
                 "bigger heads kill you. Outlive everyone."
             </p>
@@ -371,6 +437,21 @@ fn game_view(game: GameView) -> impl IntoView {
     let i_died = !spectating && !over && !last_turn.alive.contains(&me);
     let show_dpad = !over && !spectating && !i_died;
 
+    // Anyone in the game can call a halt — it is a game among friends, not a
+    // tournament. The server owns the state, so every screen agrees.
+    let pause_button = (!over && !show_countdown).then(|| {
+        view! {
+            <button
+                class="mini"
+                on:click=move |_| {
+                    net::send(&ClientMsg::SetPaused(!store.paused.get()));
+                }
+            >
+                {move || if store.paused.get() { "▶️ resume" } else { "⏸️ pause" }}
+            </button>
+        }
+    });
+
     // Results, ranked, once the game is over — under a rain of the winner's
     // emoji, as is tradition.
     let results = over.then(|| {
@@ -449,11 +530,15 @@ fn game_view(game: GameView) -> impl IntoView {
 
     view! {
         <div>
-            <p>
-                "Turn " {turn.turn_number}
-                {spectating.then_some(" — spectating (next game starts from the lobby)")}
-                {i_died.then_some(" — you died 💀 watch the rest")}
-            </p>
+            <div class="row" style="align-items: center;">
+                <p style="flex: 1 1 auto; margin: 0;">
+                    "Turn " {turn.turn_number}
+                    {move || store.paused.get().then_some(" — held ⏸️")}
+                    {spectating.then_some(" — spectating (next game starts from the lobby)")}
+                    {i_died.then_some(" — you died 💀 watch the rest")}
+                </p>
+                {pause_button}
+            </div>
             {board_view(game.config, game.players.clone(), &turn, me.clone(), on_cell)}
             {show_dpad.then(dpad)}
             {countdown}

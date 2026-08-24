@@ -15,13 +15,20 @@ pub struct PlayerProfile {
     pub colour: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GameConfig {
     pub board_width: u8,
     pub board_height: u8,
     /// Real-time tick interval in milliseconds.
     pub tick_ms: u32,
+    /// What the food looks like this game. Chosen in the lobby and stored
+    /// with the record, so a replay shows what the players actually ate.
+    pub food_emoji: String,
 }
+
+/// What food was before it was choosable, and what every game played up to
+/// then is stamped with.
+pub const DEFAULT_FOOD: &str = "🎃";
 
 impl Default for GameConfig {
     fn default() -> Self {
@@ -29,6 +36,7 @@ impl Default for GameConfig {
         GameConfig {
             board_width: 13,
             board_height: 13,
+            food_emoji: DEFAULT_FOOD.to_string(),
             tick_ms: 1000,
         }
     }
@@ -43,6 +51,9 @@ impl GameConfig {
         (7..=25).contains(&self.board_width)
             && (7..=25).contains(&self.board_height)
             && (250..=10_000).contains(&self.tick_ms)
+            // One glyph, and a glyph can be several chars (skin tones, ZWJ).
+            && !self.food_emoji.is_empty()
+            && self.food_emoji.chars().count() <= 8
     }
 
     /// Perimeter wall cells. Walls are derived, not stored — and not drawn:

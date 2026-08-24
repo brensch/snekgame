@@ -294,6 +294,10 @@ struct SessionActor {
     /// bot id -> conn currently computing for it.
     bot_hosts: HashMap<PlayerId, u64>,
     /// outstanding compute requests: id -> (bot, conn, inputs for audit).
+    /// Held by a player rather than by circumstance. Distinct from the
+    /// freezes the session does on its own (nobody watching, nobody able to
+    /// think) — those resume themselves, and this one must not.
+    paused: bool,
     pending_compute: HashMap<u64, PendingCompute>,
     /// Requests whose tick has already resolved, kept briefly so a late
     /// answer is still recognisable. Dropping them on sight made lateness
@@ -326,6 +330,7 @@ impl SessionActor {
             ready: HashSet::new(),
             game: None,
             bot_hosts: HashMap::new(),
+            paused: false,
             pending_compute: HashMap::new(),
             retired_compute: std::collections::VecDeque::new(),
             next_request_id: 1,
@@ -418,17 +423,14 @@ impl SessionActor {
                         strikes: 0,
                     },
                 );
-                // A watcher arriving un-pauses a game frozen for lack of one.
-                if self.game.is_some() && self.next_tick.is_none() {
-                    self.next_tick =
-                        Some(Instant::now() + Duration::from_millis(self.config.tick_ms as u64));
-                }
+                // A watcher arriving restarts a game frozen for lack of one.
+                self.resume_tick();
                 self.upsert_lobby_player(profile);
                 // Late joiner while a game runs: catch them up so they can
                 // spectate (or resume, if they are in it).
                 if let Some(game) = &self.game {
                     let frame = control_frame(&ServerMsg::GameInProgress {
-                        config: self.config,
+                        config: self.config.clone(),
                         players: game.players.clone(),
                         turns: game.turns.clone(),
                     });
@@ -519,6 +521,19 @@ impl SessionActor {
                     self.broadcast_lobby().await;
                 }
             }
+            ClientMsg::SetPaused(paused) => {
+                if self.game.is_some() && self.paused != paused {
+                    self.paused = paused;
+                    tracing::info!(session = %self.name, paused, "game hold changed");
+                    self.broadcast(Frame::Control(encode(&ServerMsg::Paused(paused)).into()))
+                        .await;
+                    if paused {
+                        self.next_tick = None;
+                    } else {
+                        self.resume_tick();
+                    }
+                }
+            }
             ClientMsg::Start => self.start_game().await,
             ClientMsg::Move(dir) => {
                 if let Some(game) = &mut self.game {
@@ -578,12 +593,8 @@ impl SessionActor {
                     conn.declared_available = can_compute;
                 }
                 self.assign_bots();
-                // A host coming back can restart a game paused for want of
-                // one.
-                if can_compute && self.game.is_some() && self.next_tick.is_none() {
-                    self.next_tick = Some(
-                        Instant::now() + Duration::from_millis(self.config.tick_ms as u64),
-                    );
+                if can_compute {
+                    self.resume_tick();
                 }
             }
             ClientMsg::BotMove { request_id, dir, proof, tm } => {
@@ -767,6 +778,7 @@ impl SessionActor {
         if self.game.is_some() || self.lobby.is_empty() {
             return;
         }
+        self.paused = false;
         // Bots are always ready; every human must be.
         let all_ready = self
             .lobby
@@ -780,11 +792,11 @@ impl SessionActor {
         let players = self.lobby.clone();
         let ids: Vec<PlayerId> = players.iter().map(|p| p.id.clone()).collect();
         let seed = rand::random::<u64>();
-        let mut engine = Engine::new(self.config, ids, seed);
+        let mut engine = Engine::new(self.config.clone(), ids, seed);
         let first = engine.first_turn();
 
         let frame = control_frame(&ServerMsg::GameStart {
-            config: self.config,
+            config: self.config.clone(),
             players: players.clone(),
             turn: first.clone(),
             countdown_ms: COUNTDOWN_MS,
@@ -822,6 +834,12 @@ impl SessionActor {
             self.next_tick = None;
             return;
         };
+
+        // Held on purpose.
+        if self.paused {
+            self.next_tick = None;
+            return;
+        }
 
         // Nobody watching: the bots don't play. Freeze the tick loop; the
         // next human connection resumes it.
@@ -954,7 +972,7 @@ impl SessionActor {
         self.bot_hosts.clear();
 
         let record = GameRecord {
-            config: self.config,
+            config: self.config.clone(),
             players: game.players.clone(),
             seed: game.engine.initial_seed(),
             turns: game.turns.clone(),
@@ -1075,9 +1093,16 @@ impl SessionActor {
             self.bot_hosts
                 .insert(bot_id.clone(), hosts[i % hosts.len()].0);
         }
-        // A host appearing (or waking) restarts a game paused for want of
+        // A host appearing (or waking) restarts a game frozen for want of
         // one.
-        if self.game.is_some() && self.next_tick.is_none() && !self.bot_hosts.is_empty() {
+        if !self.bot_hosts.is_empty() {
+            self.resume_tick();
+        }
+    }
+
+    /// Start the clock again, unless someone has deliberately stopped it.
+    fn resume_tick(&mut self) {
+        if self.game.is_some() && self.next_tick.is_none() && !self.paused {
             self.next_tick =
                 Some(Instant::now() + Duration::from_millis(self.config.tick_ms as u64));
         }
@@ -1200,7 +1225,7 @@ impl SessionActor {
                     request_id,
                     bot_id: bot_id.clone(),
                     bot_name,
-                    config: self.config,
+                    config: self.config.clone(),
                     turn: turn.clone(),
                     think_ms,
                     nonce,
@@ -1216,7 +1241,7 @@ impl SessionActor {
         let state = LobbyState {
             session: self.name.clone(),
             game_running: self.game.is_some(),
-            config: self.config,
+            config: self.config.clone(),
             players: self.lobby.clone(),
             ready: self.ready.iter().cloned().collect(),
             last_winners: self.last_winners.clone(),

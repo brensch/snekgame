@@ -1032,6 +1032,7 @@ mod tests {
             board_width: 13,
             board_height: 13,
             tick_ms: 1000,
+            food_emoji: DEFAULT_FOOD.to_string(),
         }
     }
 
@@ -1217,6 +1218,7 @@ mod tests {
             board_width: size,
             board_height: size,
             tick_ms: 1000,
+            food_emoji: DEFAULT_FOOD.to_string(),
         }
     }
 
@@ -1234,7 +1236,7 @@ mod tests {
         let cfg = board_config(board);
         let a: PlayerId = "a".into();
         let b: PlayerId = "b".into();
-        let mut engine = Engine::new(cfg, vec![a.clone(), b.clone()], seed);
+        let mut engine = Engine::new(cfg.clone(), vec![a.clone(), b.clone()], seed);
         let mut turn = engine.first_turn();
         for _ in 0..250 {
             if turn.game_over() {
@@ -1329,7 +1331,7 @@ mod tests {
         let cfg = arena_config();
         let a: PlayerId = "a".into();
         let b: PlayerId = "b".into();
-        let mut engine = Engine::new(cfg, vec![a.clone(), b.clone()], 7);
+        let mut engine = Engine::new(cfg.clone(), vec![a.clone(), b.clone()], 7);
         let mut turn = engine.first_turn();
         let (mut same, mut diff) = (0, 0);
         for _ in 0..60 {
