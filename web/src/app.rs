@@ -325,8 +325,13 @@ fn normalize_word(raw: &str) -> String {
 fn profile_form() -> impl IntoView {
     let store = Store::use_store();
     let draft = RwSignal::new(store.profile.get_untracked());
-    // A shufflable window into the (large) emoji list.
-    let shown = RwSignal::new(palette::random_emoji_set(24));
+    // A shufflable window into the (large) emoji list. It changes only when
+    // shuffle is pressed — picking from it must leave it alone, or the cell
+    // you were aiming at moves as you tap.
+    let shown = RwSignal::new(palette::random_emoji_set(
+        palette::EMOJI_HAND,
+        &draft.get_untracked().emoji,
+    ));
 
     let save = move || {
         let p = draft.get_untracked();
@@ -357,7 +362,15 @@ fn profile_form() -> impl IntoView {
                     <button
                         class="mini"
                         style="flex: 0 0 auto;"
-                        on:click=move |_| shown.set(palette::random_emoji_set(24))
+                        on:click=move |_| {
+                            shown
+                                .set(
+                                    palette::random_emoji_set(
+                                        palette::EMOJI_HAND,
+                                        &draft.get_untracked().emoji,
+                                    ),
+                                )
+                        }
                     >
                         "🎲 shuffle"
                     </button>
@@ -365,13 +378,8 @@ fn profile_form() -> impl IntoView {
                 <div class="emoji-grid">
                     {move || {
                         let current = draft.get().emoji;
-                        let mut list = shown.get();
-                        // Keep whatever is selected visible across shuffles.
-                        if !list.contains(&current) {
-                            list.insert(0, current.clone());
-                            list.pop();
-                        }
-                        list.into_iter()
+                        palette::hand_showing(shown.get(), &current, palette::EMOJI_HAND)
+                            .into_iter()
                             .map(|e| {
                                 let sel = e.clone();
                                 let pick = e.clone();

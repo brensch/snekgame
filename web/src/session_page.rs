@@ -119,9 +119,10 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
         .into_any()
     };
 
-    // The food on offer this round. Shuffling deals a new hand of snacks;
-    // whatever is currently picked always stays in it.
-    let food_hand = RwSignal::new(palette::random_food_set(8, &current_food));
+    // The food on offer this round, held in the store so that picking from
+    // it doesn't re-deal it. Shuffling deals a new hand; whatever is
+    // currently picked always survives into it, at the front.
+    let food_hand = store.food_hand;
     let food_for_board = current_food.clone();
     let food_for_speed = current_food.clone();
     let food_now = current_food.clone();
@@ -136,7 +137,14 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                     class="mini"
                     style="flex: 0 0 auto;"
                     on:click=move |_| {
-                        food_hand.set(palette::random_food_set(8, &food_for_shuffle));
+                        food_hand
+                            .set(
+                                palette::shuffled_with(
+                                    palette::FOODS,
+                                    palette::FOOD_HAND,
+                                    &food_for_shuffle,
+                                ),
+                            );
                     }
                 >
                     "🎲 shuffle"
@@ -146,8 +154,7 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                 <div class="food-hand">
                     {move || {
                         let picked = food_now.clone();
-                        food_hand
-                            .get()
+                        palette::hand_showing(food_hand.get(), &picked, palette::FOOD_HAND)
                             .into_iter()
                             .map(|f| {
                                 let is_picked = f == picked;

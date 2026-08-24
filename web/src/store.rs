@@ -45,6 +45,11 @@ pub struct Store {
     pub game: RwSignal<Option<GameView>>,
     /// History scrubber position when reviewing a finished game (None = live).
     pub view_turn: RwSignal<Option<usize>>,
+    /// The lobby's hand of foods. It lives here, not in the lobby view,
+    /// because that view is rebuilt every time anything in the lobby
+    /// changes — a hand held there would be re-dealt on every click,
+    /// including the click that picks from it.
+    pub food_hand: RwSignal<Vec<String>>,
     /// Someone has held the game. Server-owned: we only ever mirror what it
     /// tells us, so every screen agrees on whether the clock is running.
     pub paused: RwSignal<bool>,
@@ -72,6 +77,11 @@ impl Store {
             sessions: RwSignal::new(None),
             game: RwSignal::new(None),
             view_turn: RwSignal::new(None),
+            food_hand: RwSignal::new(crate::palette::shuffled_with(
+                crate::palette::FOODS,
+                crate::palette::FOOD_HAND,
+                snek_shared::DEFAULT_FOOD,
+            )),
             paused: RwSignal::new(false),
             selected_dir: RwSignal::new(None),
             saved_id: RwSignal::new(None),

@@ -510,28 +510,28 @@ tr.clickable {
   animation: shake 0.5s ease infinite;
 }
 
-/* The lobby's hand of foods: one scrolling row, since it is a choice and
-   not a catalogue. The picks themselves are the app's emoji-picker cells,
-   sized up for a thumb — a second look for the same job would be one look
-   too many. */
+/* The lobby's hand of foods is the app's emoji grid, eight across. It must
+   never scroll sideways — a choice you have to swipe to see is a choice you
+   won't make. */
 .food-hand {
-  display: flex;
-  gap: 8px;
-  overflow-x: auto;
-  padding: 6px 4px;
+  display: grid;
+  /* minmax(0, 1fr) rather than 1fr: a plain 1fr column will not shrink below
+     its content, so eight emoji at full size push the row wider than the
+     screen and it scrolls. */
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 6px;
+  font-size: 22px;
   margin-top: 4px;
 }
 
 .food-hand .pick {
-  flex: 0 0 auto;
-  min-width: 40px;
-  font-size: 24px;
-  line-height: 1.2;
+  padding: 3px 0;
+  overflow: hidden;
 }
 
 /* Under the d-pad, where the thumb already is. */
 .pause-row {
   display: flex;
   justify-content: center;
-  margin-top: 12px;
+  margin-top: 26px;
 }
