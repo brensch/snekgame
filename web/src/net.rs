@@ -67,6 +67,18 @@ thread_local! {
     static LATEST_TURN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// Marker for the one automatic reload we allow ourselves.
+const RELOAD_KEY: &str = "snek-reloaded-at";
+const RELOAD_COOLDOWN_MS: f64 = 30_000.0;
+
+fn reloaded_recently() -> bool {
+    web_sys::window()
+        .and_then(|w| w.session_storage().ok().flatten())
+        .and_then(|s| s.get_item(RELOAD_KEY).ok().flatten())
+        .and_then(|v| v.parse::<f64>().ok())
+        .is_some_and(|at| now() - at < RELOAD_COOLDOWN_MS)
+}
+
 fn mark_rx() {
     LAST_RX.with(|c| c.set(now()));
 }
@@ -840,7 +852,25 @@ fn apply(store: Store, msg: ServerMsg) {
             });
         }
         ServerMsg::GameSaved { id, .. } => store.saved_id.set(Some(id)),
-        ServerMsg::Error(e) => store.error.set(Some(e)),
+        ServerMsg::Error(e) => {
+            // A version mismatch means this page is running code the server
+            // has moved past, and no amount of reconnecting will fix it —
+            // it just retries forever behind "Joining session…". Telling a
+            // stuck page to refresh itself is the only thing that works, and
+            // the shell is served no-cache so the reload picks up the new
+            // build. Once only: if a reload doesn't resolve it, looping
+            // would be worse than showing the error.
+            if e.contains("version") && !reloaded_recently() {
+                if let Some(w) = web_sys::window() {
+                    let _ = w.session_storage().map(|s| {
+                        s.map(|s| s.set_item(RELOAD_KEY, &now().to_string()))
+                    });
+                    let _ = w.location().reload();
+                    return;
+                }
+            }
+            store.error.set(Some(e));
+        }
         ServerMsg::Paused(paused) => store.paused.set(paused),
         ServerMsg::Pong(_) => {}
     }

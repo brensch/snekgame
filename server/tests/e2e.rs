@@ -1040,3 +1040,54 @@ async fn a_dropped_connection_keeps_its_seat() {
     }
     assert!(still_ready, "alice came back and had to ready up all over again");
 }
+
+/// A client running code the server has moved past must be told so, and
+/// told loudly enough that it can act. Retrying forever behind "Joining
+/// session…" is what a stale page did instead.
+#[tokio::test]
+async fn a_stale_client_is_told_to_refresh() {
+    let dir = std::env::temp_dir().join(format!("snek-stale-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("stale.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let (_, registry) = snek_server::build(&db_path);
+    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    let conn = wtransport::Endpoint::client(
+        wtransport::ClientConfig::builder()
+            .with_bind_default()
+            .with_no_cert_validation()
+            .build(),
+    )
+    .unwrap()
+    .connect(format!("https://127.0.0.1:{wt_port}"))
+    .await
+    .unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap().await.unwrap();
+
+    write_frame(
+        &mut send,
+        &ClientMsg::Join {
+            version: snek_shared::protocol::PROTOCOL_VERSION - 1,
+            session: "stale-test".to_string(),
+            secret: "stale-secret-0000".to_string(),
+            profile: info("stale"),
+        },
+    )
+    .await;
+
+    let msg = tokio::time::timeout(Duration::from_secs(5), read_stream_msg(&mut recv))
+        .await
+        .expect("server said nothing to a stale client — it would just hang");
+    match msg {
+        ServerMsg::Error(e) => assert!(
+            e.contains("version"),
+            "the refusal must name the reason so the page knows to reload: {e}"
+        ),
+        other => panic!("expected a version refusal, got {other:?}"),
+    }
+}

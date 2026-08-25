@@ -149,8 +149,19 @@ async fn join_session(
     info: snek_shared::protocol::ProfileInfo,
 ) -> anyhow::Result<()> {
     if version != PROTOCOL_VERSION {
+        tracing::info!(
+            client_version = version,
+            server_version = PROTOCOL_VERSION,
+            "turned away a stale client"
+        );
         let msg = ServerMsg::Error("protocol version mismatch — refresh the page".into());
         let _ = write_frame(&mut send, &encode(&msg)).await;
+        // Finish the stream and give it a moment to leave. Bailing straight
+        // after the write tears the connection down first, so the client
+        // learns nothing and retries forever behind "Joining session…" —
+        // the refusal has to survive the refusing.
+        let _ = send.finish().await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
         anyhow::bail!("version mismatch");
     }
     let session = normalize_session(&session).ok_or_else(|| anyhow::anyhow!("bad session"))?;

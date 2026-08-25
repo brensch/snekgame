@@ -107,6 +107,23 @@ async fn history_game(
     }
 }
 
+/// The shell must be revalidated every load; everything else it names is
+/// content-hashed and can be kept forever. Served without either header, a
+/// phone will hold the shell on heuristic caching alone, keep loading an
+/// old bundle from cache, and be turned away by the version check on every
+/// join — which looks like the site hanging rather than a stale page.
+const SHELL_CACHE: &str = "no-cache";
+const HASHED_CACHE: &str = "public, max-age=31536000, immutable";
+
+fn cache_policy(path: &str) -> &'static str {
+    // trunk stamps a content hash into every asset filename it emits.
+    if path.ends_with(".html") {
+        SHELL_CACHE
+    } else {
+        HASHED_CACHE
+    }
+}
+
 async fn static_handler(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
@@ -114,7 +131,10 @@ async fn static_handler(uri: Uri) -> Response {
         Some(file) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
             (
-                [(header::CONTENT_TYPE, mime.as_ref())],
+                [
+                    (header::CONTENT_TYPE, mime.as_ref()),
+                    (header::CACHE_CONTROL, cache_policy(path)),
+                ],
                 file.data.into_owned(),
             )
                 .into_response()
@@ -122,7 +142,10 @@ async fn static_handler(uri: Uri) -> Response {
         // Unknown paths fall back to the app shell (hash routing).
         None => match Assets::get("index.html") {
             Some(file) => (
-                [(header::CONTENT_TYPE, "text/html")],
+                [
+                    (header::CONTENT_TYPE, "text/html"),
+                    (header::CACHE_CONTROL, SHELL_CACHE),
+                ],
                 file.data.into_owned(),
             )
                 .into_response(),
