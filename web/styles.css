@@ -280,20 +280,43 @@ button.mini {
   width: 100%;
   height: 100%;
   padding: 0;
-  font-size: 26px;
-  line-height: 1;
   background: #fff;
   border: 2px solid #000;
   touch-action: manipulation;
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* No transition, no shadow, no shift. A control you steer with should
+     answer on the frame you touch it; anything easing in or moving under
+     the thumb reads as lag even when the move has already gone. */
+  transition: none;
+  box-shadow: none;
+}
+
+.dpad button:hover:not(:disabled),
+.dpad button:focus-visible {
+  box-shadow: none;
 }
 
 .dpad button:active {
-  background: #000;
-  color: #fff;
-  transform: translate(2px, 2px);
-  box-shadow: 1px 1px 0 #000;
+  background: #eee;
+  transform: none;
+  box-shadow: none;
 }
+
+/* A real d-pad's arrows: solid triangles, cut from a square so they stay
+   crisp at whatever size the key ends up. */
+.dpad .tri {
+  width: 40%;
+  aspect-ratio: 1;
+  background: #000;
+  display: block;
+}
+
+.d-up .tri { clip-path: polygon(50% 8%, 100% 92%, 0 92%); }
+.d-down .tri { clip-path: polygon(0 8%, 100% 8%, 50% 92%); }
+.d-left .tri { clip-path: polygon(92% 0, 92% 100%, 8% 50%); }
+.d-right .tri { clip-path: polygon(8% 0, 8% 100%, 92% 50%); }
 
 .d-up { grid-column: 2; grid-row: 1; }
 .d-left { grid-column: 1; grid-row: 2; }
@@ -556,9 +579,11 @@ tr.clickable {
    left. The svg carries a viewBox, so it fits itself into that however
    tall or short it turns out to be. */
 .play {
+  /* A little air under the header. */
+  padding-top: 8px;
   /* dvh, not vh: on a phone the address bar comes and goes, and vh is the
      tall version, which would put the d-pad under it. */
-  height: calc(100dvh - var(--topbar-h) - var(--page-pad-bottom));
+  height: calc(100dvh - var(--topbar-h) - var(--page-pad-bottom) - 8px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -566,17 +591,27 @@ tr.clickable {
 
 /* Older browsers that don't know dvh get the static viewport. */
 @supports not (height: 100dvh) {
-  .play { height: calc(100vh - var(--topbar-h) - var(--page-pad-bottom)); }
+  .play { height: calc(100vh - var(--topbar-h) - var(--page-pad-bottom) - 8px); }
 }
 
+/* Edge to edge on a phone: the board escapes the page padding the way it
+   did before, and the svg keeps it square inside that. */
 .play .board-wrap {
   flex: 1 1 auto;
   min-height: 0;
-  width: 100%;
-  margin-left: 0;
+  width: 100vw;
+  margin-left: calc(50% - 50vw);
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+@media (min-width: 592px) {
+  .play .board-wrap {
+    width: 560px;
+    margin-left: auto;
+    margin-right: auto;
+  }
 }
 
 .play-note {

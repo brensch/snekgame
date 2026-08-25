@@ -380,7 +380,10 @@ fn emoji_rain(emoji: String) -> impl IntoView {
 /// direction lights up in the player's colour.
 fn dpad() -> impl IntoView {
     let store = Store::use_store();
-    let press = move |dir: Dir| move |_| net::send_move(store, dir);
+    // pointerdown, not click: click waits for the release, and on a touch
+    // screen that wait is most of what makes a control feel sluggish. The
+    // move goes the instant the thumb lands.
+    let press = move |dir: Dir| move |_: web_sys::PointerEvent| net::send_move(store, dir);
     let style = move |dir: Dir| {
         move || {
             if store.selected_dir.get() == Some(dir) {
@@ -392,10 +395,18 @@ fn dpad() -> impl IntoView {
     };
     view! {
         <div class="dpad">
-            <button class="d-up" style=style(Dir::Up) on:click=press(Dir::Up)>"▲"</button>
-            <button class="d-left" style=style(Dir::Left) on:click=press(Dir::Left)>"◀"</button>
-            <button class="d-right" style=style(Dir::Right) on:click=press(Dir::Right)>"▶"</button>
-            <button class="d-down" style=style(Dir::Down) on:click=press(Dir::Down)>"▼"</button>
+            <button class="d-up" style=style(Dir::Up) on:pointerdown=press(Dir::Up)>
+                <span class="tri"></span>
+            </button>
+            <button class="d-left" style=style(Dir::Left) on:pointerdown=press(Dir::Left)>
+                <span class="tri"></span>
+            </button>
+            <button class="d-right" style=style(Dir::Right) on:pointerdown=press(Dir::Right)>
+                <span class="tri"></span>
+            </button>
+            <button class="d-down" style=style(Dir::Down) on:pointerdown=press(Dir::Down)>
+                <span class="tri"></span>
+            </button>
         </div>
     }
 }
