@@ -581,16 +581,6 @@ impl SessionActor {
                 }
             }
             ClientMsg::Start => self.start_game().await,
-            ClientMsg::PlayAgain => {
-                // One person speaks for the table. Everyone already agreed
-                // to play once; making them each say so again between games
-                // is the sort of ceremony that ends an evening early.
-                if self.game.is_none() && !self.lobby.is_empty() {
-                    let all: Vec<PlayerId> = self.lobby.iter().map(|p| p.id.clone()).collect();
-                    self.ready.extend(all);
-                    self.start_game().await;
-                }
-            }
             ClientMsg::Move(dir) => {
                 if let Some(game) = &mut self.game {
                     if game

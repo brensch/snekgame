@@ -1093,11 +1093,11 @@ async fn a_stale_client_is_told_to_refresh() {
 }
 
 
-/// Play again runs it back with the same roster. Everyone already agreed to
-/// play once; making them each say so again between games is the sort of
-/// ceremony that ends an evening early.
+/// Readying up after a game starts the next one, exactly as it does in the
+/// lobby — the end screen offers the same decision, so it must work the
+/// same way.
 #[tokio::test]
-async fn play_again_restarts_for_everyone() {
+async fn readying_up_after_a_game_starts_another() {
     let dir = std::env::temp_dir().join(format!("snek-again-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = dir.join("again.db");
@@ -1135,8 +1135,10 @@ async fn play_again_restarts_for_everyone() {
     }
     assert!(over, "first game never finished");
 
-    // Nobody re-readies; one player asks for another.
-    alice.control(&ClientMsg::PlayAgain).await;
+    // A game clears everyone's ready, so both agree again and it goes.
+    alice.control(&ClientMsg::SetReady(true)).await;
+    bob.control(&ClientMsg::SetReady(true)).await;
+    alice.control(&ClientMsg::Start).await;
 
     // Both must be dealt into it.
     async fn started(c: &mut Client) -> bool {
@@ -1150,6 +1152,6 @@ async fn play_again_restarts_for_everyone() {
         }
         false
     }
-    assert!(started(&mut alice).await, "the player who asked wasn't dealt in");
+    assert!(started(&mut alice).await, "the player who started it wasn't dealt in");
     assert!(started(&mut bob).await, "the other player was left behind in the lobby");
 }
