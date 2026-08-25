@@ -1091,3 +1091,65 @@ async fn a_stale_client_is_told_to_refresh() {
         other => panic!("expected a version refusal, got {other:?}"),
     }
 }
+
+
+/// Play again runs it back with the same roster. Everyone already agreed to
+/// play once; making them each say so again between games is the sort of
+/// ceremony that ends an evening early.
+#[tokio::test]
+async fn play_again_restarts_for_everyone() {
+    let dir = std::env::temp_dir().join(format!("snek-again-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("again.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let (_, registry) = snek_server::build(&db_path);
+    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    let mut alice = Client::connect(wt_port, "again-test", "alice-secret-0000", info("alice")).await;
+    let mut bob = Client::connect(wt_port, "again-test", "bob-secret-000000", info("bob")).await;
+    alice
+        .control(&ClientMsg::Configure(GameConfig {
+            board_width: 7,
+            board_height: 7,
+            tick_ms: 250,
+            food_emoji: "🍕".to_string(),
+        }))
+        .await;
+    alice.control(&ClientMsg::SetReady(true)).await;
+    bob.control(&ClientMsg::SetReady(true)).await;
+    alice.control(&ClientMsg::Start).await;
+
+    // Play it out.
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    let mut over = false;
+    while std::time::Instant::now() < deadline && !over {
+        if let Ok(ServerMsg::Turn(t)) =
+            tokio::time::timeout(Duration::from_millis(800), alice.next_msg()).await
+        {
+            over = t.game_over();
+        }
+    }
+    assert!(over, "first game never finished");
+
+    // Nobody re-readies; one player asks for another.
+    alice.control(&ClientMsg::PlayAgain).await;
+
+    // Both must be dealt into it.
+    async fn started(c: &mut Client) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if let Ok(ServerMsg::GameStart { .. }) =
+                tokio::time::timeout(Duration::from_millis(500), c.next_msg()).await
+            {
+                return true;
+            }
+        }
+        false
+    }
+    assert!(started(&mut alice).await, "the player who asked wasn't dealt in");
+    assert!(started(&mut bob).await, "the other player was left behind in the lobby");
+}

@@ -520,45 +520,57 @@ fn game_view(game: GameView) -> impl IntoView {
             })
             .collect_view();
 
-        let scrub = view! {
-            <input
-                type="range"
-                class="scrubber"
-                min="0"
-                max=(turn_count - 1).to_string()
-                prop:value=viewing.to_string()
-                on:input=move |ev| {
-                    if let Ok(i) = event_target_value(&ev).parse::<usize>() {
-                        store.view_turn.set(Some(i));
+        let show_scrub = RwSignal::new(false);
+        let scrub = move || {
+            show_scrub.get().then(|| view! {
+                <input
+                    type="range"
+                    class="scrubber"
+                    min="0"
+                    max=(turn_count - 1).to_string()
+                    prop:value=viewing.to_string()
+                    on:input=move |ev| {
+                        if let Ok(i) = event_target_value(&ev).parse::<usize>() {
+                            store.view_turn.set(Some(i));
+                        }
                     }
-                }
-            />
+                />
+            })
         };
 
         view! {
-            <div>
+            <div class="results">
                 {rain}
                 <h3>{if draw { "Game over — it's a draw" } else { "Game over" }}</h3>
                 <table class="players">
                     <tbody>{rows}</tbody>
                 </table>
-                <p class="footnote">"Drag to replay:"</p>
-                {scrub}
                 <button
                     class="big"
                     on:click=move |_| {
-                        store.game.set(None);
                         store.view_turn.set(None);
+                        net::send(&ClientMsg::PlayAgain);
                     }
                 >
-                    "Back to lobby"
+                    "Play again"
                 </button>
+                <div class="row">
+                    <button on:click=move |_| {
+                        store.game.set(None);
+                        store.view_turn.set(None);
+                    }>"Lobby"</button>
+                    <button on:click=move |_| {
+                        show_scrub.update(|v| *v = !*v);
+                        store.view_turn.set(None);
+                    }>"Replay"</button>
+                </div>
+                {scrub}
             </div>
         }
     });
 
     view! {
-        <div class=move || if over { "" } else { "play" }>
+        <div class="play">
             // Only what has to be said. The turn number was costing a line
             // of a phone screen to tell you something the board already
             // shows.
@@ -575,12 +587,15 @@ fn game_view(game: GameView) -> impl IntoView {
                 note.map(|n| view! { <p class="play-note">{n}</p> })
             }}
             {board_view(game.config, game.players.clone(), &turn, me.clone(), on_cell)}
+            // One bottom half, whichever state the game is in. Two layouts
+            // meant two sets of rules for the same board, and the board
+            // quietly changed size the moment the game ended.
             <div class="controls">
                 {pause_button}
                 {show_dpad.then(dpad)}
+                {results}
             </div>
             {countdown}
-            {results}
         </div>
     }
 }

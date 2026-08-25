@@ -583,7 +583,11 @@ tr.clickable {
   padding-top: 8px;
   /* dvh, not vh: on a phone the address bar comes and goes, and vh is the
      tall version, which would put the d-pad under it. */
-  height: calc(100dvh - var(--topbar-h) - var(--page-pad-bottom) - 8px);
+  /* The page's generous bottom padding is for scrolling pages; this one
+     doesn't scroll, and on a small phone those pixels are the difference
+     between a thumbable d-pad and a fiddly one. Take them back. */
+  margin-bottom: calc(-1 * var(--page-pad-bottom));
+  height: calc(100dvh - var(--topbar-h) - 16px);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -591,16 +595,21 @@ tr.clickable {
 
 /* Older browsers that don't know dvh get the static viewport. */
 @supports not (height: 100dvh) {
-  .play { height: calc(100vh - var(--topbar-h) - var(--page-pad-bottom) - 8px); }
+  .play { height: calc(100vh - var(--topbar-h) - 16px); }
 }
 
-/* Edge to edge on a phone: the board escapes the page padding the way it
-   did before, and the svg keeps it square inside that. */
+/* Edge to edge, and it stays that way. The board takes the full width of
+   the phone and its own height from that, rather than being handed
+   whatever is left over — which is what made it shrink during play and
+   then jump back to full width when the game ended. The controls take the
+   remainder. max-height is the safety net for a screen too short to hold a
+   square board at full width; there, and only there, it letterboxes. */
 .play .board-wrap {
-  flex: 1 1 auto;
-  min-height: 0;
+  flex: 0 0 auto;
   width: 100vw;
   margin-left: calc(50% - 50vw);
+  aspect-ratio: var(--board-aspect, 1);
+  max-height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -621,6 +630,43 @@ tr.clickable {
 
 .controls {
   position: relative;
-  flex: 0 0 auto;
+  flex: 1 1 auto;
+  min-height: 0;
   padding: 10px 0 4px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  /* Results start under the board; the d-pad centres itself in whatever
+     room is left (margin: auto below) rather than both being centred, which
+     left the scoreboard floating in the middle of the screen. */
+  justify-content: flex-start;
+  overflow-y: auto;
+}
+
+/* The d-pad is a square as tall as the room it is given, so the keys grow
+   on a big screen and give way to the board on a small one, without any
+   size being written down twice. */
+.play .dpad {
+  margin: auto;
+  height: 100%;
+  width: auto;
+  aspect-ratio: 1;
+  max-height: 320px;
+  max-width: 100%;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+}
+
+.results {
+  width: 100%;
+}
+
+.results .row {
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.results .row button {
+  flex: 1 1 0;
+  text-align: center;
 }
