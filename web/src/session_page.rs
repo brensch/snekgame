@@ -56,7 +56,10 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
         .cloned()
         .collect();
     let i_am_in = humans.iter().any(|p| p.id == me);
-    let i_am_ready = lobby.ready.contains(&me);
+    // Our own press counts immediately. The server is the truth, but while
+    // a reconnect is in flight it has not heard us yet, and a button that
+    // ignores a press looks broken even though the intent is safely held.
+    let i_am_ready = lobby.ready.contains(&me) || store.want_ready.get();
     let all_ready = !humans.is_empty() && humans.iter().all(|p| lobby.ready.contains(&p.id));
     let my_colour = store.profile.get_untracked().colour;
 
@@ -100,7 +103,10 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                 class="big"
                 style=format!("background: {my_colour};")
                 disabled=i_am_ready || !i_am_in
-                on:click=move |_| net::send(&ClientMsg::SetReady(true))
+                on:click=move |_| {
+                    store.want_ready.set(true);
+                    net::send(&ClientMsg::SetReady(true));
+                }
             >
                 {if i_am_ready { "Waiting" } else { "I'm ready!" }}
             </button>

@@ -26,6 +26,11 @@ const CONN_BUFFER: usize = 256;
 /// How long an empty session lingers (so a network blip or refresh doesn't
 /// wipe the lobby) before it is tidied away.
 const EMPTY_GRACE: Duration = Duration::from_secs(60);
+/// How long a player keeps their seat after their connection drops. A
+/// backgrounded tab stops reading its socket and the server times it out
+/// within ten seconds, so without this, glancing at another app costs you
+/// your place in the lobby and whatever you had already agreed to.
+const AWAY_GRACE: Duration = Duration::from_secs(45);
 
 /// Outbound message with its transport class: control frames ride the
 /// reliable stream; snapshots ride (redundant) datagrams and may be dropped.
@@ -309,6 +314,9 @@ struct SessionActor {
     /// Set when the last connection drops; the actor tidies itself away
     /// after EMPTY_GRACE unless someone comes back.
     empty_deadline: Option<Instant>,
+    /// Players holding a seat with no connection behind it, and when that
+    /// stops being true.
+    away: HashMap<PlayerId, Instant>,
     last_winners: Vec<Winner>,
     last_game_id: Option<i64>,
 }
@@ -336,6 +344,7 @@ impl SessionActor {
             next_request_id: 1,
             next_tick: None,
             empty_deadline: None,
+            away: HashMap::new(),
             last_winners: Vec::new(),
             last_game_id: None,
         };
@@ -379,6 +388,12 @@ impl SessionActor {
                     None => std::future::pending::<()>().await,
                 }
             };
+            let away_sleep = async {
+                match self.away.values().min().copied() {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
                     Some(cmd) => self.handle(cmd).await,
@@ -391,10 +406,33 @@ impl SessionActor {
                     }
                     self.empty_deadline = None;
                 }
+                _ = away_sleep => self.release_expired_seats().await,
             }
         }
         tracing::info!(session = %self.name, "session ended");
         self.registry.remove(&self.name.clone(), &self.self_sender);
+    }
+
+    /// Give up the seats of players who never came back.
+    async fn release_expired_seats(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<PlayerId> = self
+            .away
+            .iter()
+            .filter(|(_, &deadline)| deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        for id in &expired {
+            tracing::info!(session = %self.name, player = %id, "seat released");
+            self.away.remove(id);
+            self.lobby.retain(|p| p.id != *id);
+            self.ready.remove(id);
+        }
+        self.assign_bots();
+        self.broadcast_lobby().await;
     }
 
     async fn handle(&mut self, cmd: Cmd) {
@@ -425,6 +463,7 @@ impl SessionActor {
                 );
                 // A watcher arriving restarts a game frozen for lack of one.
                 self.resume_tick();
+                self.away.remove(&self.conns[&conn_id].player);
                 self.upsert_lobby_player(profile);
                 // Late joiner while a game runs: catch them up so they can
                 // spectate (or resume, if they are in it).
@@ -442,10 +481,17 @@ impl SessionActor {
                 if let Some(conn) = self.conns.remove(&conn_id) {
                     let gone = !self.conns.values().any(|c| c.player == conn.player);
                     if gone {
-                        // Their snek keeps sliding if a game is running; they
-                        // just leave the next-game roster.
-                        self.lobby.retain(|p| p.id != conn.player);
-                        self.ready.remove(&conn.player);
+                        // Their snek keeps sliding if a game is running, and
+                        // their seat waits for them. Dropping it here is what
+                        // made coming back to a tab feel broken: the roster
+                        // entry vanished, the ready they had given went with
+                        // it, and they rejoined as somebody new.
+                        self.away
+                            .insert(conn.player.clone(), Instant::now() + AWAY_GRACE);
+                        tracing::info!(
+                            session = %self.name, player = %conn.player,
+                            "connection dropped — holding their seat"
+                        );
                     }
                 }
                 if self.conns.is_empty() {
@@ -571,6 +617,9 @@ impl SessionActor {
                     self.lobby.retain(|p| p.id != target);
                     self.bots.remove(&target);
                     self.ready.remove(&target);
+                    // Removing someone settles it — no held seat should
+                    // outlive the decision and put them back.
+                    self.away.remove(&target);
                     self.broadcast_lobby().await;
                 }
             }

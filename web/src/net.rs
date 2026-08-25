@@ -120,6 +120,7 @@ fn ensure(store: Store, mode: Mode) {
         store.saved_id.set(None);
         store.view_turn.set(None);
         store.selected_dir.set(None);
+        store.want_ready.set(false);
     }
     if need_new {
         open(store, mode, BACKOFF_START_MS);
@@ -174,6 +175,7 @@ pub fn disconnect(store: Store) {
         }
     });
     store.conn.set(ConnStatus::Idle);
+    store.want_ready.set(false);
     store.lobby.set(None);
     store.game.set(None);
     store.saved_id.set(None);
@@ -631,7 +633,16 @@ fn apply(store: Store, msg: ServerMsg) {
         store.conn.set(ConnStatus::Connected);
     }
     match msg {
-        ServerMsg::Welcome { your_id } => store.me.set(your_id),
+        ServerMsg::Welcome { your_id } => {
+            store.me.set(your_id);
+            // A fresh connection: say again anything we said on the last one
+            // that never got through. Ready is the only such intent, and
+            // repeating it is harmless — the server holds a set, not a
+            // counter.
+            if store.want_ready.get_untracked() {
+                send(&ClientMsg::SetReady(true));
+            }
+        }
         ServerMsg::Sessions(list) => store.sessions.set(Some(list)),
         ServerMsg::Lobby(lobby) => {
             // Server phase truth: no game running + we hold an *unfinished*
@@ -652,6 +663,9 @@ fn apply(store: Store, msg: ServerMsg) {
                     store.view_turn.set(None);
                     store.selected_dir.set(None);
                 }
+            }
+            if lobby.ready.contains(&store.me.get_untracked()) {
+                store.want_ready.set(false);
             }
             store.lobby.set(Some(lobby));
         }
@@ -679,6 +693,7 @@ fn apply(store: Store, msg: ServerMsg) {
             let me = store.me.get_untracked();
             // A fresh game always runs; never inherit the last one's hold.
             store.paused.set(false);
+            store.want_ready.set(false);
             store.selected_dir.set(
                 turn.snakes
                     .get(&me)

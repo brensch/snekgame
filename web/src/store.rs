@@ -50,6 +50,10 @@ pub struct Store {
     /// changes — a hand held there would be re-dealt on every click,
     /// including the click that picks from it.
     pub food_hand: RwSignal<Vec<String>>,
+    /// "I said I was ready." Kept until the server is seen to agree, so a
+    /// press that lands on a dead connection isn't simply lost — the
+    /// intent outlives the socket it was sent on.
+    pub want_ready: RwSignal<bool>,
     /// Someone has held the game. Server-owned: we only ever mirror what it
     /// tells us, so every screen agrees on whether the clock is running.
     pub paused: RwSignal<bool>,
@@ -82,6 +86,7 @@ impl Store {
                 crate::palette::FOOD_HAND,
                 snek_shared::DEFAULT_FOOD,
             )),
+            want_ready: RwSignal::new(false),
             paused: RwSignal::new(false),
             selected_dir: RwSignal::new(None),
             saved_id: RwSignal::new(None),

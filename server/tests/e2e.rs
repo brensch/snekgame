@@ -960,3 +960,83 @@ fn a_compute_request_fits_in_one_datagram() {
          where one lost packet delays every request behind it"
     );
 }
+
+/// A backgrounded tab stops reading its socket and the server times it out
+/// within ten seconds. Losing your seat over that is what made coming back
+/// to a tab feel broken: the roster entry went, the ready you had given
+/// went with it, and you rejoined as somebody new.
+#[tokio::test]
+async fn a_dropped_connection_keeps_its_seat() {
+    let dir = std::env::temp_dir().join(format!("snek-seat-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("seat.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let (_, registry) = snek_server::build(&db_path);
+    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    let alice_secret = "alice-secret-0000";
+    let mut alice = Client::connect(wt_port, "seat-test", alice_secret, info("alice")).await;
+    let mut bob = Client::connect(wt_port, "seat-test", "bob-secret-000000", info("bob")).await;
+    alice.control(&ClientMsg::SetReady(true)).await;
+
+    // Wait until bob can see alice ready, so we know the state we are about
+    // to test the survival of actually existed.
+    let alice_id = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut found = None;
+        while std::time::Instant::now() < deadline && found.is_none() {
+            if let Ok(ServerMsg::Lobby(lobby)) =
+                tokio::time::timeout(Duration::from_millis(500), bob.next_msg()).await
+            {
+                if let Some(p) = lobby.players.iter().find(|p| p.name == "alice") {
+                    if lobby.ready.contains(&p.id) {
+                        found = Some(p.id.clone());
+                    }
+                }
+            }
+        }
+        found.expect("alice never showed up ready")
+    };
+
+    // Her tab goes away.
+    drop(alice);
+
+    // Bob keeps watching: alice must still be there, and still ready.
+    let deadline = std::time::Instant::now() + Duration::from_secs(4);
+    let mut last: Option<snek_shared::protocol::LobbyState> = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(ServerMsg::Lobby(lobby)) =
+            tokio::time::timeout(Duration::from_millis(500), bob.next_msg()).await
+        {
+            last = Some(lobby);
+        }
+    }
+    if let Some(lobby) = last {
+        assert!(
+            lobby.players.iter().any(|p| p.id == alice_id),
+            "alice lost her seat the moment her connection dropped"
+        );
+        assert!(
+            lobby.ready.contains(&alice_id),
+            "alice's seat survived but the ready she had already given did not"
+        );
+    }
+
+    // And coming back is the same person in the same seat, still ready.
+    let mut alice = Client::connect(wt_port, "seat-test", alice_secret, info("alice")).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut still_ready = false;
+    while std::time::Instant::now() < deadline && !still_ready {
+        if let Ok(ServerMsg::Lobby(lobby)) =
+            tokio::time::timeout(Duration::from_millis(500), alice.next_msg()).await
+        {
+            still_ready =
+                lobby.ready.contains(&alice_id) && lobby.players.iter().any(|p| p.id == alice_id);
+        }
+    }
+    assert!(still_ready, "alice came back and had to ready up all over again");
+}
