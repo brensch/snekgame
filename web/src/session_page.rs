@@ -394,7 +394,6 @@ fn dpad() -> impl IntoView {
         <div class="dpad">
             <button class="d-up" style=style(Dir::Up) on:click=press(Dir::Up)>"▲"</button>
             <button class="d-left" style=style(Dir::Left) on:click=press(Dir::Left)>"◀"</button>
-            <div class="d-mid"></div>
             <button class="d-right" style=style(Dir::Right) on:click=press(Dir::Right)>"▶"</button>
             <button class="d-down" style=style(Dir::Down) on:click=press(Dir::Down)>"▼"</button>
         </div>
@@ -548,16 +547,27 @@ fn game_view(game: GameView) -> impl IntoView {
     });
 
     view! {
-        <div>
-            <p>
-                "Turn " {turn.turn_number}
-                {move || store.paused.get().then_some(" — held ⏸️")}
-                {spectating.then_some(" — spectating (next game starts from the lobby)")}
-                {i_died.then_some(" — you died 💀 watch the rest")}
-            </p>
+        <div class=move || if over { "" } else { "play" }>
+            // Only what has to be said. The turn number was costing a line
+            // of a phone screen to tell you something the board already
+            // shows.
+            {move || {
+                let note = if store.paused.get() {
+                    Some("held ⏸️")
+                } else if spectating {
+                    Some("spectating — next game starts from the lobby")
+                } else if i_died {
+                    Some("you died 💀 watch the rest")
+                } else {
+                    None
+                };
+                note.map(|n| view! { <p class="play-note">{n}</p> })
+            }}
             {board_view(game.config, game.players.clone(), &turn, me.clone(), on_cell)}
-            {show_dpad.then(dpad)}
-            {pause_button}
+            <div class="controls">
+                {pause_button}
+                {show_dpad.then(dpad)}
+            </div>
             {countdown}
             {results}
         </div>

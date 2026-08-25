@@ -54,6 +54,55 @@ pub fn app() -> impl IntoView {
 
     net::watch_main_thread();
 
+    // The play screen sizes itself against whatever is above it. Measuring
+    // beats guessing: a long name or a bigger font can wrap the header onto
+    // two lines, and a constant here would quietly push the d-pad off the
+    // bottom of the screen on exactly the phones that can least afford it.
+    {
+        use wasm_bindgen::closure::Closure;
+        use wasm_bindgen::JsCast;
+        let measure = move || {
+            let Some(w) = web_sys::window() else { return };
+            let Some(doc) = w.document() else { return };
+            // Document-relative, not viewport-relative: a bounding rect
+            // moves with the scroll position, and measuring mid-scroll gave
+            // a header nine pixels tall and a play area taller than the
+            // screen.
+            let bottom = doc
+                .query_selector(".topbar")
+                .ok()
+                .flatten()
+                .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+                .map(|e| (e.offset_top() + e.offset_height()) as f64)
+                .filter(|h| (24.0..320.0).contains(h))
+                .unwrap_or(104.0);
+            if let Some(root) = doc.document_element() {
+                let style = root.unchecked_ref::<web_sys::HtmlElement>().style();
+                let _ = style.set_property("--topbar-h", &format!("{bottom}px"));
+            }
+        };
+        measure();
+        let cb = Closure::<dyn FnMut()>::new(move || measure());
+        if let Some(w) = web_sys::window() {
+            let _ = w.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+            let _ =
+                w.add_event_listener_with_callback("orientationchange", cb.as_ref().unchecked_ref());
+        }
+        cb.forget();
+        // The header isn't in the DOM on the very first pass; catch it once
+        // it is, and again after fonts settle.
+        for delay in [0, 250, 1_000] {
+            let cb = Closure::<dyn FnMut()>::new(move || measure());
+            if let Some(w) = web_sys::window() {
+                let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    cb.as_ref().unchecked_ref(),
+                    delay,
+                );
+            }
+            cb.forget();
+        }
+    }
+
     // --- shared coarse clock + liveness watchdog ---------------------------
     let clock = Interval::new(200, move || {
         store.now_ms.set(net::now());

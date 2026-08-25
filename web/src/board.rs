@@ -158,7 +158,7 @@ pub fn board_view(
 
     // Crop the view to the playable interior — the walls sit just off-screen.
     let svg = format!(
-        r##"<svg viewBox="1 1 {vw} {vh}" xmlns="http://www.w3.org/2000/svg" style="display:block;width:100%;background:{CHECKER_A};">
+        r##"<svg viewBox="1 1 {vw} {vh}" xmlns="http://www.w3.org/2000/svg" style="display:block;width:100%;height:100%;">
             {field}{food}{sneks}{clashes}
         </svg>"##,
         vw = w - 2,
@@ -180,8 +180,26 @@ pub fn board_view(
                 if rect.width() <= 0.0 || rect.height() <= 0.0 {
                     return;
                 }
-                let x = 1 + ((ev.client_x() as f64 - rect.left()) / rect.width() * vis_w) as i32;
-                let y = 1 + ((ev.client_y() as f64 - rect.top()) / rect.height() * vis_h) as i32;
+                // The svg keeps the board square inside whatever box it is
+                // given, centring it and leaving a margin on one axis. Taps
+                // have to be measured against the board, not the box, or
+                // every column is off by half the margin — and a tap in the
+                // margin is not a tap on the board at all.
+                let board_aspect = vis_w / vis_h;
+                let (bw, bh) = if rect.width() / rect.height() > board_aspect {
+                    (rect.height() * board_aspect, rect.height())
+                } else {
+                    (rect.width(), rect.width() / board_aspect)
+                };
+                let left = rect.left() + (rect.width() - bw) / 2.0;
+                let top = rect.top() + (rect.height() - bh) / 2.0;
+                let fx = (ev.client_x() as f64 - left) / bw;
+                let fy = (ev.client_y() as f64 - top) / bh;
+                if !(0.0..1.0).contains(&fx) || !(0.0..1.0).contains(&fy) {
+                    return; // in the margin beside the board
+                }
+                let x = 1 + (fx * vis_w) as i32;
+                let y = 1 + (fy * vis_h) as i32;
                 if x >= 1 && y >= 1 && (x as usize) < w - 1 && (y as usize) < h - 1 {
                     on_cell((y as usize * w + x as usize) as Pos);
                 }
