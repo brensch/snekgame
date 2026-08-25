@@ -79,6 +79,48 @@ fn reloaded_recently() -> bool {
         .is_some_and(|at| now() - at < RELOAD_COOLDOWN_MS)
 }
 
+thread_local! {
+    /// Attempts in a row that never reached Connected.
+    static FAILED_ATTEMPTS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Attempts before we stop assuming it is us and start suspecting the
+/// network. Two is enough to rule out a single unlucky handshake.
+const ATTEMPTS_BEFORE_DIAGNOSING: u32 = 2;
+
+/// Work out whether the network is eating QUIC, and say so.
+///
+/// This is answerable rather than guessable. The page itself arrived over
+/// TCP, and the API lives on the same host, so if a plain HTTP request
+/// succeeds while WebTransport will not connect, then the server is
+/// reachable and UDP is not. Corporate and school networks routinely block
+/// UDP/443 outright, because QUIC is encrypted end to end and their
+/// middleboxes cannot read it. Ordinary sites just fall back to TCP and
+/// nobody notices; WebTransport has no TCP to fall back to.
+fn diagnose_after_failure(store: Store, generation: u64) {
+    let attempts = FAILED_ATTEMPTS.with(|c| {
+        let n = c.get() + 1;
+        c.set(n);
+        n
+    });
+    if attempts != ATTEMPTS_BEFORE_DIAGNOSING {
+        return; // once, on the way past
+    }
+    spawn_local(async move {
+        let tcp_works = gloo_net::http::Request::get("/api/sessions")
+            .send()
+            .await
+            .map(|r| r.ok())
+            .unwrap_or(false);
+        // Only claim it if the attempt is still the live one and TCP really
+        // did answer — otherwise this is just an offline phone.
+        if tcp_works && is_current(generation) && store.conn.get_untracked() != ConnStatus::Connected
+        {
+            store.quic_blocked.set(true);
+        }
+    });
+}
+
 fn mark_rx() {
     LAST_RX.with(|c| c.set(now()));
 }
@@ -275,6 +317,7 @@ fn open(store: Store, mode: Mode, backoff_ms: u32) {
     spawn_local(async move {
         if let Err(e) = connect(store, attempt_mode, generation).await {
             tracing_debug(&e);
+            diagnose_after_failure(store, generation);
             schedule_reconnect(store, generation);
         }
     });
@@ -284,6 +327,7 @@ fn open(store: Store, mode: Mode, backoff_ms: u32) {
     // future and closing its transport) and try again.
     Timeout::new(CONNECT_TIMEOUT_MS, move || {
         if is_current(generation) && store.conn.get_untracked() != ConnStatus::Connected {
+            diagnose_after_failure(store, generation);
             let next = (backoff_ms * 2).min(BACKOFF_MAX_MS);
             open(store, mode, next);
         }
@@ -428,6 +472,8 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
         }
     });
     store.conn.set(ConnStatus::Connected);
+    FAILED_ATTEMPTS.with(|c| c.set(0));
+    store.quic_blocked.set(false);
 
     // Reader: control stream (length-prefixed frames).
     {
@@ -643,6 +689,8 @@ fn apply(store: Store, msg: ServerMsg) {
     // lets the hung-attempt guard recycle a stalled join.
     if store.conn.get_untracked() != ConnStatus::Connected {
         store.conn.set(ConnStatus::Connected);
+        FAILED_ATTEMPTS.with(|c| c.set(0));
+        store.quic_blocked.set(false);
     }
     match msg {
         ServerMsg::Welcome { your_id } => {

@@ -50,6 +50,9 @@ pub struct Store {
     /// changes — a hand held there would be re-dealt on every click,
     /// including the click that picks from it.
     pub food_hand: RwSignal<Vec<String>>,
+    /// Set once we have evidence the network passes TCP but not UDP —
+    /// which is a firewall eating QUIC, not a broken site.
+    pub quic_blocked: RwSignal<bool>,
     /// "I said I was ready." Kept until the server is seen to agree, so a
     /// press that lands on a dead connection isn't simply lost — the
     /// intent outlives the socket it was sent on.
@@ -86,6 +89,7 @@ impl Store {
                 crate::palette::FOOD_HAND,
                 snek_shared::DEFAULT_FOOD,
             )),
+            quic_blocked: RwSignal::new(false),
             want_ready: RwSignal::new(false),
             paused: RwSignal::new(false),
             selected_dir: RwSignal::new(None),

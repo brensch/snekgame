@@ -243,6 +243,21 @@ pub fn app() -> impl IntoView {
                         {move || store.error.get().map(|e| view! {
                             <div class="banner error">{e}</div>
                         })}
+                        // Shown only when we have actually established it:
+                        // the API answered over TCP while WebTransport would
+                        // not connect at all.
+                        {move || store.quic_blocked.get().then(|| view! {
+                            <div class="banner error">
+                                <strong>"📵 this network is blocking snek"</strong>
+                                <br />
+                                "It lets normal web traffic through but drops the UDP "
+                                "that snek needs to talk to the server. Work and school "
+                                "Wi-Fi usually do this on purpose."
+                                <br />
+                                <br />
+                                "Turn Wi-Fi off and use mobile data."
+                            </div>
+                        })}
                         {move || match store.route.get() {
                             Route::Home => home_page().into_any(),
                             Route::Session(name) => session_page(name).into_any(),
