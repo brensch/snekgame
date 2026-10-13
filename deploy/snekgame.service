@@ -1,0 +1,32 @@
+# snekgame on the schlift.com VM (installed by deploy/setup-vm.sh).
+# HTTP on 8080 (firewalled; only Caddy reaches it, as snek.brensch.com); WebTransport on UDP
+# 443 directly, so Caddy there runs without HTTP/3. The WebTransport TLS cert is
+# Caddy's for snek.brensch.com, copied in at start; the weekly restart
+# (RuntimeMaxSec) picks up renewals.
+[Unit]
+Description=snekgame server
+After=network-online.target caddy.service
+Wants=network-online.target
+
+[Service]
+User=snek
+WorkingDirectory=/opt/snekgame
+ExecStartPre=+/bin/sh -c 'd=/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/snek.brensch.com; install -o snek -m 600 $d/snek.brensch.com.crt /opt/snekgame/certs/cert.pem && install -o snek -m 600 $d/snek.brensch.com.key /opt/snekgame/certs/key.pem'
+ExecStart=/opt/snekgame/snek-server
+Environment=SNEK_PORT=8080
+Environment=SNEK_WT_PORT=443
+Environment=SNEK_DB=/opt/snekgame/snek.db
+Environment=SNEK_CERT=/opt/snekgame/certs/cert.pem
+Environment=SNEK_KEY=/opt/snekgame/certs/key.pem
+RuntimeMaxSec=604800
+Restart=always
+RestartSec=2
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/snekgame
+
+[Install]
+WantedBy=multi-user.target

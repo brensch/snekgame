@@ -1,0 +1,7 @@
+target
+web/dist
+deploy/out
+certs
+snek.db
+snek.db-*
+.git
