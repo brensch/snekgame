@@ -207,8 +207,8 @@ self.onmessage = async (e) => {{
     opts.set_type(web_sys::WorkerType::Module);
     let worker = web_sys::Worker::new_with_options(&url, &opts).ok()?;
 
-    let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
-        move |ev: web_sys::MessageEvent| {
+    let on_message =
+        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |ev: web_sys::MessageEvent| {
             let data = ev.data();
             let id = Reflect::get(&data, &"id".into())
                 .ok()
@@ -218,9 +218,7 @@ self.onmessage = async (e) => {{
                 .ok()
                 .and_then(|v| v.as_string())
             {
-                web_sys::console::error_1(&JsValue::from_str(&format!(
-                    "bot worker failed: {err}"
-                )));
+                web_sys::console::error_1(&JsValue::from_str(&format!("bot worker failed: {err}")));
             }
             let bytes = Reflect::get(&data, &"out".into())
                 .ok()
@@ -230,8 +228,7 @@ self.onmessage = async (e) => {{
             if let Some(tx) = PENDING.with(|p| p.borrow_mut().remove(&id)) {
                 let _ = tx.send(bytes);
             }
-        },
-    );
+        });
     worker.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     on_message.forget();
 

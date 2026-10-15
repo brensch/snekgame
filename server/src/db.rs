@@ -2,7 +2,9 @@
 //! are written here once, on completion.
 
 use rusqlite::{params, Connection};
-use snek_shared::protocol::{ComputeDonor, ComputeOverview, ComputeTotals, HistoryEntry, HistoryPage};
+use snek_shared::protocol::{
+    ComputeDonor, ComputeOverview, ComputeTotals, HistoryEntry, HistoryPage,
+};
 use snek_shared::{GameRecord, PlayerProfile, Winner};
 use std::path::Path;
 use std::sync::Mutex;
@@ -57,7 +59,11 @@ impl Db {
         finished_at_ms: i64,
         record: &GameRecord,
     ) -> rusqlite::Result<i64> {
-        let winners: &[Winner] = &record.turns.last().map(|t| t.winners.clone()).unwrap_or_default();
+        let winners: &[Winner] = &record
+            .turns
+            .last()
+            .map(|t| t.winners.clone())
+            .unwrap_or_default();
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO games
@@ -81,11 +87,7 @@ impl Db {
     /// independent of page depth (OFFSET would scan everything skipped).
     /// The replay blob is the last column and is never selected here, so
     /// its overflow pages are never touched by listing.
-    pub fn list_games(
-        &self,
-        before: Option<i64>,
-        limit: u32,
-    ) -> rusqlite::Result<HistoryPage> {
+    pub fn list_games(&self, before: Option<i64>, limit: u32) -> rusqlite::Result<HistoryPage> {
         let limit = limit.clamp(1, 50) as i64;
         let conn = self.conn.lock().unwrap();
         // rowid order == finish order; fetch one extra to learn if there is
@@ -214,8 +216,7 @@ impl Db {
                     num_turns: row.get::<_, i64>(2)? as u32,
                     players: serde_json::from_str::<Vec<PlayerProfile>>(&players_json)
                         .unwrap_or_default(),
-                    winners: serde_json::from_str::<Vec<Winner>>(&winners_json)
-                        .unwrap_or_default(),
+                    winners: serde_json::from_str::<Vec<Winner>>(&winners_json).unwrap_or_default(),
                 }))
             }
             None => Ok(None),

@@ -9,8 +9,7 @@
 use crate::db::Db;
 use snek_shared::protocol::*;
 use snek_shared::{
-    bot, BotDifficulty, Dir, Engine, GameConfig, GameRecord, PlayerId, PlayerProfile, Turn,
-    Winner,
+    bot, BotDifficulty, Dir, Engine, GameConfig, GameRecord, PlayerId, PlayerProfile, Turn, Winner,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -359,10 +358,7 @@ impl SessionActor {
         let humans = self.lobby.len().saturating_sub(self.bots.len());
         // Games aren't named; they're known by their host — the first human
         // currently in the lobby.
-        let host = self
-            .lobby
-            .iter()
-            .find(|p| !self.bots.contains_key(&p.id));
+        let host = self.lobby.iter().find(|p| !self.bots.contains_key(&p.id));
         self.registry.publish(SessionSummary {
             id: self.name.clone(),
             host_name: host.map(|p| p.name.clone()).unwrap_or_default(),
@@ -623,7 +619,11 @@ impl SessionActor {
                     self.broadcast_lobby().await;
                 }
             }
-            ClientMsg::Benchmark { sims_per_sec, device, cores } => {
+            ClientMsg::Benchmark {
+                sims_per_sec,
+                device,
+                cores,
+            } => {
                 if let Some(conn) = self.conns.get_mut(&conn_id) {
                     conn.sims_per_sec = Some(sims_per_sec.clamp(500, 2_000_000));
                     conn.device = device.chars().take(80).collect();
@@ -646,7 +646,12 @@ impl SessionActor {
                     self.resume_tick();
                 }
             }
-            ClientMsg::BotMove { request_id, dir, proof, tm } => {
+            ClientMsg::BotMove {
+                request_id,
+                dir,
+                proof,
+                tm,
+            } => {
                 let Some(pending) = self.pending_compute.remove(&request_id) else {
                     // Not outstanding: either an answer we have already
                     // given up waiting for, or noise. A late answer is worth
@@ -733,9 +738,7 @@ impl SessionActor {
                 // option, decided without searching — which is correct, not
                 // poor.
                 let forced = tm.slices == 0 && tm.sims == 0;
-                if !forced
-                    && (tm.fallback || tm.sims < 800 || tm.total_ms > self.config.tick_ms)
-                {
+                if !forced && (tm.fallback || tm.sims < 800 || tm.total_ms > self.config.tick_ms) {
                     tracing::info!(
                         session = %self.name, conn = conn_id, bot = %pending.bot_id,
                         think_ms = tm.think_ms, queue_ms = tm.queue_ms,
@@ -791,7 +794,6 @@ impl SessionActor {
                         game.pending.insert(pending.bot_id.clone(), dir);
                     }
                 }
-
             }
             ClientMsg::ComputeFailed { request_id, reason } => {
                 let bot = self
@@ -805,7 +807,8 @@ impl SessionActor {
                 );
             }
             ClientMsg::Ping(n) => {
-                self.send_to(conn_id, control_frame(&ServerMsg::Pong(n))).await;
+                self.send_to(conn_id, control_frame(&ServerMsg::Pong(n)))
+                    .await;
             }
             // Handled at the transport layer before a session exists.
             ClientMsg::WatchGames => {}
@@ -868,8 +871,7 @@ impl SessionActor {
         }
         self.ready.clear();
         self.publish_info();
-        self.next_tick =
-            Some(Instant::now() + Duration::from_millis(COUNTDOWN_MS as u64));
+        self.next_tick = Some(Instant::now() + Duration::from_millis(COUNTDOWN_MS as u64));
         self.assign_bots();
         self.issue_compute_requests().await;
     }
@@ -992,7 +994,8 @@ impl SessionActor {
         game.turns.push(next.clone());
 
         // Snapshots are datagram-class: unreliable, redundant, single-packet.
-        self.broadcast(Frame::Snapshot(encode(&ServerMsg::Turn(next)).into())).await;
+        self.broadcast(Frame::Snapshot(encode(&ServerMsg::Turn(next)).into()))
+            .await;
 
         if over {
             self.finish_game().await;
@@ -1035,10 +1038,8 @@ impl SessionActor {
         let db = self.db.clone();
         let started = game.started_at_ms;
         let finished = now_ms();
-        let saved = tokio::task::spawn_blocking(move || {
-            db.insert_game(started, finished, &record)
-        })
-        .await;
+        let saved =
+            tokio::task::spawn_blocking(move || db.insert_game(started, finished, &record)).await;
 
         // One line per host: how the device actually behaved this game.
         for (conn_id, acc) in &game.compute {
@@ -1247,8 +1248,7 @@ impl SessionActor {
                 BotDifficulty::Medium => 0.5,
                 BotDifficulty::Hard => 1.0,
             };
-            let think_ms =
-                (window * difficulty_factor * share).clamp(20.0, 2_000.0) as u32;
+            let think_ms = (window * difficulty_factor * share).clamp(20.0, 2_000.0) as u32;
             let request_id = self.next_request_id;
             self.next_request_id += 1;
             let nonce = rand::random::<u64>();
@@ -1305,7 +1305,8 @@ impl SessionActor {
             last_game_id: self.last_game_id,
         };
         self.publish_info();
-        self.broadcast(control_frame(&ServerMsg::Lobby(state))).await;
+        self.broadcast(control_frame(&ServerMsg::Lobby(state)))
+            .await;
     }
 
     /// Send a pre-encoded frame to every connection; drop connections whose

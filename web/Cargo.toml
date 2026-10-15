@@ -17,6 +17,7 @@ web-sys = { version = "0.3", features = [
     "Navigator", "ShareData", "Clipboard",
     "HtmlInputElement", "HtmlSelectElement",
     "WebTransport", "WebTransportBidirectionalStream",
+    "WebTransportOptions", "WebTransportHash",
     "Worker", "WorkerOptions", "WorkerType", "Blob", "BlobPropertyBag", "Url",
     "WebTransportDatagramDuplexStream", "WebTransportReceiveStream",
     "WebTransportSendStream", "WebTransportCloseInfo",

@@ -25,7 +25,9 @@ fn info(name: &str) -> ProfileInfo {
 
 async fn write_frame(send: &mut SendStream, msg: &ClientMsg) {
     let bytes = encode(msg);
-    send.write_all(&(bytes.len() as u32).to_le_bytes()).await.unwrap();
+    send.write_all(&(bytes.len() as u32).to_le_bytes())
+        .await
+        .unwrap();
     send.write_all(&bytes).await.unwrap();
 }
 
@@ -89,7 +91,12 @@ impl Client {
                 }
             }
         });
-        Client { conn, seen_requests: std::collections::HashSet::new(), send, rx }
+        Client {
+            conn,
+            seen_requests: std::collections::HashSet::new(),
+            send,
+            rx,
+        }
     }
 
     async fn control(&mut self, msg: &ClientMsg) {
@@ -235,11 +242,13 @@ async fn two_players_play_a_full_game() {
 
     // Sessions API lists the (post-game) lobby.
     let body = http_get(http_port, "/api/sessions").await;
-    assert!(body.contains("e2e-test"), "sessions list missing id: {body}");
+    assert!(
+        body.contains("e2e-test"),
+        "sessions list missing id: {body}"
+    );
 
     // Reconnect with the same secret -> same public identity.
-    let mut alice2 =
-        Client::connect(wt_port, "e2e-test", "alice-secret-0000", info("alice")).await;
+    let mut alice2 = Client::connect(wt_port, "e2e-test", "alice-secret-0000", info("alice")).await;
     match alice2.next_msg().await {
         ServerMsg::Welcome { your_id } => assert_eq!(your_id, alice_id),
         other => panic!("expected welcome, got {other:?}"),
@@ -350,7 +359,9 @@ async fn distributed_compute_round_trip() {
             cores: 8,
         })
         .await;
-    alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Medium)).await;
+    alice
+        .control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Medium))
+        .await;
     alice.control(&ClientMsg::SetReady(true)).await;
     alice.control(&ClientMsg::Start).await;
 
@@ -370,10 +381,8 @@ async fn distributed_compute_round_trip() {
                 compute_requests += 1;
                 // What the browser does: search until the deadline, then
                 // answer with the nonce+request binding checksum.
-                let deadline =
-                    std::time::Instant::now() + Duration::from_millis(think_ms as u64);
-                let mut search =
-                    snek_shared::bot::begin(&config, &turn, &bot_id, u32::MAX, nonce);
+                let deadline = std::time::Instant::now() + Duration::from_millis(think_ms as u64);
+                let mut search = snek_shared::bot::begin(&config, &turn, &bot_id, u32::MAX, nonce);
                 let mut sims = 0u32;
                 while !search.step(128) {
                     sims += 128;
@@ -395,7 +404,8 @@ async fn distributed_compute_round_trip() {
                             think_ms,
                             sims,
                             slices: sims / 128,
-                            fallback: false, loop_lag_ms: 0,
+                            fallback: false,
+                            loop_lag_ms: 0,
                         },
                     })
                     .await;
@@ -405,7 +415,9 @@ async fn distributed_compute_round_trip() {
             }
             ServerMsg::GameSaved { compute, .. } => {
                 assert!(
-                    compute.iter().any(|c| c.device == "e2e test rig" && c.moves > 0),
+                    compute
+                        .iter()
+                        .any(|c| c.device == "e2e test rig" && c.moves > 0),
                     "compute stats missing our device: {compute:?}"
                 );
                 break;
@@ -446,26 +458,25 @@ async fn tick_cadence_is_steady() {
         }))
         .await;
     // A bot adds per-tick work (request issuance) without needing a host.
-    alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Hard)).await;
+    alice
+        .control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Hard))
+        .await;
     alice.control(&ClientMsg::SetReady(true)).await;
     alice.control(&ClientMsg::Start).await;
 
     let mut arrivals: Vec<std::time::Instant> = Vec::new();
     let mut last_turn = 0u32;
     while arrivals.len() < 14 {
-        match alice.next_msg().await {
-            ServerMsg::Turn(t) => {
-                // Dedup the redundant snapshot echoes, like the real client.
-                if t.turn_number <= last_turn {
-                    continue;
-                }
-                last_turn = t.turn_number;
-                arrivals.push(std::time::Instant::now());
-                if t.game_over() {
-                    break;
-                }
+        if let ServerMsg::Turn(t) = alice.next_msg().await {
+            // Dedup the redundant snapshot echoes, like the real client.
+            if t.turn_number <= last_turn {
+                continue;
             }
-            _ => {}
+            last_turn = t.turn_number;
+            arrivals.push(std::time::Instant::now());
+            if t.game_over() {
+                break;
+            }
         }
         // Steer in a circle to stay alive long enough.
         let dir = match arrivals.len() % 20 {
@@ -525,7 +536,9 @@ async fn sleeping_host_pauses_the_game() {
             cores: 8,
         })
         .await;
-    alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Easy)).await;
+    alice
+        .control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Easy))
+        .await;
     alice.control(&ClientMsg::SetReady(true)).await;
     alice.control(&ClientMsg::Start).await;
 
@@ -534,9 +547,15 @@ async fn sleeping_host_pauses_the_game() {
     while turns < 3 {
         match tokio::time::timeout(Duration::from_secs(5), alice.next_msg()).await {
             Ok(ServerMsg::Turn(_)) => turns += 1,
-            Ok(ServerMsg::ComputeRequest { request_id, bot_id, config, turn, nonce, .. }) => {
-                let mut search =
-                    snek_shared::bot::begin(&config, &turn, &bot_id, 200, nonce);
+            Ok(ServerMsg::ComputeRequest {
+                request_id,
+                bot_id,
+                config,
+                turn,
+                nonce,
+                ..
+            }) => {
+                let mut search = snek_shared::bot::begin(&config, &turn, &bot_id, 200, nonce);
                 while !search.step(64) {}
                 let (dir, _) = search.result();
                 let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
@@ -546,8 +565,14 @@ async fn sleeping_host_pauses_the_game() {
                         dir,
                         proof,
                         tm: snek_shared::protocol::ComputeTelemetry {
-                            queue_ms: 0, search_ms: 10, total_ms: 10,
-                            think_ms: 100, sims: 200, slices: 3, fallback: false, loop_lag_ms: 0,
+                            queue_ms: 0,
+                            search_ms: 10,
+                            total_ms: 10,
+                            think_ms: 100,
+                            sims: 200,
+                            slices: 3,
+                            fallback: false,
+                            loop_lag_ms: 0,
                         },
                     })
                     .await;
@@ -558,7 +583,9 @@ async fn sleeping_host_pauses_the_game() {
     }
 
     // Screen off.
-    alice.control(&ClientMsg::HostAvailable { can_compute: false }).await;
+    alice
+        .control(&ClientMsg::HostAvailable { can_compute: false })
+        .await;
 
     // At most the tick already in flight may land; after that, silence.
     // The pings matter: a hidden page still gets the odd message out, and
@@ -580,7 +607,9 @@ async fn sleeping_host_pauses_the_game() {
     );
 
     // Screen on: the game resumes.
-    alice.control(&ClientMsg::HostAvailable { can_compute: true }).await;
+    alice
+        .control(&ClientMsg::HostAvailable { can_compute: true })
+        .await;
     let mut resumed = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
@@ -589,18 +618,32 @@ async fn sleeping_host_pauses_the_game() {
                 resumed = true;
                 break;
             }
-            Ok(ServerMsg::ComputeRequest { request_id, bot_id, config, turn, nonce, .. }) => {
-                let mut search =
-                    snek_shared::bot::begin(&config, &turn, &bot_id, 200, nonce);
+            Ok(ServerMsg::ComputeRequest {
+                request_id,
+                bot_id,
+                config,
+                turn,
+                nonce,
+                ..
+            }) => {
+                let mut search = snek_shared::bot::begin(&config, &turn, &bot_id, 200, nonce);
                 while !search.step(64) {}
                 let (dir, _) = search.result();
                 let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
                 alice
                     .control(&ClientMsg::BotMove {
-                        request_id, dir, proof,
+                        request_id,
+                        dir,
+                        proof,
                         tm: snek_shared::protocol::ComputeTelemetry {
-                            queue_ms: 0, search_ms: 10, total_ms: 10,
-                            think_ms: 100, sims: 200, slices: 3, fallback: false, loop_lag_ms: 0,
+                            queue_ms: 0,
+                            search_ms: 10,
+                            total_ms: 10,
+                            think_ms: 100,
+                            sims: 200,
+                            slices: 3,
+                            fallback: false,
+                            loop_lag_ms: 0,
                         },
                     })
                     .await;
@@ -646,7 +689,9 @@ async fn a_silent_host_recovers_on_keepalives_alone() {
             cores: 8,
         })
         .await;
-    alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Easy)).await;
+    alice
+        .control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Easy))
+        .await;
     alice.control(&ClientMsg::SetReady(true)).await;
     alice.control(&ClientMsg::Start).await;
 
@@ -669,7 +714,10 @@ async fn a_silent_host_recovers_on_keepalives_alone() {
 
     // The only traffic a watching device produces. This must revive it.
     for _ in 0..6 {
-        alice.conn.send_datagram(encode(&ClientMsg::Ping(7))).unwrap();
+        alice
+            .conn
+            .send_datagram(encode(&ClientMsg::Ping(7)))
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
     let mut resumed = 0u32;
@@ -706,8 +754,7 @@ async fn answering_late_shrinks_the_thinking_window() {
     let wt_port = endpoint.local_addr().unwrap().port();
     tokio::spawn(snek_server::wt::serve(endpoint, registry));
 
-    let mut alice =
-        Client::connect(wt_port, "late-test", "alice-secret-0000", info("alice")).await;
+    let mut alice = Client::connect(wt_port, "late-test", "alice-secret-0000", info("alice")).await;
     alice
         .control(&ClientMsg::Configure(GameConfig {
             board_width: 11,
@@ -723,7 +770,9 @@ async fn answering_late_shrinks_the_thinking_window() {
             cores: 8,
         })
         .await;
-    alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Hard)).await;
+    alice
+        .control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Hard))
+        .await;
     alice.control(&ClientMsg::SetReady(true)).await;
     alice.control(&ClientMsg::Start).await;
 
@@ -733,7 +782,15 @@ async fn answering_late_shrinks_the_thinking_window() {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline && answered < 6 {
         match tokio::time::timeout(Duration::from_millis(500), alice.next_msg()).await {
-            Ok(ServerMsg::ComputeRequest { request_id, bot_id, config, turn, think_ms, nonce, .. }) => {
+            Ok(ServerMsg::ComputeRequest {
+                request_id,
+                bot_id,
+                config,
+                turn,
+                think_ms,
+                nonce,
+                ..
+            }) => {
                 if first_window == 0 {
                     first_window = think_ms;
                 }
@@ -751,10 +808,18 @@ async fn answering_late_shrinks_the_thinking_window() {
                 tokio::time::sleep(Duration::from_millis(think_ms as u64 + 700)).await;
                 alice
                     .control(&ClientMsg::BotMove {
-                        request_id, dir, proof,
+                        request_id,
+                        dir,
+                        proof,
                         tm: snek_shared::protocol::ComputeTelemetry {
-                            queue_ms: 300, search_ms: 50, total_ms: think_ms + 700,
-                            think_ms, sims: 64, slices: 1, fallback: false, loop_lag_ms: 0,
+                            queue_ms: 300,
+                            search_ms: 50,
+                            total_ms: think_ms + 700,
+                            think_ms,
+                            sims: 64,
+                            slices: 1,
+                            fallback: false,
+                            loop_lag_ms: 0,
                         },
                     })
                     .await;
@@ -763,7 +828,10 @@ async fn answering_late_shrinks_the_thinking_window() {
             Err(_) => {}
         }
     }
-    assert!(answered >= 4, "never got enough compute requests: {answered}");
+    assert!(
+        answered >= 4,
+        "never got enough compute requests: {answered}"
+    );
     // One backoff is the whole point: it proves lateness is heard at all.
     // Repeated lateness keeps compounding it down to the 0.45 floor, but a
     // bot that isn't being steered dies quickly, which ends the game before
@@ -811,7 +879,9 @@ async fn the_thinking_window_is_at_most_half_the_tick() {
         .await;
     // Hard is the greediest setting, and one bot on a 16-core device is the
     // case where nothing else trims the window.
-    alice.control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Hard)).await;
+    alice
+        .control(&ClientMsg::AddBot(snek_shared::BotDifficulty::Hard))
+        .await;
     alice.control(&ClientMsg::SetReady(true)).await;
     alice.control(&ClientMsg::Start).await;
 
@@ -874,7 +944,11 @@ async fn pausing_holds_the_game_and_food_is_recorded() {
             Err(_) => {}
         }
     }
-    assert_eq!(saw_food.as_deref(), Some("🌮"), "game started with the wrong food");
+    assert_eq!(
+        saw_food.as_deref(),
+        Some("🌮"),
+        "game started with the wrong food"
+    );
     assert!(turns >= 1, "game never got going");
 
     alice.control(&ClientMsg::SetPaused(true)).await;
@@ -889,7 +963,10 @@ async fn pausing_holds_the_game_and_food_is_recorded() {
             Err(_) => {}
         }
     }
-    assert!(while_held <= 1, "game kept playing while held: {while_held} turns");
+    assert!(
+        while_held <= 1,
+        "game kept playing while held: {while_held} turns"
+    );
 
     // Bob sees the hold too — it is the game's state, not one screen's.
     let mut bob_saw_pause = false;
@@ -900,7 +977,10 @@ async fn pausing_holds_the_game_and_food_is_recorded() {
             Err(_) => break,
         }
     }
-    assert!(bob_saw_pause, "the other player was never told the game was held");
+    assert!(
+        bob_saw_pause,
+        "the other player was never told the game was held"
+    );
 
     alice.control(&ClientMsg::SetPaused(false)).await;
     let mut resumed = false;
@@ -931,12 +1011,11 @@ fn a_compute_request_fits_in_one_datagram() {
         tick_ms: 500,
         food_emoji: "🍩".to_string(),
     };
-    let ids: Vec<snek_shared::PlayerId> =
-        (0..4).map(|i| format!("bot-{i}").into()).collect();
+    let ids: Vec<snek_shared::PlayerId> = (0..4).map(|i| format!("bot-{i}")).collect();
     let mut engine = snek_shared::Engine::new(config.clone(), ids.clone(), 7);
     let mut turn = engine.first_turn();
     // Grow everyone to a realistic late-game length.
-    for (_, snake) in turn.snakes.iter_mut() {
+    for snake in turn.snakes.values_mut() {
         let head = snake[0];
         *snake = (0..30).map(|i| head.saturating_sub(i)).collect();
     }
@@ -1038,7 +1117,10 @@ async fn a_dropped_connection_keeps_its_seat() {
                 lobby.ready.contains(&alice_id) && lobby.players.iter().any(|p| p.id == alice_id);
         }
     }
-    assert!(still_ready, "alice came back and had to ready up all over again");
+    assert!(
+        still_ready,
+        "alice came back and had to ready up all over again"
+    );
 }
 
 /// A client running code the server has moved past must be told so, and
@@ -1092,7 +1174,6 @@ async fn a_stale_client_is_told_to_refresh() {
     }
 }
 
-
 /// Readying up after a game starts the next one, exactly as it does in the
 /// lobby — the end screen offers the same decision, so it must work the
 /// same way.
@@ -1109,7 +1190,8 @@ async fn readying_up_after_a_game_starts_another() {
     let wt_port = endpoint.local_addr().unwrap().port();
     tokio::spawn(snek_server::wt::serve(endpoint, registry));
 
-    let mut alice = Client::connect(wt_port, "again-test", "alice-secret-0000", info("alice")).await;
+    let mut alice =
+        Client::connect(wt_port, "again-test", "alice-secret-0000", info("alice")).await;
     let mut bob = Client::connect(wt_port, "again-test", "bob-secret-000000", info("bob")).await;
     alice
         .control(&ClientMsg::Configure(GameConfig {
@@ -1152,6 +1234,12 @@ async fn readying_up_after_a_game_starts_another() {
         }
         false
     }
-    assert!(started(&mut alice).await, "the player who started it wasn't dealt in");
-    assert!(started(&mut bob).await, "the other player was left behind in the lobby");
+    assert!(
+        started(&mut alice).await,
+        "the player who started it wasn't dealt in"
+    );
+    assert!(
+        started(&mut bob).await,
+        "the other player was left behind in the lobby"
+    );
 }

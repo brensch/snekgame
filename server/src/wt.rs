@@ -182,7 +182,13 @@ async fn join_session(
         anyhow::bail!("bad profile");
     }
 
-    write_frame(&mut send, &encode(&ServerMsg::Welcome { your_id: profile.id.clone() })).await?;
+    write_frame(
+        &mut send,
+        &encode(&ServerMsg::Welcome {
+            your_id: profile.id.clone(),
+        }),
+    )
+    .await?;
 
     let conn_id = registry.new_conn_id();
     let (tx, mut rx) = conn_channel();
@@ -216,7 +222,7 @@ async fn join_session(
                             .map(|m| bytes.len() <= m)
                             .unwrap_or(false);
                         if fits {
-                            let _ = out_conn.send_datagram(bytes.to_vec());
+                            let _ = out_conn.send_datagram(&bytes);
                             echo = Some((
                                 bytes,
                                 tokio::time::Instant::now() + SNAPSHOT_ECHO_DELAY,
@@ -229,7 +235,7 @@ async fn join_session(
                 },
                 _ = echo_sleep => {
                     if let Some((bytes, _)) = echo.take() {
-                        let _ = out_conn.send_datagram(bytes.to_vec());
+                        let _ = out_conn.send_datagram(&bytes);
                     }
                 }
             }
@@ -257,9 +263,11 @@ async fn join_session(
                 // Everything latency-critical arrives here: player input
                 // and bot answers alike. Duplicates are harmless — the
                 // session drops any request id it has already retired.
-                Some(msg @ (ClientMsg::Move(_)
+                Some(
+                    msg @ (ClientMsg::Move(_)
                     | ClientMsg::BotMove { .. }
-                    | ClientMsg::ComputeFailed { .. })) => {
+                    | ClientMsg::ComputeFailed { .. }),
+                ) => {
                     if dgram_actor.send(Cmd::Msg { conn_id, msg }).await.is_err() {
                         break;
                     }
@@ -270,16 +278,11 @@ async fn join_session(
     });
 
     // Inbound control frames until the client goes away.
-    loop {
-        match read_frame(&mut recv).await {
-            Ok(Some(bytes)) => {
-                if let Some(msg) = decode::<ClientMsg>(&bytes) {
-                    if actor.send(Cmd::Msg { conn_id, msg }).await.is_err() {
-                        break;
-                    }
-                }
+    while let Ok(Some(bytes)) = read_frame(&mut recv).await {
+        if let Some(msg) = decode::<ClientMsg>(&bytes) {
+            if actor.send(Cmd::Msg { conn_id, msg }).await.is_err() {
+                break;
             }
-            _ => break,
         }
     }
 
@@ -295,9 +298,8 @@ async fn join_session(
 
 async fn read_frame(recv: &mut RecvStream) -> anyhow::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
-    match read_exact(recv, &mut len_buf).await? {
-        false => return Ok(None),
-        true => {}
+    if !read_exact(recv, &mut len_buf).await? {
+        return Ok(None);
     }
     let len = u32::from_le_bytes(len_buf);
     if len > MAX_CONTROL_FRAME {

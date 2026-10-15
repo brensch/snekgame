@@ -82,17 +82,17 @@ pub fn app() -> impl IntoView {
             }
         };
         measure();
-        let cb = Closure::<dyn FnMut()>::new(move || measure());
+        let cb = Closure::<dyn FnMut()>::new(measure);
         if let Some(w) = web_sys::window() {
             let _ = w.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
-            let _ =
-                w.add_event_listener_with_callback("orientationchange", cb.as_ref().unchecked_ref());
+            let _ = w
+                .add_event_listener_with_callback("orientationchange", cb.as_ref().unchecked_ref());
         }
         cb.forget();
         // The header isn't in the DOM on the very first pass; catch it once
         // it is, and again after fonts settle.
         for delay in [0, 250, 1_000] {
-            let cb = Closure::<dyn FnMut()>::new(move || measure());
+            let cb = Closure::<dyn FnMut()>::new(measure);
             if let Some(w) = web_sys::window() {
                 let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(
                     cb.as_ref().unchecked_ref(),
@@ -199,7 +199,11 @@ pub fn app() -> impl IntoView {
             return; // a tap — handled by cell clicks
         }
         let dir = if dx.abs() >= dy.abs() {
-            if dx > 0 { Dir::Right } else { Dir::Left }
+            if dx > 0 {
+                Dir::Right
+            } else {
+                Dir::Left
+            }
         } else if dy > 0 {
             Dir::Down
         } else {
@@ -327,7 +331,9 @@ pub fn app() -> impl IntoView {
 /// clipboard where that exists; a plain prompt as the everywhere-fallback.
 /// Feature-checked with Reflect so nothing here can throw on plain http.
 fn share_session(word: &str, copied: RwSignal<bool>) {
-    let Some(window) = web_sys::window() else { return };
+    let Some(window) = web_sys::window() else {
+        return;
+    };
     let loc = window.location();
     let url = format!(
         "{}//{}/#/s/{}",
@@ -364,10 +370,7 @@ fn parse_hash(hash: &str) -> Route {
         ["s", name] => Route::Session(normalize_word(name)),
         ["history"] => Route::History,
         ["compute"] => Route::Compute,
-        ["history", id] => id
-            .parse()
-            .map(Route::Replay)
-            .unwrap_or(Route::History),
+        ["history", id] => id.parse().map(Route::Replay).unwrap_or(Route::History),
         _ => Route::Home,
     }
 }

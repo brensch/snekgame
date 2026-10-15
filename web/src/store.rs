@@ -148,14 +148,14 @@ pub fn new_session_id() -> String {
     random_hex(8)
 }
 
-
 fn load_profile() -> ProfileInfo {
     let s = storage();
     let get = |key: &str| -> Option<String> { s.as_ref()?.get_item(key).ok()? };
 
     let random = || (js_sys::Math::random() * 1e9) as usize;
-    let emoji = get("snek_emoji")
-        .unwrap_or_else(|| crate::palette::EMOJIS[random() % crate::palette::EMOJIS.len()].to_string());
+    let emoji = get("snek_emoji").unwrap_or_else(|| {
+        crate::palette::EMOJIS[random() % crate::palette::EMOJIS.len()].to_string()
+    });
     let colour =
         get("snek_colour").unwrap_or_else(|| crate::palette::colour((random() % 360) as u32));
 

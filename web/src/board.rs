@@ -24,7 +24,7 @@ fn emoji_text(x: f64, y: f64, size: f64, glyph: &str) -> String {
 
 fn number_text(x: f64, y: f64, value: &str) -> String {
     format!(
-        r##"<text x="{x}" y="{y}" dy="0.36em" font-size="0.44" font-weight="bold" font-family="snek mono, Courier New, monospace" fill="#000" text-anchor="middle">{value}</text>"##
+        r##"<text x="{x}" y="{y}" dy="0.36em" font-size="0.44" font-weight="bold" font-family="snek mono, monospace" fill="#000" text-anchor="middle">{value}</text>"##
     )
 }
 
@@ -53,7 +53,11 @@ pub fn board_view(
     let mut field = String::new();
     for y in 1..h - 1 {
         for x in 1..w - 1 {
-            let fill = if (x + y) % 2 == 0 { CHECKER_A } else { CHECKER_B };
+            let fill = if (x + y) % 2 == 0 {
+                CHECKER_A
+            } else {
+                CHECKER_B
+            };
             field.push_str(&format!(
                 r##"<rect x="{x}" y="{y}" width="1" height="1" fill="{fill}"/>"##
             ));
@@ -112,7 +116,11 @@ pub fn board_view(
         // Numbers as the snek unfurls: length on the first body tile,
         // health on the one after.
         if let Some(&second) = path_cells.get(1) {
-            sneks.push_str(&number_text(cx(second), cy(second), &snake.len().to_string()));
+            sneks.push_str(&number_text(
+                cx(second),
+                cy(second),
+                &snake.len().to_string(),
+            ));
         }
         if let Some(&third) = path_cells.get(2) {
             let hp = turn.health.get(player_id).copied().unwrap_or(0);
@@ -193,8 +201,8 @@ pub fn board_view(
                 };
                 let left = rect.left() + (rect.width() - bw) / 2.0;
                 let top = rect.top() + (rect.height() - bh) / 2.0;
-                let fx = (ev.client_x() as f64 - left) / bw;
-                let fy = (ev.client_y() as f64 - top) / bh;
+                let fx = (ev.client_x() - left) / bw;
+                let fy = (ev.client_y() - top) / bh;
                 if !(0.0..1.0).contains(&fx) || !(0.0..1.0).contains(&fy) {
                     return; // in the margin beside the board
                 }

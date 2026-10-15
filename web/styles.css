@@ -1,23 +1,14 @@
-/* One family for the whole app. Machines that have Courier New (Mac,
-   Windows, iOS) use it and download nothing; everyone else — Linux, Android,
-   where a bare "Courier New" quietly becomes some other monospace — gets
-   Courier Prime, an open Courier drawn for screens, ~19 KB per weight,
-   Latin only. local() matches the exact installed face, not a lookalike. */
+/* One font, the same on every device: Cutive Mono, self-hosted (~22 KB,
+   Latin only). Nothing installed locally is ever used instead, so a phone
+   and a laptop look alike. index.html preloads it, and font-display: block
+   holds text back for the moment it takes rather than flashing another
+   face first. It has one weight; bold is synthesised from it. */
 @font-face {
   font-family: "snek mono";
   font-style: normal;
   font-weight: 400;
-  font-display: swap;
-  src: local("Courier New"), local("CourierNewPSMT"),
-    url(fonts/courier-prime-v11-400.woff2) format("woff2");
-}
-@font-face {
-  font-family: "snek mono";
-  font-style: normal;
-  font-weight: 700;
-  font-display: swap;
-  src: local("Courier New Bold"), local("CourierNewPS-BoldMT"),
-    url(fonts/courier-prime-v11-700.woff2) format("woff2");
+  font-display: block;
+  src: url(fonts/cutive-mono-v23-400.woff2) format("woff2");
 }
 
 :root {
@@ -43,7 +34,7 @@ body {
   margin: 0;
   background: #fff;
   color: #000;
-  font-family: "snek mono", "Courier New", Courier, monospace;
+  font-family: "snek mono", monospace;
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -654,15 +645,29 @@ tr.clickable {
   bottom: 14px;
 }
 
-/* A square key holding just an emoji. */
+/* Just the emoji, no key around it; the button stays thumb-sized so it is
+   still easy to hit. */
+button.icon-btn,
+button.icon-btn:hover:not(:disabled),
+button.icon-btn:focus-visible,
+button.icon-btn:active {
+  border: none;
+  background: none;
+  box-shadow: none;
+  transform: none;
+}
 button.icon-btn {
-  width: 48px;
-  height: 48px;
+  width: 44px;
+  height: 44px;
   padding: 0;
-  font-size: 22px;
+  font-size: 26px;
   line-height: 1;
   display: grid;
   place-items: center;
+}
+button.icon-btn:focus-visible {
+  outline: 2px solid #000;
+  outline-offset: 2px;
 }
 
 /* --- the play screen ----------------------------------------------------

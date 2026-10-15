@@ -10,7 +10,11 @@ use snek_shared::protocol::{ClientMsg, LobbyState};
 use snek_shared::{is_bot, is_draw, BotDifficulty, Dir, GameConfig, Pos, Turn};
 
 const BOARD_SIZES: &[(&str, u8)] = &[("Small", 11), ("Medium", 13), ("Large", 17)];
-const SPEEDS: &[(&str, u32)] = &[("Chill (2s)", 2000), ("Normal (1s)", 1000), ("Fast (0.5s)", 500)];
+const SPEEDS: &[(&str, u32)] = &[
+    ("Chill (2s)", 2000),
+    ("Normal (1s)", 1000),
+    ("Fast (0.5s)", 500),
+];
 
 pub fn session_page(_session: String) -> impl IntoView {
     let store = Store::use_store();
@@ -382,7 +386,7 @@ fn emoji_rain(emoji: String) -> impl IntoView {
             let size = 20 + (i * 61) % 22;
             // Every drop spins its own way: random-ish amount, either
             // direction.
-            let spin = (180 + (i * 97) % 420) as i32 * if (i * 7 + 3) % 2 == 0 { 1 } else { -1 };
+            let spin = (180 + (i * 97) % 420) * if (i * 7 + 3) % 2 == 0 { 1 } else { -1 };
             view! {
                 <span style=format!(
                     "left: {left}%; animation-delay: {delay_ms}ms; \
@@ -470,7 +474,11 @@ fn game_view(game: GameView) -> impl IntoView {
             return;
         }
         let dir = if dx.abs() >= dy.abs() {
-            if dx > 0 { Dir::Right } else { Dir::Left }
+            if dx > 0 {
+                Dir::Right
+            } else {
+                Dir::Left
+            }
         } else if dy > 0 {
             Dir::Down
         } else {

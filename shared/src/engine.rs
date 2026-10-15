@@ -361,11 +361,7 @@ impl Engine {
         for (&pos, players_here) in &heads_at {
             if players_here.len() > 1 {
                 // Head-on: the shortest snek(s) die.
-                let min_len = players_here
-                    .iter()
-                    .map(|p| snakes[p].len())
-                    .min()
-                    .unwrap();
+                let min_len = players_here.iter().map(|p| snakes[p].len()).min().unwrap();
                 for p in players_here {
                     if snakes[p].len() == min_len && !dead.contains(p) {
                         dead.push(p.clone());
@@ -452,7 +448,7 @@ impl Engine {
                     length: snakes.get(p).map(|s| s.len() as u16).unwrap_or(0),
                 })
                 .collect();
-            winners.sort_by(|a, b| b.survival_turns.cmp(&a.survival_turns));
+            winners.sort_by_key(|w| std::cmp::Reverse(w.survival_turns));
             winners
         } else {
             Vec::new()
@@ -559,7 +555,12 @@ mod tests {
             t.food.contains(&((cy * w + cx) as Pos)),
             "centre food is mandatory"
         );
-        assert_eq!(t.food.len(), 5, "one per snek plus the centre: {:?}", t.food);
+        assert_eq!(
+            t.food.len(),
+            5,
+            "one per snek plus the centre: {:?}",
+            t.food
+        );
 
         let heads: Vec<(i16, i16)> = t.snakes.values().map(|s| xy(s[0])).collect();
         for &f in &t.food {
@@ -578,9 +579,8 @@ mod tests {
                 .iter()
                 .find(|&&(hx, hy)| (fx - hx).abs() == 1 && (fy - hy).abs() == 1)
                 .copied();
-            let (hx, hy) = owner.unwrap_or_else(|| {
-                panic!("food {:?} is not diagonal to any head", (fx, fy))
-            });
+            let (hx, hy) =
+                owner.unwrap_or_else(|| panic!("food {:?} is not diagonal to any head", (fx, fy)));
             let away = (fx < hx && hx < cx)
                 || (cx < hx && hx < fx)
                 || (fy < hy && hy < cy)
@@ -685,9 +685,17 @@ mod tests {
                 break;
             }
             let dir = if x != fx {
-                if fx > x { Dir::Right } else { Dir::Left }
+                if fx > x {
+                    Dir::Right
+                } else {
+                    Dir::Left
+                }
             } else if y != fy {
-                if fy > y { Dir::Down } else { Dir::Up }
+                if fy > y {
+                    Dir::Down
+                } else {
+                    Dir::Up
+                }
             } else {
                 break;
             };
@@ -716,14 +724,14 @@ mod tests {
         let expected = |pos: Pos| {
             let (x, y) = (pos % 13, pos / 13);
             match (x, y) {
-                (2, 2) => Dir::Right,   // top-left corner
-                (10, 2) => Dir::Down,   // top-right corner
-                (2, 10) => Dir::Up,     // bottom-left corner
-                (10, 10) => Dir::Left,  // bottom-right corner
-                (6, 2) => Dir::Right,   // top mid
-                (10, 6) => Dir::Down,   // right mid
-                (6, 10) => Dir::Left,   // bottom mid
-                (2, 6) => Dir::Up,      // left mid
+                (2, 2) => Dir::Right,  // top-left corner
+                (10, 2) => Dir::Down,  // top-right corner
+                (2, 10) => Dir::Up,    // bottom-left corner
+                (10, 10) => Dir::Left, // bottom-right corner
+                (6, 2) => Dir::Right,  // top mid
+                (10, 6) => Dir::Down,  // right mid
+                (6, 10) => Dir::Left,  // bottom mid
+                (2, 6) => Dir::Up,     // left mid
                 other => panic!("unexpected spawn position {other:?}"),
             }
         };
@@ -776,10 +784,7 @@ mod tests {
             clashes: Vec::new(),
             winners: Vec::new(),
         };
-        let next = engine.next_turn(
-            &turn,
-            &moves(&[("a", Dir::Right), ("b", Dir::Down)]),
-        );
+        let next = engine.next_turn(&turn, &moves(&[("a", Dir::Right), ("b", Dir::Down)]));
         assert!(!next.alive.contains(&a), "A hit the wall and must die");
         assert!(
             next.alive.contains(&b),
@@ -816,7 +821,10 @@ mod tests {
                 break;
             }
             let dir = if i % 3 == 0 { Dir::Down } else { Dir::Right };
-            let next = e.next_turn(turns.last().unwrap(), &moves(&[("a", dir), ("b", Dir::Down)]));
+            let next = e.next_turn(
+                turns.last().unwrap(),
+                &moves(&[("a", dir), ("b", Dir::Down)]),
+            );
             turns.push(next);
         }
         let record = GameRecord {

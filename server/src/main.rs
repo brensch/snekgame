@@ -5,13 +5,11 @@ use std::path::PathBuf;
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
-    let db_path =
-        PathBuf::from(std::env::var("SNEK_DB").unwrap_or_else(|_| "snek.db".to_string()));
+    let db_path = PathBuf::from(std::env::var("SNEK_DB").unwrap_or_else(|_| "snek.db".to_string()));
     let (app, registry) = snek_server::build(&db_path);
 
     // WebTransport (QUIC) — the game transport.
@@ -26,6 +24,29 @@ async fn main() {
         snek_server::wt::build_endpoint(wt_port, &identity).expect("failed to bind WT endpoint");
     tracing::info!("webtransport listening on udp {wt_port}");
     tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    // Local dev only: with no real certificate the identity is self-signed,
+    // which a browser will accept only if told its hash up front. A page
+    // served from localhost asks for it here (see wt_target in net.rs). A
+    // server with real certs never registers the route.
+    let self_signed = std::env::var("SNEK_CERT").is_err();
+    let app = if self_signed {
+        let cert_hash: Vec<u8> = identity.certificate_chain().as_slice()[0]
+            .hash()
+            .as_ref()
+            .to_vec();
+        app.route(
+            "/api/dev/wt",
+            axum::routing::get(move || {
+                let cert_hash = cert_hash.clone();
+                async move {
+                    axum::Json(serde_json::json!({ "port": wt_port, "certHash": cert_hash }))
+                }
+            }),
+        )
+    } else {
+        app
+    };
 
     // HTTP — static frontend + read-only APIs (behind Caddy).
     let port: u16 = std::env::var("SNEK_PORT")

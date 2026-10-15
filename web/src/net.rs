@@ -114,7 +114,9 @@ fn diagnose_after_failure(store: Store, generation: u64) {
             .unwrap_or(false);
         // Only claim it if the attempt is still the live one and TCP really
         // did answer — otherwise this is just an offline phone.
-        if tcp_works && is_current(generation) && store.conn.get_untracked() != ConnStatus::Connected
+        if tcp_works
+            && is_current(generation)
+            && store.conn.get_untracked() != ConnStatus::Connected
         {
             store.quic_blocked.set(true);
         }
@@ -356,11 +358,51 @@ fn datagram_writer(
     stream.get_writer()
 }
 
+/// Local dev: a page served from localhost talks to a snek-server that has
+/// no real certificate, only a self-signed one. Browsers accept that over
+/// WebTransport only if handed the certificate's hash up front, which that
+/// server publishes at /api/dev/wt along with its port. Anywhere else this
+/// is never asked and the normal :443 connection is made.
+async fn dev_wt() -> Option<(u16, Vec<u8>)> {
+    let host = web_sys::window()?.location().hostname().ok()?;
+    if host != "localhost" && host != "127.0.0.1" {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct DevWt {
+        port: u16,
+        #[serde(rename = "certHash")]
+        cert_hash: Vec<u8>,
+    }
+    let resp = gloo_net::http::Request::get("/api/dev/wt")
+        .send()
+        .await
+        .ok()?;
+    if !resp.ok() {
+        return None;
+    }
+    let dev: DevWt = resp.json().await.ok()?;
+    Some((dev.port, dev.cert_hash))
+}
+
+fn open_transport(dev: Option<(u16, Vec<u8>)>) -> Result<WebTransport, JsValue> {
+    let Some((port, cert_hash)) = dev else {
+        return WebTransport::new(&wt_url());
+    };
+    let host = web_sys::window()
+        .and_then(|w| w.location().hostname().ok())
+        .unwrap_or_default();
+    let hash = web_sys::WebTransportHash::new();
+    hash.set_algorithm("sha-256");
+    hash.set_value_u8_array(&js_sys::Uint8Array::from(&cert_hash[..]));
+    let opts = web_sys::WebTransportOptions::new();
+    opts.set_server_certificate_hashes(&[hash]);
+    WebTransport::new_with_options(&format!("https://{host}:{port}"), &opts)
+}
+
 fn webtransport_missing() -> bool {
     web_sys::window()
-        .map(|w| {
-            !js_sys::Reflect::has(&w, &"WebTransport".into()).unwrap_or(false)
-        })
+        .map(|w| !js_sys::Reflect::has(&w, &"WebTransport".into()).unwrap_or(false))
         .unwrap_or(true)
 }
 
@@ -376,7 +418,7 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
         store.conn.set(ConnStatus::Idle);
         return Ok(());
     }
-    let transport = WebTransport::new(&wt_url())?;
+    let transport = open_transport(dev_wt().await)?;
     // Register immediately so the attempt-timeout guard (and any newer
     // generation) can close a handshake that never resolves.
     ACTIVE.with(|a| {
@@ -435,17 +477,12 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
     let repeat = match mode {
         Mode::Session(_) => {
             let repeat = Interval::new(MOVE_REPEAT_MS, move || {
-                let live = store
-                    .game
-                    .with_untracked(|g| {
-                        g.as_ref()
-                            .and_then(|g| g.turns.last())
-                            .map(|t| {
-                                !t.game_over()
-                                    && t.alive.contains(&store.me.get_untracked())
-                            })
-                            .unwrap_or(false)
-                    });
+                let live = store.game.with_untracked(|g| {
+                    g.as_ref()
+                        .and_then(|g| g.turns.last())
+                        .map(|t| !t.game_over() && t.alive.contains(&store.me.get_untracked()))
+                        .unwrap_or(false)
+                });
                 if live {
                     if let Some(dir) = store.selected_dir.get_untracked() {
                         send_datagram(&ClientMsg::Move(dir));
@@ -478,7 +515,7 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
     // Reader: control stream (length-prefixed frames).
     {
         let mut stream = wasm_streams::ReadableStream::from_raw(
-            control_readable.unchecked_into::<web_sys::ReadableStream>().into(),
+            control_readable.unchecked_into::<web_sys::ReadableStream>(),
         )
         .into_stream();
         spawn_local(async move {
@@ -508,7 +545,7 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
     // Reader: datagrams (one message per datagram).
     {
         let mut stream = wasm_streams::ReadableStream::from_raw(
-            dgram_readable.unchecked_into::<web_sys::ReadableStream>().into(),
+            dgram_readable.unchecked_into::<web_sys::ReadableStream>(),
         )
         .into_stream();
         spawn_local(async move {
@@ -560,7 +597,7 @@ thread_local! {
     /// datagram and once on the stream — so a lost packet cannot hold it up.
     /// Only the copy that gets here first is worth searching.
     static HANDLED: RefCell<std::collections::VecDeque<u64>> =
-        RefCell::new(std::collections::VecDeque::new());
+        const { RefCell::new(std::collections::VecDeque::new()) };
 }
 
 /// True the first time this request is seen, false for its other copies.
@@ -710,14 +747,12 @@ fn apply(store: Store, msg: ServerMsg) {
             // lobby. A finished game (results screen) stays until the user
             // leaves it.
             if !lobby.game_running {
-                let stale_unfinished = store
-                    .game
-                    .with_untracked(|g| {
-                        g.as_ref()
-                            .and_then(|g| g.turns.last())
-                            .map(|t| !t.game_over())
-                            .unwrap_or(false)
-                    });
+                let stale_unfinished = store.game.with_untracked(|g| {
+                    g.as_ref()
+                        .and_then(|g| g.turns.last())
+                        .map(|t| !t.game_over())
+                        .unwrap_or(false)
+                });
                 if stale_unfinished {
                     store.game.set(None);
                     store.view_turn.set(None);
@@ -894,7 +929,12 @@ fn apply(store: Store, msg: ServerMsg) {
                 // once — which is exactly how three independent workers end
                 // up defaulting on the same turn. Sent twice; the server
                 // ignores the duplicate.
-                let msg = ClientMsg::BotMove { request_id, dir, proof, tm };
+                let msg = ClientMsg::BotMove {
+                    request_id,
+                    dir,
+                    proof,
+                    tm,
+                };
                 send_datagram(&msg);
                 send_datagram(&msg);
             });
@@ -910,9 +950,9 @@ fn apply(store: Store, msg: ServerMsg) {
             // would be worse than showing the error.
             if e.contains("version") && !reloaded_recently() {
                 if let Some(w) = web_sys::window() {
-                    let _ = w.session_storage().map(|s| {
-                        s.map(|s| s.set_item(RELOAD_KEY, &now().to_string()))
-                    });
+                    let _ = w
+                        .session_storage()
+                        .map(|s| s.map(|s| s.set_item(RELOAD_KEY, &now().to_string())));
                     let _ = w.location().reload();
                     return;
                 }

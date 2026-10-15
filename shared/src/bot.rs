@@ -64,13 +64,7 @@ const DIRS: [Dir; 4] = [Dir::Up, Dir::Down, Dir::Left, Dir::Right];
 /// proof: fnv1a over the nonce, the chosen move, and the root visit
 /// distribution. Identical on every platform for identical inputs, so any
 /// party can re-run the search and verify both outputs.
-pub fn think(
-    config: &GameConfig,
-    turn: &Turn,
-    me: &PlayerId,
-    sims: u32,
-    nonce: u64,
-) -> (Dir, u64) {
+pub fn think(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32, nonce: u64) -> (Dir, u64) {
     // Index the world: alive snakes in turn order, me somewhere among them.
     let order: Vec<&PlayerId> = turn.alive.iter().collect();
     let Some(me_idx) = order.iter().position(|p| *p == me) else {
@@ -125,9 +119,10 @@ fn fast_ln(x: f32) -> f32 {
     }
     let bits = x.to_bits();
     let e = ((bits >> 23) & 0xff) as i32 - 127;
-    let m = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000); // [1, 2)
+    // The mantissa, in [1, 2).
+    let m = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
     // Least-squares cubic fit of log2(m) on [1,2); max error ~1.3e-3.
-    let (a, b, c, d) = (0.153_937f32, -1.029_631_1, 3.010_984_8, -2.133_964_3);
+    let (a, b, c, d) = (0.153_937f32, -1.029_631_1, 3.010_985, -2.133_964_3);
     let l2 = ((a * m + b) * m + c) * m + d;
     core::f32::consts::LN_2 * (e as f32 + l2)
 }
@@ -219,12 +214,12 @@ impl FastBoard {
 
         // Movement (tail pops before self-check, exactly like the engine);
         // phase-1 deaths are removed immediately.
-        for i in 0..n {
+        for (i, &dir) in moves.iter().enumerate().take(n) {
             if !self.snakes[i].alive {
                 continue;
             }
             let head = self.snakes[i].head();
-            match self.step_dir(head, moves[i]) {
+            match self.step_dir(head, dir) {
                 Some(t) if !self.is_wall(t) => {
                     self.snakes[i].body.pop_back();
                     if self.snakes[i].body.contains(&t) {
@@ -243,7 +238,7 @@ impl FastBoard {
 
         // Cross-snake collisions among survivors, simultaneously.
         let mut died = [false; MAX_SNAKES];
-        for i in 0..n {
+        for (i, dead) in died.iter_mut().enumerate().take(n) {
             if !self.snakes[i].alive {
                 continue;
             }
@@ -256,17 +251,17 @@ impl FastBoard {
                 if self.snakes[j].head() == head {
                     // Head-on: shortest dies, ties kill both.
                     if my_len <= self.snakes[j].len() {
-                        died[i] = true;
+                        *dead = true;
                     }
                 } else if self.snakes[j].body.iter().skip(1).any(|&c| c == head) {
-                    died[i] = true;
+                    *dead = true;
                 }
             }
         }
 
-        for i in 0..n {
-            if died[i] && self.snakes[i].alive {
-                self.snakes[i].alive = false;
+        for (snake, &dead) in self.snakes.iter_mut().zip(&died) {
+            if dead && snake.alive {
+                snake.alive = false;
                 self.alive_count -= 1;
             }
         }
@@ -303,7 +298,10 @@ fn last_dir(board: &FastBoard, i: usize) -> Option<Dir> {
         return None;
     }
     let (head, neck) = (s.body[0] as i16, s.body[1] as i16);
-    match (head % board.w - neck % board.w, head / board.w - neck / board.w) {
+    match (
+        head % board.w - neck % board.w,
+        head / board.w - neck / board.w,
+    ) {
         (0, -1) => Some(Dir::Up),
         (0, 1) => Some(Dir::Down),
         (-1, 0) => Some(Dir::Left),
@@ -496,8 +494,7 @@ impl Search {
                 Some(&child) => cur = child,
                 None => {
                     let mut child = nodes[cur].board.clone();
-                    let moves: Vec<Dir> =
-                        (0..n).map(|i| nodes[cur].cands[i][cidx[i]]).collect();
+                    let moves: Vec<Dir> = (0..n).map(|i| nodes[cur].cands[i][cidx[i]]).collect();
                     child.step(&moves);
                     let vals = eval(&child);
                     let id = nodes.len();
@@ -560,13 +557,7 @@ fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64, eval: EvalFn
 
 /// Start a search that the caller drives with [`Search::step`]. Trivial
 /// positions (boxed in, or a single legal move) finish immediately.
-pub fn begin(
-    config: &GameConfig,
-    turn: &Turn,
-    me: &PlayerId,
-    sims: u32,
-    nonce: u64,
-) -> Search {
+pub fn begin(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32, nonce: u64) -> Search {
     let finished = |immediate: (Dir, u64)| Search {
         nodes: Vec::new(),
         path: Vec::new(),
@@ -709,17 +700,35 @@ const LEGACY: Tuning = Tuning {
 
 // Experiments, each isolated against the tuning it challenged.
 #[cfg(test)]
-const APPETITE_022: Tuning = Tuning { appetite_base: 0.22, ..TUNING };
+const APPETITE_022: Tuning = Tuning {
+    appetite_base: 0.22,
+    ..TUNING
+};
 #[cfg(test)]
-const APPETITE_060: Tuning = Tuning { appetite_base: 0.60, ..TUNING };
+const APPETITE_060: Tuning = Tuning {
+    appetite_base: 0.60,
+    ..TUNING
+};
 #[cfg(test)]
-const BLIND_CONTESTED: Tuning = Tuning { contested_food: 0.0, ..TUNING };
+const BLIND_CONTESTED: Tuning = Tuning {
+    contested_food: 0.0,
+    ..TUNING
+};
 #[cfg(test)]
-const LENGTH_HEAVY_ONLY: Tuning = Tuning { length_heavy: true, ..LEGACY };
+const LENGTH_HEAVY_ONLY: Tuning = Tuning {
+    length_heavy: true,
+    ..LEGACY
+};
 #[cfg(test)]
-const GROWTH_ONLY: Tuning = Tuning { growth: 0.7, ..LEGACY };
+const GROWTH_ONLY: Tuning = Tuning {
+    growth: 0.7,
+    ..LEGACY
+};
 #[cfg(test)]
-const BULLY: Tuning = Tuning { bully_target: true, ..PRE_GRADIENT };
+const BULLY: Tuning = Tuning {
+    bully_target: true,
+    ..PRE_GRADIENT
+};
 
 fn evaluate(board: &FastBoard) -> [f32; MAX_SNAKES] {
     evaluate_impl(board, TUNING)
@@ -936,8 +945,7 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
             // (that is opportunistic eating), more when hungry, more when
             // behind on length. Everything continuous — no switches.
             let deficit = ((longest_other + 1.0 - len) / 4.0).clamp(0.0, 1.0);
-            let appetite =
-                (tuning.appetite_base + 0.60 * hunger + 0.50 * deficit).min(1.0);
+            let appetite = (tuning.appetite_base + 0.60 * hunger + 0.50 * deficit).min(1.0);
             // Prefer food we own outright; fall back to food we merely tie
             // the race to, at a discount.
             let (dist, share) = if food_dist[i] != u16::MAX {
@@ -1189,13 +1197,7 @@ mod tests {
         assert_eq!(board.winner(), Some(1));
     }
 
-    fn think_with(
-        config: &GameConfig,
-        turn: &Turn,
-        me: &PlayerId,
-        sims: u32,
-        eval: EvalFn,
-    ) -> Dir {
+    fn think_with(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32, eval: EvalFn) -> Dir {
         let order: Vec<&PlayerId> = turn.alive.iter().collect();
         let Some(me_idx) = order.iter().position(|p| *p == me) else {
             return Dir::Up;
@@ -1340,7 +1342,11 @@ mod tests {
             }
             let m1 = think_with(&cfg, &turn, &a, 1_200, evaluate_pre_gradient);
             let m2 = think_with(&cfg, &turn, &a, 1_200, evaluate);
-            if m1 == m2 { same += 1 } else { diff += 1 }
+            if m1 == m2 {
+                same += 1
+            } else {
+                diff += 1
+            }
             let mut moves = BTreeMap::new();
             moves.insert(a.clone(), m1);
             if turn.alive.contains(&b) {
@@ -1354,15 +1360,34 @@ mod tests {
     #[test]
     #[ignore]
     fn arena_ablation() {
-        run_arena("growth-urgency only", evaluate_growth_only, evaluate_legacy, 30, 1_200);
-        run_arena("length-heavy only  ", evaluate_length_heavy, evaluate_legacy, 30, 1_200);
+        run_arena(
+            "growth-urgency only",
+            evaluate_growth_only,
+            evaluate_legacy,
+            30,
+            1_200,
+        );
+        run_arena(
+            "length-heavy only  ",
+            evaluate_length_heavy,
+            evaluate_legacy,
+            30,
+            1_200,
+        );
     }
 
     /// Bully candidates: each isolated against the shipped tuning.
     #[test]
     #[ignore]
     fn arena_bully_candidates() {
-        run_arena_on("bully-target", evaluate_bully, evaluate_pre_gradient, 30, 1_200, 13);
+        run_arena_on(
+            "bully-target",
+            evaluate_bully,
+            evaluate_pre_gradient,
+            30,
+            1_200,
+            13,
+        );
     }
 
     /// Does a continuous appetite + proximity gradient beat the shipped
@@ -1371,24 +1396,66 @@ mod tests {
     #[ignore]
     fn arena_gradient_food() {
         // The shipped model against the tuning it replaced.
-        run_arena_on("shipped (gradient)  ", evaluate, evaluate_pre_gradient, 40, 1_200, 13);
-        run_arena_on("contested food blind", evaluate_blind_contested, evaluate_pre_gradient, 30, 1_200, 13);
-        run_arena_on("appetite 0.22       ", evaluate_appetite_022, evaluate_pre_gradient, 30, 1_200, 13);
-        run_arena_on("appetite 0.60       ", evaluate_appetite_060, evaluate_pre_gradient, 30, 1_200, 13);
+        run_arena_on(
+            "shipped (gradient)  ",
+            evaluate,
+            evaluate_pre_gradient,
+            40,
+            1_200,
+            13,
+        );
+        run_arena_on(
+            "contested food blind",
+            evaluate_blind_contested,
+            evaluate_pre_gradient,
+            30,
+            1_200,
+            13,
+        );
+        run_arena_on(
+            "appetite 0.22       ",
+            evaluate_appetite_022,
+            evaluate_pre_gradient,
+            30,
+            1_200,
+            13,
+        );
+        run_arena_on(
+            "appetite 0.60       ",
+            evaluate_appetite_060,
+            evaluate_pre_gradient,
+            30,
+            1_200,
+            13,
+        );
     }
 
     /// Where does appetite peak now that contested food is visible?
     #[test]
     #[ignore]
     fn arena_appetite_sweep() {
-        run_arena_on("shipped @11x11", evaluate, evaluate_pre_gradient, 30, 1_200, 11);
+        run_arena_on(
+            "shipped @11x11",
+            evaluate,
+            evaluate_pre_gradient,
+            30,
+            1_200,
+            11,
+        );
     }
 
     /// How long should "early" last, and does the boost hold up?
     #[test]
     #[ignore]
     fn arena_early_sweep() {
-        run_arena_on("pre-gradient vs legacy", evaluate_pre_gradient, evaluate_legacy, 30, 1_200, 13);
+        run_arena_on(
+            "pre-gradient vs legacy",
+            evaluate_pre_gradient,
+            evaluate_legacy,
+            30,
+            1_200,
+            13,
+        );
     }
 
     /// Confirmation: does growth-urgency hold up at higher power, on the
@@ -1396,8 +1463,14 @@ mod tests {
     #[test]
     #[ignore]
     fn arena_confirm_growth() {
-        run_arena_on("shipped 0.7 @13x13", evaluate, evaluate_legacy, 40, 1_200, 13);
-
+        run_arena_on(
+            "shipped 0.7 @13x13",
+            evaluate,
+            evaluate_legacy,
+            40,
+            1_200,
+            13,
+        );
     }
 
     /// fast_ln tracks real ln closely enough for UCB.

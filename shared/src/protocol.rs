@@ -55,11 +55,16 @@ pub enum ClientMsg {
     /// Whether this device can currently compute. A backgrounded page or
     /// a locked screen suspends its workers, so it must say so — otherwise
     /// its bots quietly hold their heading into a wall.
-    HostAvailable { can_compute: bool },
+    HostAvailable {
+        can_compute: bool,
+    },
     /// This device could not produce a move for a compute request. Sent so
     /// the failure is visible server-side instead of looking identical to
     /// a silent client.
-    ComputeFailed { request_id: u64, reason: String },
+    ComputeFailed {
+        request_id: u64,
+        reason: String,
+    },
     /// Alternative first message: subscribe to the active-games list
     /// instead of joining a session (used by the home screen).
     WatchGames,
@@ -105,7 +110,9 @@ pub struct LobbyState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMsg {
     /// First message after a successful join: your public player id.
-    Welcome { your_id: PlayerId },
+    Welcome {
+        your_id: PlayerId,
+    },
     /// Full lobby snapshot. Sent on join and whenever the lobby changes.
     Lobby(LobbyState),
     /// A game is starting; first tick fires after `countdown_ms`.

@@ -220,8 +220,7 @@ pub fn replay_page(id: i64) -> impl IntoView {
         if !playing.get_untracked() {
             return;
         }
-        let step_ms =
-            (r.config.tick_ms as f64 / speed.get_untracked() as f64).max(120.0);
+        let step_ms = (r.config.tick_ms as f64 / speed.get_untracked() as f64).max(120.0);
         if now - last_step.get_untracked() >= step_ms {
             last_step.set(now);
             frame.update(|f| {
