@@ -489,12 +489,14 @@ fn game_view(game: GameView) -> impl IntoView {
         view! {
             <div class="pause-row">
                 <button
-                    class="mini"
+                    class="icon-btn"
+                    aria-label=move || if store.paused.get() { "resume" } else { "pause" }
+                    title=move || if store.paused.get() { "resume" } else { "pause" }
                     on:click=move |_| {
                         net::send(&ClientMsg::SetPaused(!store.paused.get()));
                     }
                 >
-                    {move || if store.paused.get() { "▶️ resume" } else { "⏸️ pause" }}
+                    {move || if store.paused.get() { "▶️" } else { "⏸️" }}
                 </button>
             </div>
         }
@@ -563,46 +565,54 @@ fn game_view(game: GameView) -> impl IntoView {
             })
             .collect_view();
 
-        let scrub = view! {
-            <p class="footnote" style="margin: 10px 0 2px;">"Drag to replay:"</p>
-            <input
-                type="range"
-                class="scrubber"
-                min="0"
-                max=(turn_count - 1).to_string()
-                prop:value=viewing.to_string()
-                on:input=move |ev| {
-                    if let Ok(i) = event_target_value(&ev).parse::<usize>() {
-                        store.view_turn.set(Some(i));
-                    }
-                }
-            />
-        };
-
         view! {
             <div class="results">
                 {rain}
                 <h3>{if draw { "Game over — it's a draw" } else { "Game over" }}</h3>
+                // The next game first: it is what most people want from
+                // here. Agreeing to a rematch is agreeing to a game, so it is
+                // the lobby's control, not a second one that behaves almost
+                // the same.
+                {lobby_now.as_ref().map(ready_panel)}
                 <table class="players">
                     <tbody>{rows}</tbody>
                 </table>
-                // Agreeing to a rematch is agreeing to a game, so it is the
-                // lobby's control, not a second one that behaves almost the
-                // same.
-                {lobby_now.as_ref().map(ready_panel)}
                 <div class="row">
                     <button on:click=move |_| {
                         store.game.set(None);
                         store.view_turn.set(None);
                     }>"Back to lobby"</button>
                 </div>
-                {scrub}
+            </div>
+        }
+    });
+
+    // Replay, right under the board it moves, once the game is over.
+    let scrub = over.then(|| {
+        view! {
+            <div class="replay-controls">
+                <input
+                    type="range"
+                    class="scrubber"
+                    aria-label="replay"
+                    min="0"
+                    max=(turn_count - 1).to_string()
+                    prop:value=viewing.to_string()
+                    on:input=move |ev| {
+                        if let Ok(i) = event_target_value(&ev).parse::<usize>() {
+                            store.view_turn.set(Some(i));
+                        }
+                    }
+                />
+                <span class="turn-count">{format!("{viewing}/{}", turn_count - 1)}</span>
             </div>
         }
     });
 
     view! {
-        <div class="play">
+        // Once it's over nothing has to fit on one screen any more, so the
+        // page simply grows and scrolls as a page — never a box of its own.
+        <div class=if over { "play over" } else { "play" }>
             // Only what has to be said. The turn number was costing a line
             // of a phone screen to tell you something the board already
             // shows.
@@ -619,6 +629,7 @@ fn game_view(game: GameView) -> impl IntoView {
                 note.map(|n| view! { <p class="play-note">{n}</p> })
             }}
             {board_view(game.config, game.players.clone(), &turn, me.clone(), on_cell)}
+            {scrub}
             // One bottom half, whichever state the game is in. Two layouts
             // meant two sets of rules for the same board, and the board
             // quietly changed size the moment the game ended.

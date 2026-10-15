@@ -1,3 +1,25 @@
+/* One family for the whole app. Machines that have Courier New (Mac,
+   Windows, iOS) use it and download nothing; everyone else — Linux, Android,
+   where a bare "Courier New" quietly becomes some other monospace — gets
+   Courier Prime, an open Courier drawn for screens, ~19 KB per weight,
+   Latin only. local() matches the exact installed face, not a lookalike. */
+@font-face {
+  font-family: "snek mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: local("Courier New"), local("CourierNewPSMT"),
+    url(fonts/courier-prime-v11-400.woff2) format("woff2");
+}
+@font-face {
+  font-family: "snek mono";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: local("Courier New Bold"), local("CourierNewPS-BoldMT"),
+    url(fonts/courier-prime-v11-700.woff2) format("woff2");
+}
+
 :root {
   --key: min(24vw, 92px);
   --key-gap: 10px;
@@ -21,7 +43,7 @@ body {
   margin: 0;
   background: #fff;
   color: #000;
-  font-family: "Courier New", Courier, monospace;
+  font-family: "snek mono", "Courier New", Courier, monospace;
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -397,9 +419,55 @@ button.mini {
   overflow-y: auto;
 }
 
+/* A flat black rail and a square thumb, in keeping with everything else.
+   Styled by hand because the native one stops its thumb a little short of
+   the end of its track, so the last turn looked like it wasn't. */
 .scrubber {
+  -webkit-appearance: none;
+  appearance: none;
   width: 100%;
-  accent-color: #000;
+  height: 32px;
+  margin: 0;
+  /* Not a text box: none of the frame the other inputs wear, which also
+     inset the thumb from the end of the rail. */
+  border: none;
+  padding: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.scrubber:focus {
+  box-shadow: none;
+}
+.scrubber:focus-visible::-webkit-slider-thumb {
+  box-shadow: 4px 4px 0 #000;
+}
+.scrubber:focus-visible::-moz-range-thumb {
+  box-shadow: 4px 4px 0 #000;
+}
+.scrubber::-webkit-slider-runnable-track {
+  height: 4px;
+  background: #000;
+}
+.scrubber::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 22px;
+  height: 22px;
+  margin-top: -9px;
+  background: #fff;
+  border: 2px solid #000;
+  box-shadow: 2px 2px 0 #000;
+}
+.scrubber::-moz-range-track {
+  height: 4px;
+  background: #000;
+}
+.scrubber::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border: 2px solid #000;
+  border-radius: 0;
+  background: #fff;
+  box-shadow: 2px 2px 0 #000;
 }
 
 /* replay: compact icon button + scrubber + turn counter */
@@ -510,26 +578,41 @@ tr.clickable {
 
 /* --- winner emoji rain -------------------------------------------------- */
 
+/* Transform-only animation, so the compositor moves the drops on its own
+   and the page never re-lays out or repaints for them. Each drop gets its
+   own layer once (will-change) and the rain is walled off from the rest of
+   the page (contain). */
 .emoji-rain {
   position: fixed;
   inset: 0;
   pointer-events: none;
   overflow: hidden;
   z-index: 60;
+  contain: strict;
 }
 
 .emoji-rain span {
   position: absolute;
-  top: -8%;
+  top: 0;
+  line-height: 1;
+  will-change: transform;
+  transform: translate3d(0, -10vh, 0);
   animation-name: emoji-fall;
   animation-timing-function: linear;
   animation-iteration-count: infinite;
 }
 
 @keyframes emoji-fall {
-  to {
-    transform: translateY(120vh) rotate(var(--spin, 300deg));
+  from {
+    transform: translate3d(0, -10vh, 0) rotate(0deg);
   }
+  to {
+    transform: translate3d(0, 110vh, 0) rotate(var(--spin, 300deg));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .emoji-rain { display: none; }
 }
 
 @keyframes shake {
@@ -567,8 +650,19 @@ tr.clickable {
 /* Bottom left, out of the thumb's way and away from the d-pad. */
 .pause-row {
   position: absolute;
-  left: 0;
-  bottom: 0;
+  left: 16px;
+  bottom: 14px;
+}
+
+/* A square key holding just an emoji. */
+button.icon-btn {
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  font-size: 22px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
 }
 
 /* --- the play screen ----------------------------------------------------
@@ -647,7 +741,9 @@ tr.clickable {
      room is left (margin: auto below) rather than both being centred, which
      left the scoreboard floating in the middle of the screen. */
   justify-content: flex-start;
-  overflow-y: auto;
+  /* Never a scroll box: during play everything is sized to fit, and once
+     the game is over the whole page scrolls instead (.play.over). */
+  overflow: hidden;
 }
 
 /* The d-pad is a square as tall as the room it is given, so the keys grow
@@ -664,13 +760,43 @@ tr.clickable {
   grid-template-rows: repeat(3, 1fr);
 }
 
+/* Game over: the screen stops being a fixed-height console and becomes an
+   ordinary page — board, replay, the next game, the scoreboard — that
+   scrolls as one. The board keeps exactly the size it had in play. */
+.play.over {
+  height: auto;
+  overflow: visible;
+  margin-bottom: 0;
+}
+.play.over .controls {
+  flex: 0 0 auto;
+  overflow: visible;
+  padding-bottom: 0;
+}
+
+.play .replay-controls {
+  flex: 0 0 auto;
+  margin-top: 10px;
+  padding: 0 16px;
+}
+
 .results {
   width: 100%;
 }
 
+.results h3 {
+  margin-top: 4px;
+}
+
+/* Room between the next game and the scoreboard, so the big button reads as
+   its own thing rather than the table's last row. */
+.results table.players {
+  margin-top: 22px;
+}
+
 .results .row {
   gap: 8px;
-  margin-top: 8px;
+  margin-top: 10px;
 }
 
 .results .row button {

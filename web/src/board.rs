@@ -24,7 +24,7 @@ fn emoji_text(x: f64, y: f64, size: f64, glyph: &str) -> String {
 
 fn number_text(x: f64, y: f64, value: &str) -> String {
     format!(
-        r##"<text x="{x}" y="{y}" dy="0.36em" font-size="0.44" font-weight="bold" font-family="Courier New, monospace" fill="#000" text-anchor="middle">{value}</text>"##
+        r##"<text x="{x}" y="{y}" dy="0.36em" font-size="0.44" font-weight="bold" font-family="snek mono, Courier New, monospace" fill="#000" text-anchor="middle">{value}</text>"##
     )
 }
 
