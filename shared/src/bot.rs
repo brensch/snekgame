@@ -22,16 +22,22 @@
 //!   mirroring the real engine's rules (food-spawn-free lookahead), so a
 //!   descent costs microseconds instead of cloning string-keyed maps.
 //!
-//! Difficulty is purely thinking budget. The search is **deterministic and
-//! bit-identical across platforms** for a fixed simulation count (UCB's
-//! `ln` uses a platform-exact approximation), which is what makes
-//! distributed compute auditable: the server hands a phone
-//! `(turn, sims, nonce)`, the phone returns `(move, proof)` where the
-//! proof hashes the nonce with the root visit statistics, and the server
-//! can recompute the identical search at any time to catch tampering.
+//! - **The tree carries over between turns** ([`begin_from`]): the subtree
+//!   under the joint move that actually happened is already a search of
+//!   the new position, so each turn starts thousands of simulations in.
+//!   It is dropped when food spawns or a snake dies — the search never
+//!   models either, so no child matches.
+//!
+//! Difficulty is purely thinking budget. A fresh search ([`think`],
+//! [`begin`]) is deterministic for a fixed simulation count; one that
+//! carries a tree over depends on what came before, so moves are no longer
+//! re-derivable from a single turn. Nothing relies on that: the server
+//! checks only [`bind_proof`], which binds its nonce and request id to the
+//! move.
 
 use crate::types::*;
-use std::collections::{HashMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::VecDeque;
 
 /// Per-move thinking budget in milliseconds.
 pub fn budget_ms(difficulty: BotDifficulty) -> u32 {
@@ -45,6 +51,9 @@ pub fn budget_ms(difficulty: BotDifficulty) -> u32 {
 const C_UCT: f32 = 1.2;
 const DRAW_VALUE: f32 = -0.25;
 const MAX_SIMS: usize = 200_000;
+/// Tree size cap, counting nodes carried over from earlier turns: a node is
+/// a few hundred bytes, and a phone's tab must not balloon.
+const MAX_NODES: usize = 150_000;
 const MAX_SNAKES: usize = 8;
 
 // Voronoi blend weights (positive terms sum to 0.85; trap only subtracts).
@@ -179,6 +188,32 @@ impl FastBoard {
         }
     }
 
+    /// The same position: every snake's body, health and liveness, and the
+    /// same food (in any order — eating reorders the list). Food is what
+    /// makes reuse safe: the search never spawns any, so a tree whose child
+    /// matches the new turn exactly was built for the world that happened.
+    fn same_position(&self, other: &FastBoard) -> bool {
+        if (self.w, self.h) != (other.w, other.h)
+            || self.snakes.len() != other.snakes.len()
+            || self.food.len() != other.food.len()
+        {
+            return false;
+        }
+        let snakes_match = self
+            .snakes
+            .iter()
+            .zip(&other.snakes)
+            .all(|(a, b)| a.alive == b.alive && a.health == b.health && a.body == b.body);
+        if !snakes_match {
+            return false;
+        }
+        let mut a = self.food.clone();
+        let mut b = other.food.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        a == b
+    }
+
     fn is_wall(&self, pos: u16) -> bool {
         let (x, y) = (pos as i16 % self.w, pos as i16 / self.w);
         x == 0 || y == 0 || x == self.w - 1 || y == self.h - 1
@@ -310,15 +345,52 @@ fn last_dir(board: &FastBoard, i: usize) -> Option<Dir> {
     }
 }
 
+/// Up to four moves, inline: candidate lists are built for every snake at
+/// every node, so they must never touch the heap.
+#[derive(Clone, Copy)]
+struct Cands {
+    dirs: [Dir; 4],
+    n: u8,
+}
+
+impl Cands {
+    const fn empty() -> Cands {
+        Cands {
+            dirs: [Dir::Up; 4],
+            n: 0,
+        }
+    }
+    fn push(&mut self, d: Dir) {
+        self.dirs[self.n as usize] = d;
+        self.n += 1;
+    }
+}
+
+impl std::ops::Deref for Cands {
+    type Target = [Dir];
+    fn deref(&self) -> &[Dir] {
+        &self.dirs[..self.n as usize]
+    }
+}
+
+impl IntoIterator for Cands {
+    type Item = Dir;
+    type IntoIter = std::iter::Take<std::array::IntoIter<Dir, 4>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.dirs.into_iter().take(self.n as usize)
+    }
+}
+
 /// Non-reversing, on-board, non-wall moves; a trapped snake keeps all four
 /// (the search picks the least bad); the dead get a dummy.
-fn candidates(board: &FastBoard, i: usize) -> Vec<Dir> {
+fn candidates(board: &FastBoard, i: usize) -> Cands {
+    let mut v = Cands::empty();
     if !board.snakes[i].alive {
-        return vec![Dir::Up];
+        v.push(Dir::Up);
+        return v;
     }
     let head = board.snakes[i].head();
     let reverse = last_dir(board, i).map(|d| d.opposite());
-    let mut v = Vec::with_capacity(4);
     for &m in &DIRS {
         if Some(m) == reverse {
             continue;
@@ -328,8 +400,8 @@ fn candidates(board: &FastBoard, i: usize) -> Vec<Dir> {
             _ => {}
         }
     }
-    if v.is_empty() {
-        v.extend_from_slice(&DIRS);
+    if v.n == 0 {
+        v = Cands { dirs: DIRS, n: 4 };
     }
     v
 }
@@ -337,35 +409,39 @@ fn candidates(board: &FastBoard, i: usize) -> Vec<Dir> {
 /// [`candidates`] minus guaranteed head-to-head losses: squares a
 /// longer-or-equal live opponent's head can also reach next turn. If every
 /// move is such a square, keep them all and let the search pick.
-fn safe_candidates(board: &FastBoard, i: usize) -> Vec<Dir> {
+fn safe_candidates(board: &FastBoard, i: usize) -> Cands {
     let base = candidates(board, i);
     if base.len() <= 1 || !board.snakes[i].alive {
         return base;
     }
     let my_len = board.snakes[i].len();
-    let mut danger: Vec<u16> = Vec::new();
+    // Every square a big-enough rival head can step onto next turn.
+    let mut danger = [0u16; 4 * MAX_SNAKES];
+    let mut n_danger = 0;
     for (j, s) in board.snakes.iter().enumerate() {
         if j == i || !s.alive || s.len() < my_len {
             continue;
         }
         for m in candidates(board, j) {
             if let Some(t) = board.step_dir(s.head(), m) {
-                danger.push(t);
+                danger[n_danger] = t;
+                n_danger += 1;
             }
         }
     }
+    let danger = &danger[..n_danger];
     let head = board.snakes[i].head();
-    let safe: Vec<Dir> = base
-        .iter()
-        .copied()
-        .filter(|&m| {
-            board
-                .step_dir(head, m)
-                .map(|t| !danger.contains(&t))
-                .unwrap_or(false)
-        })
-        .collect();
-    if safe.is_empty() {
+    let mut safe = Cands::empty();
+    for &m in base.iter() {
+        if board
+            .step_dir(head, m)
+            .map(|t| !danger.contains(&t))
+            .unwrap_or(false)
+        {
+            safe.push(m);
+        }
+    }
+    if safe.n == 0 {
         base
     } else {
         safe
@@ -376,52 +452,63 @@ fn safe_candidates(board: &FastBoard, i: usize) -> Vec<Dir> {
 // Decoupled-UCT search over joint moves
 // ---------------------------------------------------------------------------
 
+/// Per-snake statistics live inline (four moves at most); children are a
+/// short list keyed by the joint move — a node rarely has more than a
+/// dozen, and a linear scan of a few words beats hashing.
 struct Node {
     board: FastBoard,
-    cands: Vec<Vec<Dir>>,
-    visits: Vec<Vec<f32>>,
-    values: Vec<Vec<f32>>,
+    cands: [Cands; MAX_SNAKES],
+    /// (visits, summed value) per snake per candidate, at `i * 4 + c` —
+    /// sized to the snakes actually playing rather than the maximum, since
+    /// it is most of a node and a tree holds a hundred thousand of them.
+    stats: Vec<[f32; 2]>,
     total: f32,
-    children: HashMap<u32, usize>,
+    children: Vec<(u32, u32)>,
     terminal: bool,
 }
 
 impl Node {
     fn new(board: FastBoard) -> Node {
         let terminal = board.is_terminal();
-        let cands: Vec<Vec<Dir>> = (0..board.snakes.len())
-            .map(|i| safe_candidates(&board, i))
-            .collect();
-        let visits = cands.iter().map(|c| vec![0.0; c.len()]).collect();
-        let values = cands.iter().map(|c| vec![0.0; c.len()]).collect();
+        let mut cands = [Cands::empty(); MAX_SNAKES];
+        for (i, c) in cands.iter_mut().enumerate().take(board.snakes.len()) {
+            *c = safe_candidates(&board, i);
+        }
         Node {
+            stats: vec![[0.0; 2]; board.snakes.len() * 4],
             board,
             cands,
-            visits,
-            values,
             total: 0.0,
-            children: HashMap::new(),
+            children: Vec::new(),
             terminal,
         }
     }
 
+    fn child(&self, key: u32) -> Option<usize> {
+        self.children
+            .iter()
+            .find(|&&(k, _)| k == key)
+            .map(|&(_, id)| id as usize)
+    }
+
     /// UCB1 for one snake: first unvisited candidate, else
     /// argmax Q + c·√(ln(total+1)/n). Deterministic tie-break.
-    fn select(&self, i: usize) -> usize {
+    fn select(&self, i: usize, c_uct: f32) -> usize {
         let n_cands = self.cands[i].len();
         if n_cands == 1 {
             return 0;
         }
-        if let Some(c) = (0..n_cands).find(|&c| self.visits[i][c] == 0.0) {
+        let stats = &self.stats[i * 4..i * 4 + 4];
+        if let Some(c) = (0..n_cands).find(|&c| stats[c][0] == 0.0) {
             return c;
         }
         let ln_total = fast_ln(self.total + 1.0);
         let mut best = 0;
         let mut best_score = f32::NEG_INFINITY;
         for c in 0..n_cands {
-            let n = self.visits[i][c];
-            let q = self.values[i][c] / n;
-            let score = q + C_UCT * (ln_total / n).sqrt();
+            let [n, v] = stats[c];
+            let q = v / n;
+            let score = q + c_uct * (ln_total / n).sqrt();
             if score > best_score {
                 best_score = score;
                 best = c;
@@ -435,18 +522,21 @@ type EvalFn = fn(&FastBoard) -> [f32; MAX_SNAKES];
 /// The production evaluation.
 const EVAL: EvalFn = evaluate;
 
-/// A search that can be run in pieces. The browser drives it in small
-/// chunks, yielding to the event loop between them, so a phone hosting bot
-/// compute still renders and dispatches taps; the server just runs it in
-/// one go. Chunking cannot change the answer — simulations are sequential
-/// and deterministic, so N+M sims is bit-identical to one run of N+M.
+/// A search that can be run in pieces. The browser's bot worker drives it
+/// in slices against a deadline. Chunking cannot change the answer —
+/// simulations are sequential, so N+M sims equals one run of N+M.
 pub struct Search {
     nodes: Vec<Node>,
     path: Vec<(usize, [usize; MAX_SNAKES])>,
+    /// Who each board index is (the turn's alive list), so a later turn can
+    /// tell whether this tree still describes its world.
+    order: Vec<PlayerId>,
     me: usize,
     remaining: usize,
     nonce: u64,
     eval: EvalFn,
+    /// UCB exploration constant.
+    c_uct: f32,
     /// Set when the position needed no search at all.
     immediate: Option<(Dir, u64)>,
 }
@@ -465,6 +555,11 @@ impl Search {
         self.remaining == 0
     }
 
+    /// Nodes in the tree, including any carried over from the last turn.
+    pub fn tree_size(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// The chosen move and its proof. Valid once `step` has returned true.
     pub fn result(&self) -> (Dir, u64) {
         if let Some(done) = self.immediate {
@@ -474,7 +569,7 @@ impl Search {
     }
 
     fn simulate(&mut self) {
-        let (nodes, path, eval) = (&mut self.nodes, &mut self.path, self.eval);
+        let (nodes, path, eval, c_uct) = (&mut self.nodes, &mut self.path, self.eval, self.c_uct);
         path.clear();
         let mut cur = 0usize;
         let leaf_vals = loop {
@@ -485,21 +580,28 @@ impl Search {
             let mut cidx = [0usize; MAX_SNAKES];
             let mut key = 0u32;
             for (i, slot) in cidx.iter_mut().enumerate().take(n) {
-                let c = nodes[cur].select(i);
+                let c = nodes[cur].select(i, c_uct);
                 *slot = c;
                 key = key * 4 + c as u32;
             }
             path.push((cur, cidx));
-            match nodes[cur].children.get(&key) {
-                Some(&child) => cur = child,
+            match nodes[cur].child(key) {
+                Some(child) => cur = child,
                 None => {
                     let mut child = nodes[cur].board.clone();
-                    let moves: Vec<Dir> = (0..n).map(|i| nodes[cur].cands[i][cidx[i]]).collect();
-                    child.step(&moves);
+                    let mut moves = [Dir::Up; MAX_SNAKES];
+                    for (i, m) in moves.iter_mut().enumerate().take(n) {
+                        *m = nodes[cur].cands[i][cidx[i]];
+                    }
+                    child.step(&moves[..n]);
                     let vals = eval(&child);
-                    let id = nodes.len();
-                    nodes.push(Node::new(child));
-                    nodes[cur].children.insert(key, id);
+                    // At the size cap the tree stops growing but the search
+                    // doesn't: the leaf is scored and backed up, unstored.
+                    if nodes.len() < MAX_NODES {
+                        let id = nodes.len();
+                        nodes.push(Node::new(child));
+                        nodes[cur].children.push((key, id as u32));
+                    }
                     break vals;
                 }
             }
@@ -508,8 +610,9 @@ impl Search {
             let node = &mut nodes[nid];
             node.total += 1.0;
             for i in 0..node.board.snakes.len() {
-                node.visits[i][cidx[i]] += 1.0;
-                node.values[i][cidx[i]] += leaf_vals[i];
+                let st = &mut node.stats[i * 4 + cidx[i]];
+                st[0] += 1.0;
+                st[1] += leaf_vals[i];
             }
         }
     }
@@ -520,23 +623,24 @@ impl Search {
 fn readout(nodes: &[Node], me: usize, nonce: u64) -> (Dir, u64) {
     let root_node = &nodes[0];
     let q = |c: usize| {
-        let n = root_node.visits[me][c];
+        let [n, v] = root_node.stats[me * 4 + c];
         if n > 0.0 {
-            root_node.values[me][c] / n
+            v / n
         } else {
             f32::NEG_INFINITY
         }
     };
     let mut best = 0usize;
     for c in 1..root_node.cands[me].len() {
-        if (root_node.visits[me][c], q(c)) > (root_node.visits[me][best], q(best)) {
+        let visits = |c: usize| root_node.stats[me * 4 + c][0];
+        if (visits(c), q(c)) > (visits(best), q(best)) {
             best = c;
         }
     }
     let dir = root_node.cands[me][best];
     let mut words: Vec<u64> = vec![nonce, dir_index(dir) as u64];
     for c in 0..root_node.cands[me].len() {
-        words.push(root_node.visits[me][c] as u64);
+        words.push(root_node.stats[me * 4 + c][0] as u64);
     }
     (dir, fnv1a(&words))
 }
@@ -545,10 +649,12 @@ fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64, eval: EvalFn
     let mut s = Search {
         nodes: vec![Node::new(root.clone())],
         path: Vec::with_capacity(64),
+        order: Vec::new(),
         me,
         remaining: max_sims.min(MAX_SIMS),
         nonce,
         eval,
+        c_uct: C_UCT,
         immediate: None,
     };
     while !s.step(usize::MAX) {}
@@ -558,21 +664,42 @@ fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64, eval: EvalFn
 /// Start a search that the caller drives with [`Search::step`]. Trivial
 /// positions (boxed in, or a single legal move) finish immediately.
 pub fn begin(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32, nonce: u64) -> Search {
+    begin_from(None, config, turn, me, sims, nonce)
+}
+
+/// [`begin`], but starting from last turn's tree when it still applies:
+/// the subtree under the joint move that actually happened is already a
+/// search of this exact position, often thousands of simulations deep. It
+/// applies only if that child's board *is* this turn — same snakes, same
+/// health, same food. New food (the one thing the search never imagines)
+/// or a death changing who is playing means no child matches, and the
+/// search starts fresh.
+pub fn begin_from(
+    prev: Option<Search>,
+    config: &GameConfig,
+    turn: &Turn,
+    me: &PlayerId,
+    sims: u32,
+    nonce: u64,
+) -> Search {
     let finished = |immediate: (Dir, u64)| Search {
         nodes: Vec::new(),
         path: Vec::new(),
+        order: Vec::new(),
         me: 0,
         remaining: 0,
         nonce,
         eval: EVAL,
+        c_uct: C_UCT,
         immediate: Some(immediate),
     };
 
-    let order: Vec<&PlayerId> = turn.alive.iter().collect();
-    let Some(me_idx) = order.iter().position(|p| *p == me) else {
+    let order: Vec<PlayerId> = turn.alive.clone();
+    let Some(me_idx) = order.iter().position(|p| p == me) else {
         return finished((Dir::Up, fnv1a(&[nonce, 0])));
     };
-    let board = FastBoard::from_turn(config, turn, &order);
+    let refs: Vec<&PlayerId> = order.iter().collect();
+    let board = FastBoard::from_turn(config, turn, &refs);
     let cands = safe_candidates(&board, me_idx);
     match cands.len() {
         0 => finished((Dir::Up, fnv1a(&[nonce, 1]))),
@@ -580,16 +707,53 @@ pub fn begin(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32, nonce: 
             let d = cands[0];
             finished((d, fnv1a(&[nonce, 2, dir_index(d) as u64])))
         }
-        _ => Search {
-            nodes: vec![Node::new(board)],
-            path: Vec::with_capacity(64),
-            me: me_idx,
-            remaining: (sims as usize).min(MAX_SIMS),
-            nonce,
-            eval: EVAL,
-            immediate: None,
-        },
+        _ => {
+            let nodes = prev
+                .filter(|p| p.immediate.is_none() && p.order == order && !p.nodes.is_empty())
+                .and_then(|p| {
+                    let next = p.nodes[0]
+                        .children
+                        .iter()
+                        .map(|&(_, id)| id as usize)
+                        .find(|&id| p.nodes[id].board.same_position(&board))?;
+                    Some(reroot(p.nodes, next))
+                })
+                .unwrap_or_else(|| vec![Node::new(board)]);
+            Search {
+                nodes,
+                path: Vec::with_capacity(64),
+                order,
+                me: me_idx,
+                remaining: (sims as usize).min(MAX_SIMS),
+                nonce,
+                eval: EVAL,
+                c_uct: C_UCT,
+                immediate: None,
+            }
+        }
     }
+}
+
+/// The subtree under `root`, moved (not copied) into a fresh arena with
+/// `root` at index 0. Everything else is dropped.
+fn reroot(nodes: Vec<Node>, root: usize) -> Vec<Node> {
+    let mut slots: Vec<Option<Node>> = nodes.into_iter().map(Some).collect();
+    let mut out: Vec<Node> = Vec::new();
+    out.extend(slots[root].take());
+    let mut i = 0;
+    while i < out.len() {
+        let kids = std::mem::take(&mut out[i].children);
+        let mut moved = Vec::with_capacity(kids.len());
+        for (key, old) in kids {
+            if let Some(node) = slots[old as usize].take() {
+                moved.push((key, out.len() as u32));
+                out.push(node);
+            }
+        }
+        out[i].children = moved;
+        i += 1;
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -774,7 +938,39 @@ fn evaluate_bully(board: &FastBoard) -> [f32; MAX_SNAKES] {
     evaluate_impl(board, BULLY)
 }
 
+/// Buffers the evaluation reuses on every call (one set per thread). An
+/// evaluation runs once per simulation — tens of thousands of times a move
+/// — and allocating these afresh each time was most of its cost.
+#[derive(Default)]
+struct Scratch {
+    blocked_until: Vec<u16>,
+    owner: Vec<u8>,
+    arrival: Vec<u16>,
+    is_food: Vec<bool>,
+    frontier: Vec<Vec<usize>>,
+    next: Vec<Vec<usize>>,
+    /// `seen[c] == stamp` marks c visited in the current flood; bumping the
+    /// stamp clears the whole array at once.
+    seen: Vec<u32>,
+    stamp: u32,
+    queue: Vec<(usize, u16)>,
+    /// `blocked_until` for an empty board of `walls_for` — the wall ring —
+    /// built once per board size and copied in.
+    walls: Vec<u16>,
+    walls_for: (i16, i16),
+    /// Non-wall cells on that board.
+    interior: usize,
+}
+
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
+}
+
 fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
+    SCRATCH.with(|scratch| evaluate_with(&mut scratch.borrow_mut(), board, tuning))
+}
+
+fn evaluate_with(sc: &mut Scratch, board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
     let mut vals = [-1.0f32; MAX_SNAKES];
     if board.is_terminal() {
         match board.winner() {
@@ -790,66 +986,99 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
 
     let w = board.w as usize;
     let cells = w * board.h as usize;
-    let alive: Vec<usize> = (0..board.snakes.len())
-        .filter(|&i| board.snakes[i].alive)
-        .collect();
-
-    // Turns until each cell is vacated (walls never are).
-    let mut blocked_until = vec![0u16; cells];
-    for pos in 0..cells as u16 {
-        if board.is_wall(pos) {
-            blocked_until[pos as usize] = u16::MAX;
+    let n = board.snakes.len();
+    let mut alive_buf = [0usize; MAX_SNAKES];
+    let mut n_alive_snakes = 0;
+    for i in 0..n {
+        if board.snakes[i].alive {
+            alive_buf[n_alive_snakes] = i;
+            n_alive_snakes += 1;
         }
     }
-    for &i in &alive {
+    let alive = &alive_buf[..n_alive_snakes];
+
+    // Turns until each cell is vacated (walls never are).
+    if sc.walls_for != (board.w, board.h) || sc.walls.len() != cells {
+        sc.walls = (0..cells as u16)
+            .map(|pos| if board.is_wall(pos) { u16::MAX } else { 0 })
+            .collect();
+        sc.walls_for = (board.w, board.h);
+        sc.interior = sc.walls.iter().filter(|&&b| b == 0).count();
+    }
+    let blocked_until = &mut sc.blocked_until;
+    blocked_until.clear();
+    blocked_until.extend_from_slice(&sc.walls);
+    // Distinct cells under living bodies (stacked tail segments share one).
+    let mut occupied = 0usize;
+    for &i in alive {
         let s = &board.snakes[i];
         let len = s.len();
         for (k, &seg) in s.body.iter().enumerate() {
             let c = seg as usize;
+            if blocked_until[c] == 0 {
+                occupied += 1;
+            }
             blocked_until[c] = blocked_until[c].max((len - k) as u16);
         }
     }
 
     // Ownership race: longer snakes claim first within a turn; equal-length
     // same-turn contests void the cell and stop both floods.
-    let mut owner = vec![UNCLAIMED; cells];
-    let mut arrival = vec![0u16; cells];
+    let owner = &mut sc.owner;
+    owner.clear();
+    owner.resize(cells, UNCLAIMED);
+    let arrival = &mut sc.arrival;
+    arrival.clear();
+    arrival.resize(cells, 0);
     // Food lookup + earliest arrival at any food a snake reaches first *or
     // ties for*; contested food is discounted later, never ignored.
-    let mut is_food = vec![false; cells];
+    let is_food = &mut sc.is_food;
+    is_food.clear();
+    is_food.resize(cells, false);
     for &f in &board.food {
         is_food[f as usize] = true;
     }
     let mut food_any = [u16::MAX; MAX_SNAKES];
-    let mut race_order = alive.clone();
+    // Cells owned outright, tallied as the flood claims (and contests) them.
+    let mut area = [0usize; MAX_SNAKES];
+    let mut race_buf = alive_buf;
+    let race_order = &mut race_buf[..n_alive_snakes];
     race_order.sort_by_key(|&i| std::cmp::Reverse(board.snakes[i].len()));
-    let mut frontier: Vec<Vec<usize>> = vec![Vec::new(); board.snakes.len()];
-    for &i in &alive {
+    let race_order = &*race_order;
+    if sc.frontier.len() < n {
+        sc.frontier.resize_with(n, Vec::new);
+        sc.next.resize_with(n, Vec::new);
+    }
+    let (frontier, next) = (&mut sc.frontier, &mut sc.next);
+    for f in frontier.iter_mut().take(n) {
+        f.clear();
+    }
+    for &i in alive {
         frontier[i].push(board.snakes[i].head() as usize);
     }
     let mut t: u16 = 0;
-    while frontier.iter().any(|f| !f.is_empty()) && (t as usize) <= cells {
+    while frontier[..n].iter().any(|f| !f.is_empty()) && (t as usize) <= cells {
         t += 1;
-        let mut next: Vec<Vec<usize>> = vec![Vec::new(); board.snakes.len()];
-        for &i in &race_order {
+        for f in next.iter_mut().take(n) {
+            f.clear();
+        }
+        for &i in race_order {
             let my_len = board.snakes[i].len();
             for &c in &frontier[i] {
                 if t > 1 && owner[c] != i as u8 {
                     continue; // this frontier cell got contested away
                 }
-                let (x, y) = ((c % w) as i32, (c / w) as i32);
-                for (dx, dy) in [(0, 1), (0, -1), (1, 0), (-1, 0)] {
-                    let (nx, ny) = (x + dx, y + dy);
-                    if nx < 0 || nx >= w as i32 || ny < 0 || ny >= board.h as i32 {
-                        continue;
-                    }
-                    let nc = ny as usize * w + nx as usize;
+                // Flood cells are never walls and the board is ringed by
+                // walls, so all four neighbours are in range: no
+                // coordinates, no bounds checks.
+                for nc in [c + w, c - w, c + 1, c - 1] {
                     if blocked_until[nc] > t {
                         continue;
                     }
                     match owner[nc] {
                         UNCLAIMED => {
                             owner[nc] = i as u8;
+                            area[i] += 1;
                             arrival[nc] = t;
                             next[i].push(nc);
                             if is_food[nc] {
@@ -862,6 +1091,7 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
                             && board.snakes[o as usize].len() == my_len =>
                         {
                             owner[nc] = CONTESTED;
+                            area[o as usize] -= 1;
                             if is_food[nc] {
                                 // Both can be here at t; both should see it.
                                 food_any[i] = food_any[i].min(t);
@@ -873,15 +1103,9 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
                 }
             }
         }
-        frontier = next;
+        std::mem::swap(frontier, next);
     }
 
-    let mut area = [0usize; MAX_SNAKES];
-    for c in 0..cells {
-        if owner[c] != UNCLAIMED && owner[c] != CONTESTED {
-            area[owner[c] as usize] += 1;
-        }
-    }
     // Earliest arrival at food this snake wins the race to.
     let mut food_dist = [u16::MAX; MAX_SNAKES];
     for &f in &board.food {
@@ -893,9 +1117,9 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
         }
     }
 
-    let free = (0..cells).filter(|&c| blocked_until[c] == 0).count().max(1);
+    let free = (sc.interior - occupied).max(1);
     let n_alive = alive.len() as f32;
-    for &i in &alive {
+    for &i in alive {
         let s = &board.snakes[i];
         let len = s.len() as f32;
         let area_score = ((area[i] as f32 / free as f32) * n_alive - 1.0).clamp(-1.0, 1.0);
@@ -968,7 +1192,15 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
             urgency * margin
         };
         // Trap: a reachable region smaller than the body is a death sentence.
-        let reach = reachable_cells(board, i, &blocked_until);
+        // Only "is there room for my body?" matters (anything at or past
+        // `len` scores 0), so the flood stops once it has counted that much.
+        let reach = reachable_cells(
+            board,
+            i,
+            blocked_until,
+            s.len(),
+            (&mut sc.seen, &mut sc.stamp, &mut sc.queue),
+        );
         let trap = ((reach as f32 - len) / len).clamp(-1.0, 0.0);
         let (w_health, w_length) = if tuning.length_heavy {
             (0.05, W_LENGTH + 0.05)
@@ -1001,29 +1233,45 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
 }
 
 /// Cells snake `i` can reach at all, opponents parked and tails decaying:
-/// enterable at step t+1 if vacated by then.
-fn reachable_cells(board: &FastBoard, i: usize, blocked_until: &[u16]) -> usize {
+/// enterable at step t+1 if vacated by then. Counted only up to `enough` —
+/// the caller just needs to know whether there are at least that many.
+fn reachable_cells(
+    board: &FastBoard,
+    i: usize,
+    blocked_until: &[u16],
+    enough: usize,
+    (seen, stamp, queue): (&mut Vec<u32>, &mut u32, &mut Vec<(usize, u16)>),
+) -> usize {
     let w = board.w as usize;
-    let mut seen = vec![false; blocked_until.len()];
-    let mut queue = VecDeque::new();
+    if seen.len() != blocked_until.len() || *stamp == u32::MAX {
+        seen.clear();
+        seen.resize(blocked_until.len(), 0);
+        *stamp = 0;
+    }
+    *stamp += 1;
+    let mark = *stamp;
+    // A Vec read from the front is the same FIFO as a VecDeque, minus the
+    // allocation.
+    queue.clear();
     let start = board.snakes[i].head() as usize;
-    seen[start] = true;
-    queue.push_back((start, 0u16));
+    seen[start] = mark;
+    queue.push((start, 0u16));
     let mut count = 0usize;
-    while let Some((c, t)) = queue.pop_front() {
-        let (x, y) = ((c % w) as i32, (c / w) as i32);
-        for (dx, dy) in [(0, 1), (0, -1), (1, 0), (-1, 0)] {
-            let (nx, ny) = (x + dx, y + dy);
-            if nx < 0 || nx >= w as i32 || ny < 0 || ny >= board.h as i32 {
+    let mut head = 0;
+    while head < queue.len() {
+        let (c, t) = queue[head];
+        head += 1;
+        // Never a wall (see the ownership flood), so no bounds checks.
+        for nc in [c + w, c - w, c + 1, c - 1] {
+            if seen[nc] == mark || blocked_until[nc] > t + 1 {
                 continue;
             }
-            let nc = ny as usize * w + nx as usize;
-            if seen[nc] || blocked_until[nc] > t + 1 {
-                continue;
-            }
-            seen[nc] = true;
+            seen[nc] = mark;
             count += 1;
-            queue.push_back((nc, t + 1));
+            if count >= enough {
+                return count;
+            }
+            queue.push((nc, t + 1));
         }
     }
     count
@@ -1470,6 +1718,321 @@ mod tests {
             40,
             1_200,
             13,
+        );
+    }
+
+    /// Positions from real playthroughs: 2-, 3- and 4-snake games on three
+    /// board sizes, sampled every few turns.
+    fn fingerprint_positions() -> Vec<(GameConfig, Turn, PlayerId)> {
+        let mut out = Vec::new();
+        for (size, players, seed) in [(11u8, 2usize, 1u64), (13, 3, 2), (17, 4, 3), (13, 2, 4)] {
+            let cfg = board_config(size);
+            let ids: Vec<PlayerId> = (0..players).map(|i| format!("p{i}")).collect();
+            let mut engine = Engine::new(cfg.clone(), ids.clone(), seed);
+            let mut turn = engine.first_turn();
+            for t in 0..60 {
+                if turn.game_over() {
+                    break;
+                }
+                if t % 5 == 0 {
+                    out.push((cfg.clone(), turn.clone(), turn.alive[0].clone()));
+                }
+                let moves = turn
+                    .alive
+                    .iter()
+                    .map(|p| (p.clone(), think(&cfg, &turn, p, 400, 1).0))
+                    .collect();
+                turn = engine.next_turn(&turn, &moves);
+            }
+        }
+        out
+    }
+
+    /// One hash over the bot's answers (move + root-visit proof) on the
+    /// fingerprint positions. Pure performance work must not move it.
+    fn search_fingerprint() -> u64 {
+        let words: Vec<u64> = fingerprint_positions()
+            .iter()
+            .map(|(cfg, turn, me)| think(cfg, turn, me, 3_000, 99).1)
+            .collect();
+        fnv1a(&words)
+    }
+
+    #[test]
+    #[ignore]
+    fn print_search_fingerprint() {
+        let t0 = std::time::Instant::now();
+        let fp = search_fingerprint();
+        println!(
+            "FINGERPRINT {fp:#x} over {} positions in {:?}",
+            fingerprint_positions().len(),
+            t0.elapsed()
+        );
+    }
+
+    /// Where a simulation's time goes: evaluation, board copy + step, and
+    /// node setup, each timed alone over the fingerprint positions.
+    #[test]
+    #[ignore]
+    fn profile_parts() {
+        let boards: Vec<FastBoard> = fingerprint_positions()
+            .iter()
+            .map(|(cfg, turn, _)| {
+                let order: Vec<&PlayerId> = turn.alive.iter().collect();
+                FastBoard::from_turn(cfg, turn, &order)
+            })
+            .collect();
+        let reps = 4_000;
+        let time = |name: &str, f: &mut dyn FnMut(&FastBoard)| {
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                for b in &boards {
+                    f(b);
+                }
+            }
+            let per = t0.elapsed().as_nanos() as f64 / (reps * boards.len()) as f64;
+            println!("PART {name:<12} {per:>8.0} ns");
+        };
+        let mut sink = 0f32;
+        time("evaluate", &mut |b| sink += evaluate(b)[0]);
+        time("clone+step", &mut |b| {
+            let mut c = b.clone();
+            let moves: Vec<Dir> = (0..c.snakes.len()).map(|i| candidates(b, i)[0]).collect();
+            c.step(&moves);
+            sink += c.alive_count as f32;
+        });
+        time("node", &mut |b| {
+            sink += Node::new(b.clone()).cands[0].len() as f32
+        });
+        println!("(sink {sink})");
+    }
+
+    /// A bot as it plays a whole game: a search budget per move, and
+    /// whether it carries its tree from one turn to the next.
+    #[derive(Clone, Copy)]
+    struct Spec {
+        sims: u32,
+        reuse: bool,
+        eval: EvalFn,
+        c_uct: f32,
+    }
+
+    struct Agent {
+        spec: Spec,
+        prev: Option<Search>,
+    }
+
+    impl Agent {
+        fn new(spec: Spec) -> Agent {
+            Agent { spec, prev: None }
+        }
+        fn act(&mut self, cfg: &GameConfig, turn: &Turn, me: &PlayerId) -> Dir {
+            let prev = if self.spec.reuse {
+                self.prev.take()
+            } else {
+                None
+            };
+            let mut s = begin_from(prev, cfg, turn, me, self.spec.sims, 0);
+            s.eval = self.spec.eval;
+            s.c_uct = self.spec.c_uct;
+            while !s.step(usize::MAX) {}
+            let dir = s.result().0;
+            self.prev = Some(s);
+            dir
+        }
+    }
+
+    /// One game between two specs; (challenger, incumbent) scores as
+    /// (survival turns, final length).
+    fn agent_duel(
+        challenger: Spec,
+        incumbent: Spec,
+        seed: u64,
+        swap: bool,
+        board: u8,
+    ) -> ((u32, usize), (u32, usize)) {
+        let cfg = board_config(board);
+        let a: PlayerId = "a".into();
+        let b: PlayerId = "b".into();
+        let (spec_a, spec_b) = if swap {
+            (incumbent, challenger)
+        } else {
+            (challenger, incumbent)
+        };
+        let mut agents = [Agent::new(spec_a), Agent::new(spec_b)];
+        let mut engine = Engine::new(cfg.clone(), vec![a.clone(), b.clone()], seed);
+        let mut turn = engine.first_turn();
+        for _ in 0..300 {
+            if turn.game_over() {
+                break;
+            }
+            let mut moves = BTreeMap::new();
+            for (p, agent) in [&a, &b].into_iter().zip(agents.iter_mut()) {
+                if turn.alive.contains(p) {
+                    moves.insert(p.clone(), agent.act(&cfg, &turn, p));
+                }
+            }
+            turn = engine.next_turn(&turn, &moves);
+        }
+        let score = |p: &PlayerId| {
+            let survived = turn
+                .winners
+                .iter()
+                .find(|w| &w.player == p)
+                .map(|w| w.survival_turns)
+                .unwrap_or(turn.turn_number);
+            (survived, turn.snakes.get(p).map(|s| s.len()).unwrap_or(0))
+        };
+        if swap {
+            (score(&b), score(&a))
+        } else {
+            (score(&a), score(&b))
+        }
+    }
+
+    /// Challenger vs incumbent over `seeds` positions, each played from
+    /// both seats, across all cores. Prints wins/losses/draws and the
+    /// challenger's score (draws half) with a ±2σ band.
+    fn agent_arena(name: &str, challenger: Spec, incumbent: Spec, seeds: u64, board: u8) -> f64 {
+        let jobs: Vec<(u64, bool)> = (0..seeds)
+            .flat_map(|s| [(1_000 + s, false), (1_000 + s, true)])
+            .collect();
+        let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(seed, swap)) = jobs.get(k) else {
+                        break;
+                    };
+                    let r = agent_duel(challenger, incumbent, seed, swap, board);
+                    results.lock().unwrap().push(r);
+                });
+            }
+        });
+        let results = results.into_inner().unwrap();
+        let (mut w, mut l, mut d) = (0, 0, 0);
+        let (mut ch_len, mut in_len) = (0usize, 0usize);
+        for (ch, inc) in &results {
+            ch_len += ch.1;
+            in_len += inc.1;
+            match ch.cmp(inc) {
+                std::cmp::Ordering::Greater => w += 1,
+                std::cmp::Ordering::Less => l += 1,
+                std::cmp::Ordering::Equal => d += 1,
+            }
+        }
+        let n = results.len() as f64;
+        let score = (w as f64 + 0.5 * d as f64) / n;
+        let band = 2.0 * (score * (1.0 - score) / n).sqrt();
+        println!(
+            "ARENA {name:<28} {w:>3}W {l:>3}L {d:>2}D  score {:.1}% ±{:.1}  len {:.1} vs {:.1}  ({board}x{board})",
+            100.0 * score,
+            100.0 * band,
+            ch_len as f64 / n,
+            in_len as f64 / n,
+        );
+        score
+    }
+
+    const BASE: Spec = Spec {
+        sims: 20_000,
+        reuse: false,
+        eval: evaluate,
+        c_uct: C_UCT,
+    };
+    const REUSE: Spec = Spec {
+        reuse: true,
+        ..BASE
+    };
+
+    /// The shipped bot against the one it replaced, at equal thinking time:
+    /// the browser measured 2.8x the simulations per ms (~93k vs ~30k a
+    /// move at the hard budget) plus tree reuse. The old bot's play is the
+    /// fresh search here — `print_search_fingerprint` shows the speedups
+    /// left its moves identical.
+    #[test]
+    #[ignore]
+    fn arena_new_vs_old() {
+        let old = Spec {
+            sims: 30_000,
+            ..BASE
+        };
+        let new = Spec {
+            sims: 84_000,
+            ..REUSE
+        };
+        agent_arena("new vs old, equal time", new, old, 40, 11);
+    }
+
+    /// Exploration constant, both sides reusing trees.
+    #[test]
+    #[ignore]
+    fn arena_c_uct() {
+        for c in [0.5, 0.8, 1.7] {
+            agent_arena(
+                &format!("c_uct {c} vs 1.2"),
+                Spec { c_uct: c, ..REUSE },
+                REUSE,
+                40,
+                11,
+            );
+        }
+    }
+
+    /// Does carrying the tree between turns win, at equal fresh work?
+    #[test]
+    #[ignore]
+    fn arena_tree_reuse() {
+        agent_arena(
+            "reuse vs fresh @11",
+            Spec {
+                reuse: true,
+                ..BASE
+            },
+            BASE,
+            40,
+            11,
+        );
+        agent_arena(
+            "reuse vs fresh @13",
+            Spec {
+                reuse: true,
+                ..BASE
+            },
+            BASE,
+            40,
+            13,
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn print_node_size() {
+        let (cfg, turn, me) = fingerprint_positions().remove(8);
+        let mut s = begin(&cfg, &turn, &me, 50_000, 0);
+        while !s.step(usize::MAX) {}
+        let heap: usize = s
+            .nodes
+            .iter()
+            .map(|n| {
+                n.children.capacity() * 8
+                    + n.board.snakes.capacity() * std::mem::size_of::<Snake>()
+                    + n.board
+                        .snakes
+                        .iter()
+                        .map(|x| x.body.capacity() * 2)
+                        .sum::<usize>()
+                    + n.board.food.capacity() * 2
+            })
+            .sum();
+        println!(
+            "NODE inline {} B, heap ~{} B/node over {} nodes",
+            std::mem::size_of::<Node>(),
+            heap / s.nodes.len(),
+            s.nodes.len()
         );
     }
 

@@ -73,8 +73,17 @@ pub fn snek_bot_compute(job: &[u8]) -> Vec<u8> {
     // worse exactly as the board gets crowded.
     const TARGET_SLICE_MS: f64 = 4.0;
     let began_ms = js_sys::Date::now();
-    let mut search =
-        snek_shared::bot::begin(&job.config, &job.turn, &job.bot_id, u32::MAX, job.nonce);
+    // This worker only ever thinks for one bot, so last turn's tree is
+    // usually a head start on this one (begin_from checks it still fits).
+    let prev = LAST_SEARCH.with(|l| l.borrow_mut().take());
+    let mut search = snek_shared::bot::begin_from(
+        prev,
+        &job.config,
+        &job.turn,
+        &job.bot_id,
+        u32::MAX,
+        job.nonce,
+    );
     let mut sims = 0u32;
     let mut slices = 0u32;
     let mut slice = 32usize;
@@ -99,6 +108,7 @@ pub fn snek_bot_compute(job: &[u8]) -> Vec<u8> {
         }
     }
     let (dir, proof) = search.result();
+    LAST_SEARCH.with(|l| *l.borrow_mut() = Some(search));
     let search_ms = (js_sys::Date::now() - began_ms).max(0.0) as u32;
     postcard::to_allocvec(&JobResult {
         dir,
@@ -112,6 +122,9 @@ pub fn snek_bot_compute(job: &[u8]) -> Vec<u8> {
 }
 
 thread_local! {
+    /// Inside a worker: the search it ran last, kept for the next turn.
+    static LAST_SEARCH: RefCell<Option<snek_shared::bot::Search>> =
+        const { RefCell::new(None) };
     /// One worker per bot, always. Sharing a worker means sharing a message
     /// queue, and a worker drains that queue strictly in order — so a
     /// second bot on the same worker cannot start until the first finishes,
