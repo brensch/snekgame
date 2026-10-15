@@ -505,8 +505,7 @@ impl Node {
         let ln_total = fast_ln(self.total + 1.0);
         let mut best = 0;
         let mut best_score = f32::NEG_INFINITY;
-        for c in 0..n_cands {
-            let [n, v] = stats[c];
+        for (c, &[n, v]) in stats.iter().enumerate().take(n_cands) {
             let q = v / n;
             let score = q + c_uct * (ln_total / n).sqrt();
             if score > best_score {
