@@ -59,7 +59,8 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - run: mkdir -p web/dist
-      - run: cargo llvm-cov --workspace --exclude snek-web --json --summary-only --output-path cov.json
+      # The floor: 90% of lines, by tests that check behaviour.
+      - run: cargo llvm-cov --workspace --exclude snek-web --json --summary-only --output-path cov.json --fail-under-lines 90
       - name: Summarise
         id: cov
         run: |
