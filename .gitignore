@@ -29,3 +29,6 @@ snek.db-*
 
 # cross-build output (make build)
 deploy/out/
+
+# TLS material never belongs in the repo (the server reads SNEK_CERT/SNEK_KEY)
+certs/
