@@ -28,7 +28,8 @@ thread_local! {
 }
 
 /// Play the highlights of the game on screen, if it's over: from the
-/// top (the rewind) or, given a turn, from that turn on.
+/// end (holding on how it finished, then rewinding) or, given a turn, from
+/// that turn on.
 pub(crate) fn start(store: Store, from: Option<usize>) {
     let game = store.game.with_untracked(|g| {
         g.as_ref()
@@ -42,7 +43,7 @@ pub(crate) fn start(store: Store, from: Option<usize>) {
     if plan.is_empty() {
         return;
     }
-    let into = from.map_or(0.0, |turn| start_of(&plan, turn));
+    let into = start_of(&plan, from.unwrap_or(turns.len() - 1));
     let timer = Interval::new(FRAME_MS, move || tick(store));
     PLAYING.with(|p| {
         *p.borrow_mut() = Some(Playing {

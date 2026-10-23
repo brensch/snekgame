@@ -470,6 +470,11 @@ mod tests {
             "starts with the rewind"
         );
         let total: f64 = timeline.iter().map(|b| b.ms).sum();
+        // Entered at the last turn, it's the hold on the end, all of it,
+        // before the rewind: how a game that's just finished starts.
+        let end = start_of(&timeline, 9);
+        assert!((total - end - END_HOLD_MS).abs() < 1e-9, "{end} of {total}");
+        assert_eq!(beat_at(&timeline, end + END_HOLD_MS - 1.0).unwrap().turn, 9);
         assert_eq!(
             beat_at(&timeline, total + 1.0).unwrap().turn,
             9,
