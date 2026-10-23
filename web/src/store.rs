@@ -30,6 +30,15 @@ pub(crate) struct GameView {
     pub turns: Vec<Turn>,
 }
 
+/// A countdown before play, in wall-clock ms: when it began and ends, and
+/// whether it's a resume (which opens with a second of "resuming").
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Countdown {
+    pub began: f64,
+    pub ends: f64,
+    pub resume: bool,
+}
+
 /// The lobby's popups.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Popup {
@@ -37,8 +46,8 @@ pub(crate) enum Popup {
     BotPicker,
     /// Board, speed and food.
     Settings,
-    /// How to play.
-    Rules,
+    /// How to play, at this step.
+    Rules(usize),
     /// "Are you sure?" before removing this player.
     Kick(PlayerProfile),
     /// "Are you sure?" before leaving the game for this address (a URL
@@ -64,6 +73,8 @@ pub(crate) struct Store {
     pub game: RwSignal<Option<GameView>>,
     /// History scrubber position when reviewing a finished game (None = live).
     pub view_turn: RwSignal<Option<usize>>,
+    /// Whether a finished game's highlights are playing (see `autoplay`).
+    pub autoplay: RwSignal<bool>,
     /// Set once we have evidence the network passes TCP but not UDP —
     /// which is a firewall eating QUIC, not a broken site.
     pub quic_blocked: RwSignal<bool>,
@@ -74,15 +85,16 @@ pub(crate) struct Store {
     /// The toasts on screen, newest first: brief notes that stack and fade
     /// on their own (see `notices`).
     pub toasts: RwSignal<Vec<crate::notices::Toast>>,
-    /// Someone has held the game. Server-owned: we only ever mirror what it
-    /// tells us, so every screen agrees on whether the clock is running.
-    pub paused: RwSignal<bool>,
+    /// The game's pause state: who has it paused and everyone's pauses
+    /// left. Server-owned: we only ever mirror what it tells us, so every
+    /// screen agrees on whether the clock is running.
+    pub hold: RwSignal<snek_shared::protocol::Hold>,
     /// The direction we're currently steering (highlights the d-pad).
     /// Starts at the clockwise default; corrected from each resolved turn.
     pub selected_dir: RwSignal<Option<Dir>>,
     pub saved_id: RwSignal<Option<i64>>,
-    /// performance-now ms when the pre-game countdown ends.
-    pub countdown_ends: RwSignal<f64>,
+    /// The countdown before play: a game's start, or a resume.
+    pub countdown: RwSignal<Countdown>,
     /// Coarse clock for countdown display, ticked by an interval.
     pub now_ms: RwSignal<f64>,
     pub error: RwSignal<Option<String>>,
@@ -101,13 +113,14 @@ impl Store {
             sessions: RwSignal::new(None),
             game: RwSignal::new(None),
             view_turn: RwSignal::new(None),
+            autoplay: RwSignal::new(false),
             quic_blocked: RwSignal::new(false),
             food_hand: RwSignal::new(crate::palette::FoodHand::dealt(snek_shared::DEFAULT_FOOD)),
             toasts: RwSignal::new(Vec::new()),
-            paused: RwSignal::new(false),
+            hold: RwSignal::new(snek_shared::protocol::Hold::default()),
             selected_dir: RwSignal::new(None),
             saved_id: RwSignal::new(None),
-            countdown_ends: RwSignal::new(0.0),
+            countdown: RwSignal::new(Countdown::default()),
             now_ms: RwSignal::new(0.0),
             error: RwSignal::new(None),
         }

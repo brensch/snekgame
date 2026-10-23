@@ -4,12 +4,11 @@
 //! - checkerboard field, full-bleed and square to maximise size on mobile
 //! - sneks as one continuous rounded path with the player's emoji as head,
 //!   health on the neck, stacked count on the tail (tac logic)
-//! - food is whatever the lobby picked; deaths leave 💀 trails but keep the
-//!   dead player's emoji head
+//! - food is whatever the lobby picked; the dead become grey 💀 trails
 use crate::num;
 use leptos::prelude::*;
 use snek_shared::{GameConfig, PlayerProfile, Pos, Turn};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use wasm_bindgen::JsCast;
 
@@ -200,32 +199,23 @@ fn snek_svg(grid: Grid, snake: &[Pos], hp: u8, colour: &str, emoji: &str) -> Str
     out
 }
 
-/// Clashes stay emoji, like tac. The dead snek's body becomes a 💀 trail,
-/// but its head cell keeps the player's emoji so you can see who died. The
-/// engine puts the dead player first in `players` and their head first in
-/// their clash trail.
-fn clashes_svg(grid: Grid, turn: &Turn, emoji_of: &HashMap<&str, &str>) -> String {
+/// The dead: a grey square and a skull on every cell they left behind.
+/// The head is gone with them (it went into whatever killed them), so
+/// there's nothing to say whose they were but the space they took up.
+fn clashes_svg(grid: Grid, turn: &Turn) -> String {
     let mut clashes = String::new();
-    let mut seen_dead_heads: HashSet<&str> = HashSet::new();
     for clash in &turn.clashes {
-        let owner = clash.players.first().map_or("", String::as_str);
-        let is_head = seen_dead_heads.insert(owner);
         let _ = write!(
             clashes,
             r##"<rect x="{x}" y="{y}" width="1" height="1" fill="#d3d3d3" opacity="0.8"/>"##,
             x = grid.x(clash.pos),
             y = grid.y(clash.pos),
         );
-        let glyph = if is_head {
-            emoji_of.get(owner).copied().unwrap_or("💀")
-        } else {
-            "💀"
-        };
         clashes.push_str(&emoji_text(
             grid.cx(clash.pos),
             grid.cy(clash.pos),
             0.8,
-            glyph,
+            "💀",
         ));
     }
     clashes
@@ -256,6 +246,12 @@ pub(crate) struct Extras<V> {
     pub spotlight: bool,
     /// Whether it's showing right now.
     pub spot_on: Signal<bool>,
+    /// Whether the game is paused (the board greys out).
+    pub held: Signal<bool>,
+    /// A game just starting: how far into the board's fade-in we are, in
+    /// ms. Given rather than started fresh, so a board redrawn partway
+    /// through carries on rather than fading in again.
+    pub entering_ms: Option<f64>,
     /// Laid over the board, centred on it.
     pub overlay: V,
 }
@@ -266,27 +262,24 @@ impl Extras<()> {
         Self {
             spotlight: false,
             spot_on: Signal::stored(false),
+            held: Signal::stored(false),
+            entering_ms: None,
             overlay: (),
         }
     }
 }
 
-pub(crate) fn board_view<F: Fn(Pos) + Copy + 'static, V: IntoView + 'static>(
+/// The board as SVG, exactly as the game draws it: the field, food, every
+/// snek with its numbers, the dead, and optionally the "you!" spotlight
+/// layer and a red ring round one cell.
+pub(crate) fn board_svg(
     config: &GameConfig,
     players: &[PlayerProfile],
     turn: &Turn,
     my_id: &str,
-    // Before the first tick: grey out everything but my snek and put a red
-    // box and a "you!" over it, so nobody spends the start looking for
-    // themselves.
-    extras: Extras<V>,
-    on_cell: F,
-) -> impl IntoView + use<F, V> {
-    let Extras {
-        spotlight,
-        spot_on,
-        overlay,
-    } = extras;
+    spotlight: bool,
+    ring: Option<Pos>,
+) -> String {
     let grid = Grid {
         w: u16::from(config.board_width),
         h: u16::from(config.board_height),
@@ -333,23 +326,61 @@ pub(crate) fn board_view<F: Fn(Pos) + Copy + 'static, V: IntoView + 'static>(
         sneks.push_str(&drawn);
     }
 
-    let clashes = clashes_svg(grid, turn, &emoji_of);
+    let clashes = clashes_svg(grid, turn);
+
+    // A red ring round one cell, for pointing something out (the rules).
+    let ring = ring.map_or_else(String::new, |pos| {
+        format!(
+            r##"<rect x="{x}" y="{y}" width="1" height="1" fill="none" stroke="#e00" stroke-width="0.1" rx="0.15"/>"##,
+            x = grid.x(pos),
+            y = grid.y(pos),
+        )
+    });
 
     let spot = my_head.map_or_else(String::new, |head| spotlight_svg(grid, head, &mine));
 
     // Crop the view to the playable interior — the walls sit just off-screen.
     let svg = format!(
         r#"<svg viewBox="1 1 {vw} {vh}" xmlns="http://www.w3.org/2000/svg" style="display:block;width:100%;height:100%;">
-            {field}{food}{sneks}{clashes}{spot}
+            {field}{food}{sneks}{clashes}{ring}{spot}
         </svg>"#,
         vw = grid.w - 2,
         vh = grid.h - 2,
     );
+    svg
+}
+
+pub(crate) fn board_view<F: Fn(Pos) + Copy + 'static, V: IntoView + 'static>(
+    config: &GameConfig,
+    players: &[PlayerProfile],
+    turn: &Turn,
+    my_id: &str,
+    // Before the first tick: grey out everything but my snek and put a red
+    // box and a "you!" over it, so nobody spends the start looking for
+    // themselves.
+    extras: Extras<V>,
+    on_cell: F,
+) -> impl IntoView + use<F, V> {
+    let Extras {
+        spotlight,
+        spot_on,
+        held,
+        entering_ms,
+        overlay,
+    } = extras;
+    let grid = Grid {
+        w: u16::from(config.board_width),
+        h: u16::from(config.board_height),
+    };
+    let svg = board_svg(config, players, turn, my_id, spotlight, None);
 
     view! {
         <div
             class="board-wrap"
             class:spotlit=move || spot_on.get()
+            class:held=move || held.get()
+            class:entering=entering_ms.is_some()
+            style=entering_ms.map(|ms| format!("animation-delay: -{ms:.0}ms;"))
             on:click=move |ev: web_sys::MouseEvent| {
                 if let Some(pos) = grid.cell_at(&ev) {
                     on_cell(pos);

@@ -14,9 +14,11 @@
 )]
 
 mod app;
+mod autoplay;
 mod board;
 mod botworker;
 mod compute_page;
+mod demo;
 mod games_page;
 mod history_page;
 mod net;

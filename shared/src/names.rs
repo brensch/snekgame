@@ -1,8 +1,9 @@
-//! Game names: three words picked at random.
+//! What a game is called, and what its link is.
 //!
-//! Two adjectives and a noun, from lists with a tired, sardonic streak
-//! ("lukewarm-mandatory-potluck"). The name is also the game's link, so it
-//! is lowercase, dash-joined, and short enough to say out loud.
+//! The name: two adjectives and a noun picked at random from lists with a
+//! tired, sardonic streak ("lukewarm mandatory potluck"); anyone in the game
+//! can change it. The link: a short code that never changes, made of
+//! characters that can't be mistaken for one another when read out.
 
 /// The mood of the thing.
 pub const ADJECTIVES: &[&str] = &[
@@ -110,7 +111,7 @@ pub const NOUNS: &[&str] = &[
     "biscuit",
 ];
 
-/// A fresh game name: two different adjectives and a noun, dash-joined.
+/// A fresh game name: two different adjectives and a noun.
 /// `pick` is given how many there are to choose from and returns an index
 /// below that (out of range is clamped).
 pub fn game_name(mut pick: impl FnMut(usize) -> usize) -> String {
@@ -118,18 +119,31 @@ pub fn game_name(mut pick: impl FnMut(usize) -> usize) -> String {
     let first = choose(ADJECTIVES);
     let mut second = choose(ADJECTIVES);
     if second == first {
-        // The neighbour instead: still random, never "damp-damp".
+        // The neighbour instead: still random, never "damp damp".
         let i = ADJECTIVES.iter().position(|a| *a == first).unwrap_or(0);
         second = ADJECTIVES[(i + 1) % ADJECTIVES.len()];
     }
-    format!("{first}-{second}-{}", choose(NOUNS))
+    format!("{first} {second} {}", choose(NOUNS))
+}
+
+/// What a game's link is made of: lowercase letters and digits, without
+/// the ones that read alike (0/o, 1/l/i).
+pub const CODE_CHARS: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+/// How long a game's code is: 31^5, some 28 million, is plenty.
+pub const CODE_LEN: usize = 5;
+
+/// A fresh game code (`pick` as for [`game_name`]).
+pub fn game_code(mut pick: impl FnMut(usize) -> usize) -> String {
+    (0..CODE_LEN)
+        .map(|_| char::from(CODE_CHARS[pick(CODE_CHARS.len()).min(CODE_CHARS.len() - 1)]))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Names are three distinct-enough words that fit a link.
+    /// Names are three words: two different adjectives and a noun.
     #[test]
     fn names_are_two_different_adjectives_and_a_noun() {
         let mut seed = 3usize;
@@ -138,7 +152,7 @@ mod tests {
                 seed = seed.wrapping_mul(2_654_435_761).wrapping_add(7);
                 seed % n
             });
-            let words: Vec<&str> = name.split('-').collect();
+            let words: Vec<&str> = name.split(' ').collect();
             assert_eq!(words.len(), 3, "{name}");
             assert!(
                 ADJECTIVES.contains(&words[0]) && ADJECTIVES.contains(&words[1]),
@@ -146,7 +160,7 @@ mod tests {
             );
             assert_ne!(words[0], words[1], "{name}");
             assert!(NOUNS.contains(&words[2]), "{name}");
-            assert!(name.len() <= 48, "{name}");
+            assert!(crate::protocol::valid_game_name(&name), "{name}");
         }
     }
 
@@ -156,13 +170,13 @@ mod tests {
     fn a_repeated_or_wild_pick_still_makes_a_name() {
         assert_eq!(
             game_name(|_| 0),
-            format!("{}-{}-{}", ADJECTIVES[0], ADJECTIVES[1], NOUNS[0])
+            format!("{} {} {}", ADJECTIVES[0], ADJECTIVES[1], NOUNS[0])
         );
         let last = ADJECTIVES.len() - 1;
         assert_eq!(
             game_name(|n| n + 9),
             format!(
-                "{}-{}-{}",
+                "{} {} {}",
                 ADJECTIVES[last],
                 ADJECTIVES[0],
                 NOUNS[NOUNS.len() - 1]
@@ -170,7 +184,22 @@ mod tests {
         );
     }
 
-    /// Every word is lowercase letters only, so a name is a clean link.
+    /// Codes are five of the unmistakable characters, and an out-of-range
+    /// pick is clamped.
+    #[test]
+    fn codes_are_short_and_unmistakable() {
+        let mut seed = 11usize;
+        let code = game_code(|n| {
+            seed = seed.wrapping_mul(2_654_435_761).wrapping_add(3);
+            seed % n
+        });
+        assert_eq!(code.len(), CODE_LEN);
+        assert!(code.bytes().all(|b| CODE_CHARS.contains(&b)), "{code}");
+        assert!(!CODE_CHARS.iter().any(|c| b"01ilo".contains(c)));
+        assert_eq!(game_code(|n| n + 1), "99999");
+    }
+
+    /// Every word is plain lowercase letters, nothing to trip on.
     #[test]
     fn every_word_is_plain_lowercase() {
         for w in ADJECTIVES.iter().chain(NOUNS) {

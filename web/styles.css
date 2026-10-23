@@ -217,12 +217,6 @@ td.kick {
   gap: 4px;
 }
 
-.games-heading .count {
-  font-size: 13px;
-  border: 2px solid #000;
-  padding: 1px 7px;
-}
-
 ul.games {
   list-style: none;
   margin: 0;
@@ -738,6 +732,13 @@ tr.clickable {
   position: absolute;
   left: 16px;
   bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.pauses-left {
+  font-size: 14px;
 }
 
 /* Just the emoji, no key around it; the button stays thumb-sized so it is
@@ -1039,8 +1040,27 @@ button.ready-switch.on .yes {
   height: 100%;
 }
 
+/* The spotlight eases away rather than snapping off. */
+.spot {
+  transition: opacity 600ms ease;
+}
+
 .board-wrap:not(.spotlit) .spot {
-  display: none;
+  opacity: 0;
+}
+
+/* A game starting: the board fades up out of a blur, already spotlit. */
+.board-wrap.entering {
+  animation: board-in 900ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes board-in {
+  from { opacity: 0; transform: scale(0.94); filter: blur(6px); }
+  to { opacity: 1; transform: none; filter: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .board-wrap.entering { animation: none; }
 }
 
 /* "ready", "steady", "spagheddi!": all three stacked in the middle of the
@@ -1065,11 +1085,14 @@ button.ready-switch.on .yes {
   animation: count-word 1000ms ease both;
 }
 
+/* Each word is gone a little before its second is up, so "spagheddi!" has
+   faded out before play starts rather than being cut off by it (this
+   phone's countdown runs a touch behind the server's). */
 @keyframes count-word {
   0% { opacity: 0; transform: scale(0.6); }
-  20% { opacity: 1; transform: scale(1); }
-  80% { opacity: 1; transform: scale(1); }
-  100% { opacity: 0; transform: scale(1); }
+  18% { opacity: 1; transform: scale(1); }
+  62% { opacity: 1; transform: scale(1); }
+  82%, 100% { opacity: 0; transform: scale(1); }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1173,44 +1196,6 @@ button.ready-switch.on .yes {
   line-height: 1.5;
 }
 
-/* --- the rules popup: a rule a line, each with its picture --------------- */
-.rule-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 24px;
-}
-
-.rule {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  font-size: 16px;
-  line-height: 1.4;
-}
-
-/* Every picture gets the same box, so the sentences line up. */
-.rule-pic {
-  flex: 0 0 96px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.rule-pic svg {
-  display: block;
-  width: 96px;
-  height: auto;
-  border: 2px solid #000;
-}
-
-.rule-emoji {
-  font-size: 32px;
-  line-height: 1;
-}
-
 /* --- the players: chips that wrap -------------------------------------- */
 .player-chips {
   list-style: none;
@@ -1299,4 +1284,101 @@ button.last-game {
   width: 100%;
   font-size: 15px;
   text-align: left;
+}
+
+/* The rules: a looping animation on a little board, and under it a line
+   saying what's happening. */
+/* Every step's picture fills the same square, board or not, so paging
+   through never moves the arrows or the button. */
+.demo-stage {
+  aspect-ratio: 1;
+  border: 2px solid #000;
+}
+
+.demo-stage svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.demo-stage.steer,
+.demo-stage.fun {
+  display: grid;
+  place-items: center;
+}
+
+.demo-stage.fun {
+  font-size: 120px;
+}
+
+/* The steering step's picture: the game's d-pad, small. */
+.dpad.dpad-mini {
+  --key: 56px;
+  --key-gap: 8px;
+}
+
+.dpad-mini .key {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid #000;
+  background: #fff;
+}
+
+.stepper {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 6px;
+}
+
+button.step-arrow {
+  width: 64px;
+  height: 52px;
+  padding: 0;
+  font-size: 34px;
+  line-height: 1;
+  text-align: center;
+}
+
+.step-count {
+  font-size: 16px;
+}
+
+/* Room for the longest line (three lines on a phone) whatever's showing,
+   so the board and the button under it never jump as captions change. */
+.demo-caption {
+  height: 4.5em;
+  line-height: 1.5;
+  overflow: hidden;
+  margin: 8px 0 0;
+  font-size: 16px;
+  font-weight: bold;
+  color: #c00;
+}
+
+/* Two buttons side by side at the bottom of a popup. */
+.popup-buttons {
+  margin-top: 18px;
+}
+
+.popup-buttons button {
+  height: 60px;
+  font-size: 20px;
+  text-align: center;
+}
+
+/* Paused: the board greys out under the card saying who paused it. */
+.board-wrap.held .board-svg {
+  filter: grayscale(1);
+  opacity: 0.45;
+}
+
+/* A card that stays put (paused, resuming) rather than fading in turn. */
+.countdown span.still {
+  animation: none;
+  opacity: 1;
+  font-size: 24px;
+  max-width: 90%;
+  text-align: center;
 }

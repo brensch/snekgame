@@ -52,6 +52,19 @@ opt-level = 3
 lto = true
 codegen-units = 1
 
+# Quick frontend builds while iterating (`trunk watch --cargo-profile web-dev`):
+# incremental, unoptimised for our own code, but the dependencies (the bot's
+# search included, via snek-shared) optimised once, so bots still play.
+[profile.web-dev]
+inherits = "dev"
+debug = false
+
+[profile.web-dev.package."*"]
+opt-level = 3
+
+[profile.web-dev.package.snek-shared]
+opt-level = 3
+
 # Small wasm output for the web crate
 [profile.release.package.snek-web]
 opt-level = "z"

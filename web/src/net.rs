@@ -13,7 +13,7 @@
 //! state, so no incremental state is ever trusted across a gap.
 
 use crate::num;
-use crate::store::{ConnStatus, GameView, Store};
+use crate::store::{ConnStatus, Countdown, GameView, Store};
 use crate::trail;
 use futures_util::StreamExt;
 use gloo_timers::callback::{Interval, Timeout};
@@ -976,7 +976,18 @@ fn apply(store: Store, msg: ServerMsg) {
         }),
         ServerMsg::GameSaved { id, .. } => store.saved_id.set(Some(id)),
         ServerMsg::Error(e) => on_error(store, e),
-        ServerMsg::Paused(paused) => store.paused.set(paused),
+        ServerMsg::Hold(hold) => {
+            // Lifted: the countdown runs again before play does.
+            if let Some(ms) = hold.resume_in_ms {
+                let began = now();
+                store.countdown.set(Countdown {
+                    began,
+                    ends: began + f64::from(ms),
+                    resume: true,
+                });
+            }
+            store.hold.set(hold);
+        }
         ServerMsg::Kicked(by) => on_kicked(store, by.as_ref()),
         ServerMsg::Left => finish_leaving(),
         ServerMsg::Pong(_) => {}
@@ -1084,11 +1095,16 @@ fn on_game_start(
     }
     store.saved_id.set(None);
     store.view_turn.set(None);
-    store.countdown_ends.set(now() + f64::from(countdown_ms));
+    let began = now();
+    store.countdown.set(Countdown {
+        began,
+        ends: began + f64::from(countdown_ms),
+        resume: false,
+    });
     // Pre-select the clockwise default heading on the d-pad.
     let me = store.me.get_untracked();
     // A fresh game always runs; never inherit the last one's hold.
-    store.paused.set(false);
+    store.hold.set(snek_shared::protocol::Hold::default());
     // And the lobby's popups belong to the lobby: back from the game, it
     // starts closed.
     store.popup.set(None);
@@ -1110,6 +1126,21 @@ fn on_turn(store: Store, turn: Turn) {
     // Datagram-class: dedup the redundant copies, drop stale
     // reorderings, accept gaps (snapshots are full state).
     let me = store.me.get_untracked();
+    // Play has begun: whatever this phone's clock makes of the countdown,
+    // it's over. (It counts from when the start reached it, so it runs a
+    // little behind the server's, and the first move would otherwise be
+    // drawn with the last of the countdown still on it.)
+    let newer = store.game.with_untracked(|g| {
+        g.as_ref().is_some_and(|g| {
+            g.turns
+                .last()
+                .is_none_or(|t| turn.turn_number > t.turn_number)
+        })
+    });
+    if newer && store.countdown.with_untracked(|c| c.ends > now()) {
+        store.countdown.update(|c| c.ends = now());
+    }
+    let finished = newer && turn.game_over();
     store.game.update(|g| {
         if let Some(g) = g {
             let last = g.turns.last().map_or(0, |t| t.turn_number);
@@ -1121,6 +1152,10 @@ fn on_turn(store: Store, turn: Turn) {
             }
         }
     });
+    // It's over: play the highlights.
+    if finished {
+        crate::autoplay::start(store, None);
+    }
 }
 
 /// A `ComputeRequest`: one bot move the server wants from this device.

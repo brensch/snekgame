@@ -25,9 +25,9 @@ pub(crate) fn home_page() -> impl IntoView {
         if creating.get_untracked().is_some() {
             return;
         }
-        // Three random words, which are both the link and, until someone
-        // renames it, the game's name.
-        let id = snek_shared::names::game_name(num::random_index);
+        // A short code that never changes: the link. (The server names
+        // the game.)
+        let id = snek_shared::names::game_code(num::random_index);
         creating.set(Some(id.clone()));
         crate::net::ensure_session(store, &id);
         // Fallback: if the join is slow, navigate anyway and let the
@@ -111,9 +111,8 @@ pub(crate) fn home_page() -> impl IntoView {
 fn live_games(list: &[SessionSummary], page: RwSignal<usize>, store: Store) -> impl IntoView {
     let pages = list.len().div_ceil(PAGE_SIZE).max(1);
     let p = page.get().min(pages - 1);
-    let count = list.len();
     view! {
-        <h3 class="games-heading">"Live games " <span class="count">{count}</span></h3>
+        <h3 class="games-heading">"Live games"</h3>
         <ul class="games" style=format!("--mine: {};", store.profile.get_untracked().colour)>
             {list
                 .iter()

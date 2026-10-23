@@ -444,10 +444,13 @@ impl Engine {
             let target = match target {
                 Some(t) if !self.config.is_wall(t) => t,
                 _ => {
-                    // Off the board or into the wall: die where you stood.
-                    // The corpse is removed before cross-snake collisions —
-                    // running into a snake that died this tick is safe.
+                    // Off the board or into the wall: the head goes over the
+                    // edge and the rest follows it a cell, so what's left
+                    // on the board is one shorter. The corpse is removed
+                    // before cross-snake collisions — running into a snake
+                    // that died this tick is safe.
                     dead.push(player.clone());
+                    snake.pop();
                     clashes.extend(snake.iter().map(|&pos| Clash {
                         pos,
                         players: vec![player.clone()],
@@ -532,7 +535,9 @@ fn collide(snakes: &BTreeMap<PlayerId, Vec<Pos>>, clashes: &mut Vec<Clash>) -> V
                     dead.push(p.clone());
                     let mut involved = vec![p.clone()];
                     involved.extend(others);
-                    clashes.extend(snakes[p].iter().map(|&pos| Clash {
+                    // The head went into the other snek: the corpse is the
+                    // rest of it, and never lies on top of the living.
+                    clashes.extend(snakes[p].iter().skip(1).map(|&pos| Clash {
                         pos,
                         players: involved.clone(),
                         reason: ClashReason::Body,
@@ -551,7 +556,8 @@ fn collide(snakes: &BTreeMap<PlayerId, Vec<Pos>>, clashes: &mut Vec<Clash>) -> V
                         // (and head cell) this clash trail belongs to.
                         let mut involved = vec![p.clone()];
                         involved.extend(meeting.iter().filter(|o| *o != p).cloned());
-                        clashes.extend(snakes[p].iter().map(|&pos| Clash {
+                        // As for a body: the meeting cell isn't part of it.
+                        clashes.extend(snakes[p].iter().skip(1).map(|&pos| Clash {
                             pos,
                             players: involved.clone(),
                             reason: ClashReason::HeadOn,
@@ -769,6 +775,24 @@ mod tests {
         assert!(!t.alive.contains(&"a".to_owned()));
     }
 
+    /// Into the wall, the head goes over the edge and the rest follows it a
+    /// cell: the corpse is one shorter, where the snek was left lying.
+    #[test]
+    fn a_snek_into_the_wall_leaves_one_shorter() {
+        let mut e = two_player_engine();
+        let w = u16::from(config().board_width);
+        let (edge, row) = (w - 2, 5 * w);
+        let turn = turn_with(&[
+            ("a", vec![row + edge, row + edge - 1, row + edge - 2]),
+            ("b", vec![2 * w + 2, 2 * w + 3, 2 * w + 4]),
+        ]);
+        let next = e.next_turn(&turn, &moves(&[("a", Dir::Right), ("b", Dir::Left)]));
+        assert_eq!(next.alive, vec!["b".to_owned()]);
+        let corpse: Vec<Pos> = next.clashes.iter().map(|c| c.pos).collect();
+        assert_eq!(corpse, vec![row + edge, row + edge - 1]);
+        assert_eq!(reasons(&next, "a"), vec![ClashReason::Wall; 2]);
+    }
+
     #[test]
     fn eating_food_grows_and_heals() {
         let cfg = config();
@@ -916,7 +940,8 @@ mod tests {
     }
 
     /// Running into another snek's body kills the runner, and only the
-    /// runner: its corpse is marked with whose body it hit.
+    /// runner: its corpse is marked with whose body it hit, and is what's
+    /// left of it behind the head that went in, never on top of the other.
     #[test]
     fn running_into_a_body_kills_the_runner() {
         let mut e = two_player_engine();
@@ -924,12 +949,18 @@ mod tests {
         let turn = turn_with(&[("a", vec![70, 69, 68]), ("b", vec![84, 71, 58])]);
         let next = e.next_turn(&turn, &moves(&[("a", Dir::Right), ("b", Dir::Down)]));
         assert_eq!(next.alive, vec!["b".to_owned()]);
+        let corpse: Vec<Pos> = next.clashes.iter().map(|c| c.pos).collect();
         assert_eq!(
-            reasons(&next, "a"),
-            vec![ClashReason::Body; 3],
-            "a clash per corpse cell"
+            corpse,
+            vec![70, 69],
+            "a clash per corpse cell, head-in cell excluded"
         );
+        assert_eq!(reasons(&next, "a"), vec![ClashReason::Body; 2]);
         assert!(next.clashes.iter().all(|c| c.players == ["a", "b"]));
+        assert!(
+            !corpse.iter().any(|p| next.snakes["b"].contains(p)),
+            "corpse on the living"
+        );
         assert_eq!(next.snakes["b"], vec![97, 84, 71]);
         assert_eq!(next.winners[0].player, "b");
     }
@@ -941,8 +972,12 @@ mod tests {
         let turn = turn_with(&[("a", vec![70, 69, 68]), ("b", vec![72, 73, 74, 75])]);
         let next = e.next_turn(&turn, &moves(&[("a", Dir::Right), ("b", Dir::Left)]));
         assert_eq!(next.alive, vec!["b".to_owned()]);
-        assert_eq!(reasons(&next, "a"), vec![ClashReason::HeadOn; 3]);
+        assert_eq!(reasons(&next, "a"), vec![ClashReason::HeadOn; 2]);
         assert_eq!(next.snakes["b"][0], 71, "the winner keeps the cell");
+        assert!(
+            !next.clashes.iter().any(|c| c.pos == 71),
+            "a corpse in the winner's cell"
+        );
         assert!(!is_draw(&next.winners));
     }
 
@@ -954,8 +989,8 @@ mod tests {
         let turn = turn_with(&[("a", vec![70, 69, 68]), ("b", vec![72, 73, 74])]);
         let next = e.next_turn(&turn, &moves(&[("a", Dir::Right), ("b", Dir::Left)]));
         assert_eq!(next.alive, Vec::<PlayerId>::new());
-        assert_eq!(reasons(&next, "a"), vec![ClashReason::HeadOn; 3]);
-        assert_eq!(reasons(&next, "b"), vec![ClashReason::HeadOn; 3]);
+        assert_eq!(reasons(&next, "a"), vec![ClashReason::HeadOn; 2]);
+        assert_eq!(reasons(&next, "b"), vec![ClashReason::HeadOn; 2]);
         assert!(next.game_over());
         assert!(is_draw(&next.winners), "{:?}", next.winners);
         assert!(next.winners.iter().all(|w| w.length == 0));

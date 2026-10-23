@@ -14,10 +14,11 @@
 
 use crate::types::{BotDifficulty, Dir, GameConfig, PlayerId, PlayerProfile, Turn, Winner};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 20;
+pub const PROTOCOL_VERSION: u16 = 21;
 
 /// The client-editable part of a profile.
 ///
@@ -152,10 +153,26 @@ pub struct LobbyState {
     /// tell a fresh change from the same lobby being sent again for some
     /// other reason.
     pub config_rev: u32,
-    /// What the game is called. It starts as its link's three words and
-    /// anyone can change it; the link itself never changes.
+    /// What the game is called: three random words to start with (see
+    /// [`crate::names`]), and anyone can change it. Its link never changes.
     pub name: String,
 }
+
+/// The game's pause state. Sent when a game starts, whenever someone
+/// pauses or resumes it, and to anyone arriving mid-game.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hold {
+    /// Who paused it, while it's paused. Only they can resume it (unless
+    /// they've gone).
+    pub by: Option<PlayerId>,
+    /// Pauses each player has left this game (see [`PAUSES_PER_GAME`]).
+    pub pauses_left: BTreeMap<PlayerId, u8>,
+    /// Just resumed: how long the countdown runs before play does.
+    pub resume_in_ms: Option<u32>,
+}
+
+/// How many times each player can pause a game.
+pub const PAUSES_PER_GAME: u8 = 3;
 
 /// How getting connected went, as the client saw it.
 ///
@@ -255,8 +272,9 @@ pub enum ServerMsg {
     Error(String),
     /// Answer to `Ping`, with the same number.
     Pong(u32),
-    /// The game is held, or running again.
-    Paused(bool),
+    /// Who has the game paused, if anyone, and what's left of everyone's
+    /// pauses (see [`Hold`]).
+    Hold(Hold),
     /// You were taken out of the lobby, by this player (None if they have
     /// since left). Nothing more comes on this connection.
     Kicked(Option<PlayerProfile>),
@@ -292,7 +310,7 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Option<T> {
 /// in it owns it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
-    /// The game's id, as in its link (see [`crate::names`]).
+    /// The game's code, as in its link (see [`crate::names::game_code`]).
     pub id: String,
     /// What it's called now (see [`LobbyState::name`]).
     pub name: String,
@@ -424,12 +442,6 @@ pub struct HistoryEntry {
     pub winners: Vec<Winner>,
 }
 
-/// The name a game starts with: its link's words, spaced out.
-#[must_use]
-pub fn default_game_name(id: &str) -> String {
-    id.replace('-', " ")
-}
-
 /// Whether `name` will do as a game's name: something to read (not just
 /// spaces), and at most 40 characters.
 #[must_use]
@@ -483,7 +495,7 @@ mod tests {
             ServerMsg::ComputeRequest { .. } => 7,
             ServerMsg::Error(_) => 8,
             ServerMsg::Pong(_) => 9,
-            ServerMsg::Paused(_) => 10,
+            ServerMsg::Hold(_) => 10,
             ServerMsg::Kicked(_) => 11,
             ServerMsg::Left => 12,
         }
@@ -650,7 +662,11 @@ mod tests {
             },
             ServerMsg::Error("refresh".to_owned()),
             ServerMsg::Pong(9),
-            ServerMsg::Paused(true),
+            ServerMsg::Hold(Hold {
+                by: Some("abc123def456".to_owned()),
+                pauses_left: BTreeMap::from([("abc123def456".to_owned(), 2)]),
+                resume_in_ms: Some(4000),
+            }),
             ServerMsg::Kicked(Some(player())),
             ServerMsg::Left,
         ]
@@ -694,7 +710,7 @@ mod tests {
         let print = fingerprint(bytes);
         assert_eq!(
             (PROTOCOL_VERSION, print),
-            (20, 0x470c_a4da_b20d_1e25),
+            (21, 0xbc5d_5b0d_37d5_18ef),
             "the wire format changed: bump PROTOCOL_VERSION and record its new fingerprint"
         );
     }

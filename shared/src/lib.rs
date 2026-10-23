@@ -5,6 +5,7 @@
 
 pub mod bot;
 pub mod engine;
+pub mod highlights;
 pub mod names;
 pub mod protocol;
 pub mod rng;

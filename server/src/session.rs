@@ -11,8 +11,8 @@
 use crate::db::Db;
 use crate::lock;
 use snek_shared::protocol::{
-    ClientMsg, ComputeStat, ComputeTelemetry, ConnectReport, LobbyState, ServerMsg, SessionSummary,
-    default_game_name, encode, valid_game_name,
+    ClientMsg, ComputeStat, ComputeTelemetry, ConnectReport, Hold, LobbyState, PAUSES_PER_GAME,
+    ServerMsg, SessionSummary, encode, valid_game_name,
 };
 use snek_shared::{
     BotDifficulty, Dir, Engine, GameConfig, GameRecord, PlayerId, PlayerProfile, Turn, Winner, bot,
@@ -24,8 +24,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
-/// A second of "this one's you", then ready, steady, go.
-pub const COUNTDOWN_MS: u32 = 4000;
+/// Three seconds of "this one's you", then ready, steady, go (a second
+/// each): the same at every speed, and again after a pause.
+pub const COUNTDOWN_MS: u32 = 6000;
+/// After a pause: a second of "resuming", then the same as a start.
+pub const RESUME_MS: u32 = 1000 + COUNTDOWN_MS;
 const MAX_PLAYERS: usize = 8;
 /// Outbound frames buffered per connection before we call the client dead.
 const CONN_BUFFER: usize = 256;
@@ -340,10 +343,13 @@ struct SessionActor {
     /// bot id -> conn currently computing for it.
     bot_hosts: HashMap<PlayerId, u64>,
     /// outstanding compute requests: id -> (bot, conn, inputs for audit).
-    /// Held by a player rather than by circumstance. Distinct from the
-    /// freezes the session does on its own (nobody watching, nobody able to
-    /// think) — those resume themselves, and this one must not.
-    paused: bool,
+    /// Who has the game paused, if anyone: held by a player rather than by
+    /// circumstance. Distinct from the freezes the session does on its own
+    /// (nobody watching, nobody able to think) — those resume themselves,
+    /// and this one must not.
+    paused_by: Option<PlayerId>,
+    /// Pauses each player has left this game.
+    pauses_left: BTreeMap<PlayerId, u8>,
     pending_compute: HashMap<u64, PendingCompute>,
     /// Requests whose tick has already resolved, kept briefly so a late
     /// answer is still recognisable. Dropping them on sight made lateness
@@ -379,7 +385,7 @@ impl SessionActor {
     fn new(name: String, registry: Registry, db: Arc<Db>) -> Self {
         let (tx, rx) = mpsc::channel(1024);
         Self {
-            title: default_game_name(&name),
+            title: snek_shared::names::game_name(|n| rand::random_range(0..n)),
             name,
             registry,
             db,
@@ -393,7 +399,8 @@ impl SessionActor {
             ready: HashSet::new(),
             game: None,
             bot_hosts: HashMap::new(),
-            paused: false,
+            paused_by: None,
+            pauses_left: BTreeMap::new(),
             pending_compute: HashMap::new(),
             retired_compute: VecDeque::new(),
             next_request_id: 1,
@@ -524,6 +531,7 @@ impl SessionActor {
                         turns: game.turns.clone(),
                     });
                     self.send_to(conn_id, frame);
+                    self.send_to(conn_id, control_frame(&self.hold(None)));
                 }
                 self.broadcast_lobby();
             }
@@ -612,18 +620,8 @@ impl SessionActor {
             ClientMsg::Configure(config) => self.configure(player, config),
             ClientMsg::Rename(name) => self.rename(player, &name),
             ClientMsg::Leave => self.leave(&player),
-            ClientMsg::SetPaused(paused) => {
-                if self.game.is_some() && self.paused != paused {
-                    self.paused = paused;
-                    tracing::info!(session = %self.name, paused, "game hold changed");
-                    self.broadcast(&Frame::Control(encode(&ServerMsg::Paused(paused)).into()));
-                    if paused {
-                        self.next_tick = None;
-                    } else {
-                        self.resume_tick();
-                    }
-                }
-            }
+            ClientMsg::SetPaused(true) => self.pause(player),
+            ClientMsg::SetPaused(false) => self.unpause(&player),
             ClientMsg::Start => self.start_game(),
             ClientMsg::Move(dir) => {
                 if let Some(game) = &mut self.game
@@ -825,7 +823,7 @@ impl SessionActor {
             self.bot_counter += 1;
             let (name, emoji, colour) = match difficulty {
                 BotDifficulty::Easy => ("cool guy", "🐛", "hsl(95, 45%, 65%)"),
-                BotDifficulty::Medium => ("dude", "🤖", "hsl(210, 50%, 68%)"),
+                BotDifficulty::Medium => ("dude", "🐍", "hsl(210, 50%, 68%)"),
                 BotDifficulty::Hard => ("lad", "🐲", "hsl(275, 45%, 68%)"),
             };
             let id = format!("bot-{}", self.bot_counter);
@@ -1010,11 +1008,59 @@ impl SessionActor {
         }
     }
 
+    /// `player` pauses the game: if one's running, nobody has it paused,
+    /// and they have a pause left.
+    fn pause(&mut self, player: PlayerId) {
+        if self.game.is_none() || self.paused_by.is_some() {
+            return;
+        }
+        let Some(left) = self.pauses_left.get_mut(&player).filter(|l| **l > 0) else {
+            return;
+        };
+        *left -= 1;
+        tracing::info!(session = %self.name, %player, left = *left, "paused");
+        self.paused_by = Some(player);
+        self.next_tick = None;
+        self.broadcast_hold(None);
+    }
+
+    /// `player` resumes the game: theirs to resume if they paused it, or
+    /// anyone's if whoever did has gone (a game can't be left stuck). It
+    /// plays again after a second of "resuming" and the countdown a game
+    /// starts with.
+    fn unpause(&mut self, player: &PlayerId) {
+        let Some(by) = &self.paused_by else {
+            return;
+        };
+        let pauser_here = self.conns.values().any(|c| c.player == *by);
+        if by != player && pauser_here {
+            return;
+        }
+        tracing::info!(session = %self.name, %player, "resumed");
+        self.paused_by = None;
+        self.next_tick = Some(Instant::now() + Duration::from_millis(u64::from(RESUME_MS)));
+        self.broadcast_hold(Some(RESUME_MS));
+    }
+
+    /// The game's pause state, as told to everyone.
+    fn hold(&self, resume_in_ms: Option<u32>) -> ServerMsg {
+        ServerMsg::Hold(Hold {
+            by: self.paused_by.clone(),
+            pauses_left: self.pauses_left.clone(),
+            resume_in_ms,
+        })
+    }
+
+    fn broadcast_hold(&mut self, resume_in_ms: Option<u32>) {
+        let frame = control_frame(&self.hold(resume_in_ms));
+        self.broadcast(&frame);
+    }
+
     fn start_game(&mut self) {
         if self.game.is_some() || self.lobby.is_empty() {
             return;
         }
-        self.paused = false;
+        self.paused_by = None;
         // Bots are always ready; every human must be.
         let all_ready = self
             .lobby
@@ -1054,6 +1100,14 @@ impl SessionActor {
             conn.think_share = conn.think_share.max(0.5);
         }
         self.ready.clear();
+        // Everyone in it starts with their full allowance of pauses.
+        self.pauses_left = self
+            .lobby
+            .iter()
+            .filter(|p| !self.bots.contains_key(&p.id))
+            .map(|p| (p.id.clone(), PAUSES_PER_GAME))
+            .collect();
+        self.broadcast_hold(None);
         self.publish_info();
         self.next_tick = Some(Instant::now() + Duration::from_millis(u64::from(COUNTDOWN_MS)));
         self.assign_bots();
@@ -1071,7 +1125,7 @@ impl SessionActor {
         };
 
         // Held on purpose.
-        if self.paused {
+        if self.paused_by.is_some() {
             self.next_tick = None;
             return;
         }
@@ -1332,7 +1386,7 @@ impl SessionActor {
 
     /// Start the clock again, unless someone has deliberately stopped it.
     fn resume_tick(&mut self) {
-        if self.game.is_some() && self.next_tick.is_none() && !self.paused {
+        if self.game.is_some() && self.next_tick.is_none() && self.paused_by.is_none() {
             self.next_tick =
                 Some(Instant::now() + Duration::from_millis(u64::from(self.tick_ms_now())));
         }
@@ -1988,7 +2042,12 @@ mod tests {
         let mut alice = join(&mut s, "alice");
         let bob = join(&mut s, "bob");
         alice.msgs();
-        assert_eq!(s.title, default_game_name(&s.name));
+        assert_eq!(
+            s.title.split(' ').count(),
+            3,
+            "a new game is named three words: {}",
+            s.title
+        );
 
         say(
             &mut s,
@@ -2129,25 +2188,67 @@ mod tests {
         let mut bob = join(&mut s, "bob");
         // No game, nothing to hold.
         say(&mut s, &alice, ClientMsg::SetPaused(true));
-        assert!(!bob.msgs().iter().any(|m| matches!(m, ServerMsg::Paused(_))));
+        assert!(!bob.msgs().iter().any(|m| matches!(m, ServerMsg::Hold(_))));
 
         start(&mut s, &[&alice, &bob]);
         bob.msgs();
         say(&mut s, &alice, ClientMsg::SetPaused(true));
-        say(&mut s, &alice, ClientMsg::SetPaused(true));
-        let held: Vec<ServerMsg> = bob.msgs();
-        assert!(matches!(held[..], [ServerMsg::Paused(true)]), "{held:?}");
+        // Already held: a second pause is nothing.
+        say(&mut s, &bob, ClientMsg::SetPaused(true));
+        let when_paused = bob.msgs();
+        let [ServerMsg::Hold(paused)] = &when_paused[..] else {
+            panic!("{when_paused:?}");
+        };
+        assert_eq!(paused.by.as_deref(), Some(alice.id.as_str()));
+        assert_eq!(paused.pauses_left[&alice.id], PAUSES_PER_GAME - 1);
+        assert_eq!(
+            paused.pauses_left[&bob.id], PAUSES_PER_GAME,
+            "bob's was spent"
+        );
         assert_eq!(s.next_tick, None);
-        // Nothing a player does in the meantime restarts it.
+        // Nothing a player does in the meantime restarts it, bob's resume
+        // included: it's alice's to lift.
         say(&mut s, &bob, ClientMsg::HostAvailable { can_compute: true });
         s.handle(Cmd::Alive {
             conn_id: bob.conn_id,
         });
-        assert_eq!(s.next_tick, None);
-
         say(&mut s, &bob, ClientMsg::SetPaused(false));
-        assert!(matches!(bob.msgs()[..], [ServerMsg::Paused(false)]));
-        assert!(s.next_tick.is_some());
+        assert_eq!(s.next_tick, None);
+        assert!(s.paused_by.is_some());
+
+        // Alice lifts it: everyone gets the countdown, then play.
+        say(&mut s, &alice, ClientMsg::SetPaused(false));
+        let resumed = bob.msgs();
+        let [ServerMsg::Hold(lifted)] = &resumed[..] else {
+            panic!("{resumed:?}");
+        };
+        assert_eq!(lifted.by, None);
+        assert_eq!(lifted.resume_in_ms, Some(RESUME_MS));
+        let due = s.next_tick.expect("not resumed");
+        assert!(due > Instant::now() + Duration::from_millis(u64::from(RESUME_MS) - 100));
+    }
+
+    #[tokio::test]
+    async fn three_pauses_each_and_nobody_is_held_hostage() {
+        let mut s = session();
+        let alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+        start(&mut s, &[&alice, &bob]);
+        for _ in 0..PAUSES_PER_GAME {
+            say(&mut s, &alice, ClientMsg::SetPaused(true));
+            assert!(s.paused_by.is_some());
+            say(&mut s, &alice, ClientMsg::SetPaused(false));
+        }
+        say(&mut s, &alice, ClientMsg::SetPaused(true));
+        assert_eq!(s.paused_by, None, "a fourth pause");
+
+        // Bob pauses, then goes: alice can lift it.
+        say(&mut s, &bob, ClientMsg::SetPaused(true));
+        s.handle(Cmd::Disconnect {
+            conn_id: bob.conn_id,
+        });
+        say(&mut s, &alice, ClientMsg::SetPaused(false));
+        assert_eq!(s.paused_by, None, "stuck held by someone who left");
     }
 
     #[tokio::test]

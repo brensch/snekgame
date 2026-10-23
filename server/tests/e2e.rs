@@ -910,7 +910,7 @@ async fn pausing_holds_the_game_and_food_is_recorded() {
     let mut bob_saw_pause = false;
     for _ in 0..40 {
         match tokio::time::timeout(Duration::from_millis(100), bob.next_msg()).await {
-            Ok(ServerMsg::Paused(true)) => bob_saw_pause = true,
+            Ok(ServerMsg::Hold(hold)) if hold.by.is_some() => bob_saw_pause = true,
             Ok(_) => {}
             Err(_) => break,
         }
@@ -922,7 +922,7 @@ async fn pausing_holds_the_game_and_food_is_recorded() {
 
     alice.control(&ClientMsg::SetPaused(false)).await;
     let mut resumed = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline && !resumed {
         if let Ok(ServerMsg::Turn(_)) =
             tokio::time::timeout(Duration::from_millis(400), alice.next_msg()).await

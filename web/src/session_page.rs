@@ -6,7 +6,7 @@ use crate::net;
 use crate::palette;
 use crate::store::{ConnStatus, GameView, Popup, Store};
 use leptos::prelude::*;
-use snek_shared::protocol::{ClientMsg, LobbyState};
+use snek_shared::protocol::{ClientMsg, LobbyState, PAUSES_PER_GAME};
 use snek_shared::{BotDifficulty, Dir, GameConfig, PlayerProfile, Pos, Turn, is_bot, is_draw};
 
 pub(crate) const BOARD_SIZES: &[(&str, u8)] = &[("Small", 11), ("Medium", 13), ("Large", 17)];
@@ -208,6 +208,7 @@ fn open_finished_game(store: Store, id: i64) {
                 players: record.players,
                 turns: record.turns,
             }));
+            crate::autoplay::start(store, None);
         }
     });
 }
@@ -391,7 +392,7 @@ fn kick_confirm(who: &PlayerProfile) -> impl IntoView + use<> {
                     " from the lobby?"
                 </p>
                 <div class="row confirm-row">
-                    <button on:click=close>"no, keep them"</button>
+                    <button on:click=close>"keep"</button>
                     <button
                         class="danger"
                         on:click=move |_| {
@@ -399,7 +400,7 @@ fn kick_confirm(who: &PlayerProfile) -> impl IntoView + use<> {
                             store.popup.set(None);
                         }
                     >
-                        "yes, remove"
+                        "remove"
                     </button>
                 </div>
             </div>
@@ -425,7 +426,7 @@ fn lobby_view(lobby: &LobbyState) -> impl IntoView + use<> {
                 <button class="settings-button" on:click=move |_| store.popup.set(Some(Popup::Settings))>
                     {settings_summary(&lobby.config)}
                 </button>
-                <button class="rules-button" on:click=move |_| store.popup.set(Some(Popup::Rules))>
+                <button class="rules-button" on:click=move |_| crate::demo::open(store)>
                     <span class="book">{move || book(store.now_ms.get())}</span>
                     "rules"
                 </button>
@@ -441,7 +442,7 @@ fn lobby_view(lobby: &LobbyState) -> impl IntoView + use<> {
                     .map(|popup| match popup {
                         Popup::BotPicker => bot_picker().into_any(),
                         Popup::Settings => settings_popup(&config, &name).into_any(),
-                        Popup::Rules => crate::rules::rules_popup(&food).into_any(),
+                        Popup::Rules(step) => crate::rules::rules_popup(&food, step).into_any(),
                         Popup::Kick(who) => kick_confirm(&who).into_any(),
                         // Drawn by the session page, game or lobby alike.
                         Popup::Leave(_) => ().into_any(),
@@ -464,7 +465,7 @@ fn settings_summary(config: &GameConfig) -> impl IntoView + use<> {
         .map_or("Custom", |(name, _)| name);
     view! {
         <span class="food">{config.food_emoji.clone()}</span>
-        <span class="values">"board " <b>{board}</b> <br /> "speed " <b>{speed}</b></span>
+        <span class="values">"size " <b>{board}</b> <br /> "speed " <b>{speed}</b></span>
     }
 }
 
@@ -549,7 +550,7 @@ fn bot_picker() -> impl IntoView {
                     style="margin-bottom: 10px;"
                     on:click=pick(BotDifficulty::Medium)
                 >
-                    "🤖 medium"
+                    "🐍 medium"
                 </button>
                 <button class="big" on:click=pick(BotDifficulty::Hard)>"🐲 hard"</button>
             </div>
@@ -644,19 +645,29 @@ fn dir_towards(head: Pos, pos: Pos, width: i32) -> Option<Dir> {
 const WORDS: [&str; 3] = ["ready", "steady", "spagheddi!"];
 const WORD_MS: f64 = 1000.0;
 const WORDS_MS: f64 = 3.0 * WORD_MS;
+/// How long a starting game's board takes to fade in (styles.css matches).
+const BOARD_FADE_MS: f64 = 900.0;
+/// The spotlight's three seconds, before the words: shown, then fading
+/// out over the last `SPOT_FADE_MS` (styles.css's `.spot` transition).
+const SPOTLIGHT_MS: f64 = 3_000.0;
+const SPOT_FADE_MS: f64 = 600.0;
 
 /// Where the start of a game has got to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Start {
+    /// Coming back from a pause: just "resuming", for a second.
+    Resuming,
     /// The board spotlights you.
     You,
+    /// The spotlight fading away, nothing else, so it's gone before "ready".
+    Clearing,
     /// The plain board, with the countdown over it.
     Countdown,
     /// Under way (or not starting at all).
     Done,
 }
 
-/// The start's phase, from the shared clock. A memo, so the board and the
+/// The start's phase (a game's, or a resume's), from the shared clock. A memo, so the board and the
 /// words only hear about it when the phase changes, not five times a
 /// second: the whole game view (board SVG included) would otherwise re-render
 /// with every tick of the clock.
@@ -666,13 +677,21 @@ fn start_phase(starting: bool) -> Memo<Start> {
         if !starting {
             return Start::Done;
         }
-        let remaining = store.countdown_ends.get() - store.now_ms.get();
-        if remaining > WORDS_MS {
-            Start::You
-        } else if remaining > 0.0 {
-            Start::Countdown
-        } else {
+        let countdown = store.countdown.get();
+        // The shared clock lags by up to a tick, so "remaining" can read a
+        // little over the full countdown: it's still the start (not a
+        // resume), and still the spotlight.
+        let remaining = countdown.ends - store.now_ms.get();
+        if remaining <= 0.0 {
             Start::Done
+        } else if countdown.resume && remaining > WORDS_MS + SPOTLIGHT_MS {
+            Start::Resuming
+        } else if remaining > WORDS_MS + SPOT_FADE_MS {
+            Start::You
+        } else if remaining > WORDS_MS {
+            Start::Clearing
+        } else {
+            Start::Countdown
         }
     })
 }
@@ -684,7 +703,7 @@ fn start_phase(starting: bool) -> Memo<Start> {
 /// partway through joins the animation where it is (a negative delay).
 fn countdown_words() -> impl IntoView {
     let store = Store::use_store();
-    let left = (store.countdown_ends.get_untracked() - store.now_ms.get_untracked()).max(0.0);
+    let left = (store.countdown.get_untracked().ends - store.now_ms.get_untracked()).max(0.0);
     let elapsed = WORDS_MS - left;
     view! {
         <div class="countdown">
@@ -705,20 +724,47 @@ fn countdown_words() -> impl IntoView {
 
 /// Anyone in the game can call a halt — it is a game among friends, not a
 /// tournament. The server owns the state, so every screen agrees.
-fn pause_button() -> impl IntoView {
+fn pause_button(me: String) -> impl IntoView {
     let store = Store::use_store();
+    // What the server says: who has it paused and what's left of mine.
+    // Paused by me, I can resume it; paused by someone else, I can't;
+    // running, I can pause it while I have pauses left, and once I've used
+    // one it says how many.
+    move || {
+        let (by, left) = store
+            .hold
+            .with(|h| (h.by.clone(), h.pauses_left.get(&me).copied().unwrap_or(0)));
+        let (icon, label, resume) = match by {
+            Some(by) if by == me => ("▶️", "resume", true),
+            None if left > 0 => ("⏸️", "pause", false),
+            _ => return None,
+        };
+        let spent = !resume && left < PAUSES_PER_GAME;
+        Some(view! {
+            <div class="pause-row">
+                <button
+                    class="icon-btn"
+                    aria-label=label
+                    title=label
+                    on:click=move |_| net::send(&ClientMsg::SetPaused(!resume))
+                >
+                    {icon}
+                </button>
+                {spent.then(|| view! { <span class="pauses-left">{format!("({left} left)")}</span> })}
+            </div>
+        })
+    }
+}
+
+/// Paused: a card over the greyed-out board saying who did it.
+fn paused_card(by: &str, players: &[PlayerProfile]) -> impl IntoView + use<> {
+    let who = players.iter().find(|p| p.id == by).map_or_else(
+        || "someone".to_owned(),
+        |p| format!("{} {}", p.emoji, p.name),
+    );
     view! {
-        <div class="pause-row">
-            <button
-                class="icon-btn"
-                aria-label=move || if store.paused.get() { "resume" } else { "pause" }
-                title=move || if store.paused.get() { "resume" } else { "pause" }
-                on:click=move |_| {
-                    net::send(&ClientMsg::SetPaused(!store.paused.get()));
-                }
-            >
-                {move || if store.paused.get() { "▶️" } else { "⏸️" }}
-            </button>
+        <div class="countdown">
+            <span class="still">"⏸ " {who} " paused"</span>
         </div>
     }
 }
@@ -811,25 +857,63 @@ fn results(
 }
 
 /// Replay, right under the board it moves, once the game is over.
-fn scrubber(viewing: usize, last: usize) -> impl IntoView {
+fn scrubber(last: usize) -> impl IntoView {
     let store = Store::use_store();
+    let viewing = move || store.view_turn.get().unwrap_or(last).min(last);
     view! {
         <div class="replay-controls">
+            // Highlights playing: stop them. Stopped: play them from here.
+            <button
+                class="icon"
+                aria-label=move || if store.autoplay.get() { "stop" } else { "play highlights" }
+                on:click=move |_| {
+                    if store.autoplay.get_untracked() {
+                        crate::autoplay::stop(store);
+                    } else {
+                        crate::autoplay::start(store, Some(viewing()));
+                    }
+                }
+            >
+                {move || if store.autoplay.get() { "⏸" } else { "▶" }}
+            </button>
+            // Grabbing the slider takes over from the highlights.
             <input
                 type="range"
                 class="scrubber"
                 aria-label="replay"
                 min="0"
                 max=last.to_string()
-                prop:value=viewing.to_string()
+                prop:value=move || viewing().to_string()
+                on:pointerdown=move |_| crate::autoplay::stop(store)
                 on:input=move |ev| {
+                    crate::autoplay::stop(store);
                     if let Ok(i) = event_target_value(&ev).parse::<usize>() {
                         store.view_turn.set(Some(i));
                     }
                 }
             />
-            <span class="turn-count">{format!("{viewing}/{last}")}</span>
+            <span class="turn-count">{move || format!("{}/{last}", viewing())}</span>
         </div>
+    }
+}
+
+/// A finished game's board: whichever turn the slider or the highlights
+/// are on, redrawn as that changes and nothing else.
+fn finished_board(game: &GameView, me: &str, last: usize) -> impl IntoView + use<> {
+    let store = Store::use_store();
+    let shown = StoredValue::new((
+        game.config.clone(),
+        game.players.clone(),
+        game.turns.clone(),
+    ));
+    let me = me.to_owned();
+    move || {
+        let i = store.view_turn.get().unwrap_or(last).min(last);
+        shown.with_value(|(config, players, turns)| {
+            turns
+                .get(i)
+                .map(|turn| board_view(config, players, turn, &me, Extras::none(), |_| {}))
+        })
     }
 }
 
@@ -841,15 +925,24 @@ fn game_view(game: &GameView) -> Option<impl IntoView + use<>> {
 
     let turn_count = game.turns.len();
     let last = turn_count.saturating_sub(1);
-    let viewing = store.view_turn.get().unwrap_or(last).min(last);
-    let turn: Turn = game.turns.get(viewing)?.clone();
+    // Live, the board is the latest turn. Over, it's whichever the slider
+    // (or the highlights) shows, and only the board follows it (below): the
+    // rest of the screen, the winner's emoji rain included, stays put.
+    let turn: Turn = game.turns.get(last)?.clone();
     let last_turn = game.turns.last()?;
     let over = last_turn.game_over();
 
-    // Before the first tick: the board spotlights you (see board_view) for
-    // a few seconds, then the countdown.
-    let show_countdown = !over && turn_count == 1;
-    let phase = start_phase(show_countdown);
+    // Before the first tick, and again after a pause: the board spotlights
+    // you (see board_view) for a second, then the countdown.
+    let phase = start_phase(!over);
+    // A game starting fades its board in (already spotlit), from wherever
+    // in the fade we are.
+    let countdown = store.countdown.get_untracked();
+    let since_start = net::now() - countdown.began;
+    let entering_ms =
+        (!over && !countdown.resume && turn_count == 1 && since_start < BOARD_FADE_MS)
+            .then_some(since_start.max(0.0));
+    let players = game.players.clone();
 
     // Direction input: tap a cell relative to my head.
     let my_head: Option<Pos> = turn.snakes.get(&me).and_then(|s| s.first().copied());
@@ -861,6 +954,7 @@ fn game_view(game: &GameView) -> Option<impl IntoView + use<>> {
     };
 
     let spectating = !game.players.iter().any(|p| p.id == me);
+    let me_for_pause = me.clone();
     let i_died = !spectating && !over && !last_turn.alive.contains(&me);
     let show_dpad = !over && !spectating && !i_died;
     let lobby_now = store.lobby.get();
@@ -873,9 +967,7 @@ fn game_view(game: &GameView) -> Option<impl IntoView + use<>> {
             // of a phone screen to tell you something the board already
             // shows.
             {move || {
-                let note = if store.paused.get() {
-                    Some("held ⏸️")
-                } else if spectating {
+                let note = if spectating {
                     Some("spectating — you can join next game")
                 } else if i_died {
                     Some("you died 💀 watch the rest")
@@ -884,24 +976,52 @@ fn game_view(game: &GameView) -> Option<impl IntoView + use<>> {
                 };
                 note.map(|n| view! { <p class="play-note">{n}</p> })
             }}
-            {board_view(
+            {if over {
+                finished_board(game, &me, last).into_any()
+            } else {
+                board_view(
                 &game.config,
                 &game.players,
                 &turn,
                 &me,
                 Extras {
-                    spotlight: show_countdown,
-                    spot_on: Signal::derive(move || phase.get() == Start::You),
-                    overlay: move || (phase.get() == Start::Countdown).then(countdown_words),
+                    spotlight: !over,
+                    spot_on: Signal::derive(move || {
+                        phase.get() == Start::You && store.hold.with(|h| h.by.is_none())
+                    }),
+                    held: Signal::derive(move || store.hold.with(|h| h.by.is_some())),
+                    entering_ms,
+                    overlay: move || {
+                        if let Some(by) = store.hold.with(|h| h.by.clone()) {
+                            return Some(paused_card(&by, &players).into_any());
+                        }
+                        match phase.get() {
+                            Start::Resuming => Some(
+                                view! {
+                                    <div class="countdown">
+                                        <span class="still">"resuming"</span>
+                                    </div>
+                                }
+                                    .into_any(),
+                            ),
+                            Start::Countdown => Some(countdown_words().into_any()),
+                            _ => None,
+                        }
+                    },
                 },
                 on_cell,
-            )}
-            {over.then(|| scrubber(viewing, last))}
+            )
+                .into_any()
+            }}
+            {over.then(|| scrubber(last))}
             // One bottom half, whichever state the game is in. Two layouts
             // meant two sets of rules for the same board, and the board
             // quietly changed size the moment the game ended.
             <div class="controls">
-                {(!over && !show_countdown).then(pause_button)}
+                {move || {
+                    (!over && phase.get() == Start::Done && !spectating)
+                        .then(|| pause_button(me_for_pause.clone()))
+                }}
                 {show_dpad.then(dpad)}
                 {over.then(|| results(game, last_turn, lobby_now.as_ref()))}
             </div>
