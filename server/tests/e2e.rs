@@ -207,18 +207,11 @@ async fn two_players_play_a_full_game() {
     let _ = alice.conn.send_datagram(encode(&ClientMsg::Ping(7)));
 
     let mut saved_id: Option<i64> = None;
-    let mut game_over = false;
     let mut got_pong = false;
     let mut turn_count = 0u32;
     for _ in 0..400 {
         match alice.next_msg().await {
-            ServerMsg::Turn(turn) => {
-                turn_count += 1;
-                if turn.game_over() {
-                    game_over = true;
-                    assert_eq!(turn.winners.len(), 2, "all players ranked");
-                }
-            }
+            ServerMsg::Turn(_) => turn_count += 1,
             ServerMsg::Pong(7) => got_pong = true,
             ServerMsg::GameSaved { id, .. } => {
                 saved_id = Some(id);
@@ -227,7 +220,9 @@ async fn two_players_play_a_full_game() {
             _ => {}
         }
     }
-    assert!(game_over, "game never ended");
+    // The final snapshot is a datagram and the save notice rides the
+    // stream, so the notice can overtake it; the saved record (below) is
+    // the reliable word on how the game ended.
     assert!(got_pong, "datagram ping never answered");
     assert!(turn_count > 0, "no turn snapshots arrived");
     let saved_id = saved_id.expect("game was not saved");
@@ -238,7 +233,9 @@ async fn two_players_play_a_full_game() {
     let blob = http_get_bytes(http_port, &format!("/api/history/{saved_id}")).await;
     let record: snek_shared::GameRecord = postcard::from_bytes(&blob).expect("decode record");
     assert_eq!(record.players.len(), 2);
-    assert!(record.turns.last().unwrap().game_over());
+    let last = record.turns.last().expect("record has turns");
+    assert!(last.game_over(), "game never ended");
+    assert_eq!(last.winners.len(), 2, "all players ranked");
 
     // Sessions API lists the (post-game) lobby.
     let body = http_get(http_port, "/api/sessions").await;
