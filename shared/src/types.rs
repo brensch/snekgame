@@ -241,7 +241,7 @@ pub struct Winner {
 /// count is shared. Winners are still ranked data; presentation decides
 /// whether anyone gets a medal.
 #[must_use]
-pub fn is_draw(winners: &[Winner]) -> bool {
+pub const fn is_draw(winners: &[Winner]) -> bool {
     winners.len() >= 2 && winners[0].survival_turns == winners[1].survival_turns
 }
 

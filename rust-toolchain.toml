@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned so this machine and CI run the same compiler and the same clippy:
+# a newer clippy brings new lints, and with -D warnings those fail CI.
+channel = "1.99.1"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+targets = ["wasm32-unknown-unknown"]

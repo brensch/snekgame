@@ -326,7 +326,7 @@ async fn watch_games_pushes_list() {
         .await
         .unwrap()
     {
-        ServerMsg::Sessions(list) => assert!(list.is_empty()),
+        ServerMsg::Sessions(list) => assert_eq!(list, Vec::<SessionSummary>::new()),
         other => panic!("expected sessions, got {other:?}"),
     }
 

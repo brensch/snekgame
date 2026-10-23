@@ -706,7 +706,7 @@ mod tests {
             assert!(!config().is_wall(snake[0]));
         }
         // centre food + up to one per snek
-        assert!(!t.food.is_empty());
+        assert_ne!(t.food, Vec::<Pos>::new(), "no food was dealt");
         assert!(t.health.values().all(|&h| h == 100));
     }
 
@@ -953,7 +953,7 @@ mod tests {
         let mut e = two_player_engine();
         let turn = turn_with(&[("a", vec![70, 69, 68]), ("b", vec![72, 73, 74])]);
         let next = e.next_turn(&turn, &moves(&[("a", Dir::Right), ("b", Dir::Left)]));
-        assert!(next.alive.is_empty());
+        assert_eq!(next.alive, Vec::<PlayerId>::new());
         assert_eq!(reasons(&next, "a"), vec![ClashReason::HeadOn; 3]);
         assert_eq!(reasons(&next, "b"), vec![ClashReason::HeadOn; 3]);
         assert!(next.game_over());
@@ -971,7 +971,7 @@ mod tests {
         let next = e.next_turn(&turn, &moves(&[("solo", Dir::Down)]));
         assert_eq!(next.health["solo"], 1, "one tick from starving");
         let last = e.next_turn(&next, &moves(&[("solo", Dir::Down)]));
-        assert!(last.alive.is_empty());
+        assert_eq!(last.alive, Vec::<PlayerId>::new());
         assert_eq!(reasons(&last, "solo"), vec![ClashReason::Starved; 3]);
         assert!(last.game_over(), "a solo game ends when its snek dies");
     }

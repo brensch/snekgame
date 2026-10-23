@@ -1768,7 +1768,7 @@ mod tests {
         say(&mut s, &alice, ClientMsg::SetReady(true));
         assert_eq!(alice.lobby().unwrap().ready, ["alice-id"]);
         say(&mut s, &alice, ClientMsg::SetReady(false));
-        assert!(alice.lobby().unwrap().ready.is_empty());
+        assert_eq!(alice.lobby().unwrap().ready, Vec::<String>::new());
     }
 
     #[tokio::test]
@@ -1809,7 +1809,7 @@ mod tests {
         say(&mut s, &alice, ClientMsg::Kick(bob.id.clone()));
         let lobby = alice.lobby().unwrap();
         assert_eq!(lobby.players.len(), 1);
-        assert!(lobby.ready.is_empty());
+        assert_eq!(lobby.ready, Vec::<String>::new());
         assert!(s.bots.is_empty());
         assert!(s.away.is_empty(), "the held seat outlived the kick");
 
@@ -1935,7 +1935,7 @@ mod tests {
         assert!(bob.msgs().contains(&ServerMsg::Left), "bob wasn't told");
         let lobby = alice.lobby().unwrap();
         assert_eq!(lobby.players.len(), 1);
-        assert!(lobby.ready.is_empty());
+        assert_eq!(lobby.ready, Vec::<String>::new());
         // The transport closing afterwards holds no seat.
         s.handle(Cmd::Disconnect {
             conn_id: bob.conn_id,
@@ -2020,7 +2020,7 @@ mod tests {
         assert!(matches!(alice.frames()[..], [(true, ServerMsg::Pong(9))]));
         // The home screen's subscription means nothing inside a session.
         say(&mut s, &alice, ClientMsg::WatchGames);
-        assert!(alice.frames().is_empty());
+        assert_eq!(alice.frames(), Vec::<(bool, ServerMsg)>::new());
     }
 
     /// Messages from a connection the session no longer has (dropped as
@@ -2037,7 +2037,7 @@ mod tests {
         s.handle(Cmd::Alive { conn_id: 999 });
         s.handle(Cmd::Disconnect { conn_id: 999 });
         let lobby = alice.lobby().unwrap();
-        assert!(lobby.ready.is_empty());
+        assert_eq!(lobby.ready, Vec::<String>::new());
         assert_eq!(lobby.players.len(), 1);
     }
 
@@ -2552,7 +2552,7 @@ mod tests {
         let db = Arc::new(Db::open(&temp_path("registry.db")).unwrap());
         let registry = Registry::new(db);
         let mut watch = registry.watch_games();
-        assert!(registry.active_sessions().is_empty());
+        assert_eq!(registry.active_sessions(), Vec::<SessionSummary>::new());
 
         // An actor that has just exited, still in the map.
         let (dead, _) = mpsc::channel(1);
@@ -2631,7 +2631,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
         let lobby = latest_lobby(&mut bob_rx).expect("nobody was told");
         assert_eq!(lobby.players.len(), 1, "alice's seat was never released");
-        assert!(lobby.ready.is_empty());
+        assert_eq!(lobby.ready, Vec::<String>::new());
 
         // Bob goes too: the session lingers a minute, then it's gone.
         actor.send(Cmd::Disconnect { conn_id: 2 }).await.unwrap();
@@ -2639,13 +2639,13 @@ mod tests {
         assert!(lock(&registry.inner).contains_key("grace"));
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(!lock(&registry.inner).contains_key("grace"));
-        assert!(registry.active_sessions().is_empty());
+        assert_eq!(registry.active_sessions(), Vec::<SessionSummary>::new());
 
         // Coming back now is a fresh lobby.
         let (_, mut rx) = connect("alice", 3).await;
         tokio::task::yield_now().await;
         let lobby = latest_lobby(&mut rx).unwrap();
         assert_eq!(lobby.players.len(), 1);
-        assert!(lobby.ready.is_empty());
+        assert_eq!(lobby.ready, Vec::<String>::new());
     }
 }

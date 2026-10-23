@@ -381,8 +381,8 @@ mod tests {
             "UPDATE games SET players_json = 'not json', winners_json = '{'",
         );
         let entry = db.get_game_meta(id).unwrap().unwrap();
-        assert!(entry.players.is_empty());
-        assert!(entry.winners.is_empty());
+        assert_eq!(entry.players, Vec::<PlayerProfile>::new());
+        assert_eq!(entry.winners, Vec::<Winner>::new());
         assert_eq!(db.list_games(None, 10).unwrap().entries, [entry]);
     }
 
@@ -400,7 +400,7 @@ mod tests {
                 wall_ms: 0
             }
         );
-        assert!(empty.donors.is_empty());
+        assert_eq!(empty.donors, Vec::<ComputeDonor>::new());
 
         // Alice on two devices across two games, bob on one in one game.
         db.insert_compute_stat(1, &stat("alice", "phone", 10, 1_000), "a1", "ip", 900)

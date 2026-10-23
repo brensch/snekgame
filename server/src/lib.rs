@@ -660,7 +660,7 @@ mod tests {
 
         // Nobody is playing.
         let sessions: Vec<serde_json::Value> = get(&router, "/api/sessions").await.json();
-        assert!(sessions.is_empty());
+        assert_eq!(sessions, Vec::<serde_json::Value>::new());
     }
 
     /// A database gone wrong is a server error, never an empty history that
