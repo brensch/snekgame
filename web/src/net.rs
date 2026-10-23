@@ -14,13 +14,14 @@
 
 use crate::num;
 use crate::store::{ConnStatus, GameView, Store};
+use crate::trail;
 use futures_util::StreamExt;
 use gloo_timers::callback::{Interval, Timeout};
 use js_sys::Uint8Array;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use snek_shared::protocol::{
-    ClientMsg, ComputeTelemetry, LobbyState, PROTOCOL_VERSION, ReconnectReport, ServerMsg, decode,
+    ClientMsg, ComputeTelemetry, ConnectReport, LobbyState, PROTOCOL_VERSION, ServerMsg, decode,
     encode,
 };
 use snek_shared::{Dir, GameConfig, PlayerId, PlayerProfile, Turn};
@@ -62,6 +63,8 @@ struct Conn {
     /// Likewise the move repeater (session mode).
     repeat: Option<Interval>,
     backoff_ms: u32,
+    /// When this attempt's connection became ready, once it has.
+    ready_at: Option<f64>,
     /// When this connection attempt began, while it is still trying: from
     /// `open` until the server first says something on it. None once it is
     /// live, and while waiting out a backoff.
@@ -80,6 +83,11 @@ thread_local! {
     static BENCHMARK: Cell<Option<u32>> = const { Cell::new(None) };
     /// The connection we lost and are getting back, while we are.
     static OUTAGE: Cell<Option<Outage>> = const { Cell::new(None) };
+    /// Where we're going once the server confirms we've left a game.
+    static LEAVING_FOR: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The next move away from a game has been agreed to (see
+    /// `app::read_route`).
+    static LEAVE_ALLOWED: Cell<bool> = const { Cell::new(false) };
     /// When the page last came back into view.
     static VISIBLE_SINCE: Cell<f64> = const { Cell::new(0.0) };
     /// Whether the page was last seen hidden.
@@ -87,13 +95,11 @@ thread_local! {
 }
 
 /// A live connection lost, timed until it is back so the server can be
-/// told how the reconnect went (see [`ReconnectReport`]).
+/// told how the reconnect went (see [`ConnectReport`]).
 #[derive(Clone, Copy)]
 struct Outage {
     /// Last thing heard on the connection that went.
     last_rx: f64,
-    /// When the first attempt to replace it began.
-    first_attempt: f64,
     attempts: u32,
 }
 
@@ -118,7 +124,7 @@ thread_local! {
 /// network. Two is enough to rule out a single unlucky handshake.
 const ATTEMPTS_BEFORE_DIAGNOSING: u32 = 2;
 
-/// Work out whether the network is eating QUIC, and say so.
+/// Work out why connecting keeps failing, and do something about it.
 ///
 /// This is answerable rather than guessable. The page itself arrived over
 /// TCP, and the API lives on the same host, so if a plain HTTP request
@@ -141,13 +147,30 @@ fn diagnose_after_failure(store: Store, generation: u64) {
             .send()
             .await
             .is_ok_and(|r| r.ok());
-        // Only claim it if the attempt is still the live one and TCP really
-        // did answer — otherwise this is just an offline phone.
-        if tcp_works
-            && is_current(generation)
-            && store.conn.get_untracked() != ConnStatus::Connected
-        {
+        // Only if TCP really did answer and we're still not through: else
+        // this is just an offline phone. (Not "is this attempt still the
+        // live one": the attempt that timed out has always been replaced by
+        // the time the answer comes back.)
+        if !tcp_works || store.conn.get_untracked() == ConnStatus::Connected {
+            return;
+        }
+        // The server is there and QUIC won't reach it. Seen on phones after
+        // a sleep: every new connection the page opens hangs, while the
+        // same page freshly loaded connects at once. So the first remedy is
+        // the one that works, a reload. Only if that didn't help (we
+        // reloaded moments ago) is it the network itself blocking UDP.
+        if reloaded_recently() {
             store.quic_blocked.set(true);
+            return;
+        }
+        if let Some(w) = web_sys::window() {
+            trail::note(&format!(
+                "reloading: #{generation} and the one before hung, http fine"
+            ));
+            if let Ok(Some(s)) = w.session_storage() {
+                let _ = s.set_item(RELOAD_KEY, &now().to_string());
+            }
+            let _ = w.location().reload();
         }
     });
 }
@@ -207,7 +230,13 @@ fn ensure(store: Store, mode: Mode) {
         store.selected_dir.set(None);
         OUTAGE.with(|o| o.set(None));
     }
+    trail::want_connection(true);
     if need_new {
+        trail::note(if mode_changed {
+            "navigated"
+        } else {
+            "reopen: no connection"
+        });
         open(store, mode, BACKOFF_START_MS);
     }
 }
@@ -232,7 +261,20 @@ pub(crate) fn nudge(store: Store) {
                 let hung = conn
                     .attempt_started
                     .is_some_and(|t| now() - t > f64::from(CONNECT_TIMEOUT_MS));
-                (waiting || hung || is_stale()).then(|| conn.mode.clone())
+                let stale = is_stale();
+                (waiting || hung || stale).then(|| {
+                    trail::note(&format!(
+                        "reopen: {}",
+                        if waiting {
+                            "skipping backoff"
+                        } else if hung {
+                            "attempt hung"
+                        } else {
+                            "silent"
+                        }
+                    ));
+                    conn.mode.clone()
+                })
             }
             None => None,
         }
@@ -264,6 +306,7 @@ pub(crate) fn disconnect(store: Store) {
         }
     });
     store.conn.set(ConnStatus::Idle);
+    trail::want_connection(false);
     OUTAGE.with(|o| o.set(None));
     store.lobby.set(None);
     store.game.set(None);
@@ -343,12 +386,10 @@ fn open(store: Store, mode: Mode, backoff_ms: u32) {
         store.conn.get_untracked(),
         ConnStatus::Connected | ConnStatus::Reconnecting
     ) {
-        let started = now();
         let last_rx = LAST_RX.with(Cell::get);
         OUTAGE.with(|o| {
             let outage = o.get().unwrap_or(Outage {
                 last_rx,
-                first_attempt: started,
                 attempts: 0,
             });
             o.set(Some(Outage {
@@ -374,14 +415,18 @@ fn open(store: Store, mode: Mode, backoff_ms: u32) {
             ping: None,
             repeat: None,
             backoff_ms,
+            ready_at: None,
             attempt_started: Some(now()),
         });
         generation
     });
 
+    trail::note(&format!("open #{generation}"));
     mark_rx(); // fresh attempt starts with a fresh liveness clock
+    // Losing a connection is reconnecting until we're back, however many
+    // attempts that takes; anything else is a first connect.
     store.conn.update(|c| {
-        *c = if *c == ConnStatus::Connected {
+        *c = if matches!(*c, ConnStatus::Connected | ConnStatus::Reconnecting) {
             ConnStatus::Reconnecting
         } else {
             ConnStatus::Connecting
@@ -391,6 +436,13 @@ fn open(store: Store, mode: Mode, backoff_ms: u32) {
     let attempt_mode = mode.clone();
     spawn_local(async move {
         if let Err(e) = connect(store, attempt_mode, generation).await {
+            // A thrown WebTransportError carries its reason in `message`.
+            let reason = js_sys::Reflect::get(&e, &"message".into())
+                .ok()
+                .and_then(|m| m.as_string())
+                .or_else(|| e.as_string())
+                .unwrap_or_default();
+            trail::note(&format!("#{generation} failed: {reason}"));
             tracing_debug(&e);
             diagnose_after_failure(store, generation);
             schedule_reconnect(store, generation);
@@ -405,6 +457,7 @@ fn open(store: Store, mode: Mode, backoff_ms: u32) {
     // the status it would see is the one the sleep itself caused.
     Timeout::new(CONNECT_TIMEOUT_MS, move || {
         if still_trying(generation) {
+            trail::note(&format!("#{generation} timed out"));
             diagnose_after_failure(store, generation);
             let next = (backoff_ms * 2).min(BACKOFF_MAX_MS);
             open(store, mode, next);
@@ -423,29 +476,27 @@ fn still_trying(generation: u64) -> bool {
     })
 }
 
-/// The server is talking to us again after an outage: tell it how getting
-/// back went. Sessions only; the home screen's list has no one to tell.
-fn report_reconnect() {
-    let Some(outage) = OUTAGE.with(Cell::take) else {
-        return;
-    };
-    let in_session = ACTIVE.with(|a| {
-        a.borrow()
-            .as_ref()
-            .is_some_and(|c| matches!(c.mode, Mode::Session(_)))
-    });
-    if !in_session {
-        return;
-    }
+/// The server has answered a new session connection: tell it how getting
+/// here went (see [`ConnectReport`]): how long this attempt's handshake and
+/// join took, and for a reconnect, how long the player was cut off and how
+/// many attempts it took, with the trail of what happened on the way.
+fn report_connect(started: f64, ready_at: f64) {
     let at = now();
+    let outage = OUTAGE.with(Cell::take);
     let visible_since = VISIBLE_SINCE.with(Cell::get);
-    send(&ClientMsg::Reconnected(ReconnectReport {
-        attempts: outage.attempts,
-        silent_ms: num::to_u32(at - outage.last_rx),
-        reconnect_ms: num::to_u32(at - outage.first_attempt),
+    send(&ClientMsg::Connected(ConnectReport {
+        reconnect: outage.is_some(),
+        attempts: outage.map_or(1, |o| o.attempts),
+        silent_ms: outage.map(|o| num::to_u32(at - o.last_rx)),
         // Only if the page was hidden after the old connection went quiet:
         // otherwise it was in view throughout and there is no wake to time.
-        since_visible_ms: (visible_since > outage.last_rx).then(|| num::to_u32(at - visible_since)),
+        since_visible_ms: outage
+            .filter(|o| visible_since > o.last_rx)
+            .map(|_| num::to_u32(at - visible_since)),
+        page_ms: num::to_u32(trail::page_ms()),
+        handshake_ms: num::to_u32(ready_at - started),
+        join_ms: num::to_u32(at - ready_at),
+        trail: trail::events(),
     }));
 }
 
@@ -529,6 +580,7 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
                 .into(),
         ));
         store.conn.set(ConnStatus::Idle);
+        trail::want_connection(false);
         return Ok(());
     }
     let transport = open_transport(dev_wt().await)?;
@@ -546,6 +598,13 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
         transport.close();
         return Ok(());
     }
+    ACTIVE.with(|a| {
+        if let Some(conn) = &mut *a.borrow_mut()
+            && conn.generation == generation
+        {
+            conn.ready_at = Some(now());
+        }
+    });
 
     // Control stream.
     let stream: web_sys::WebTransportBidirectionalStream =
@@ -614,6 +673,7 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
     spawn_local(async move {
         let _ = JsFuture::from(transport.closed()).await;
         if is_current(generation) {
+            trail::note(&format!("#{generation} closed"));
             store.conn.set(ConnStatus::Reconnecting);
             schedule_reconnect(store, generation);
         }
@@ -768,8 +828,12 @@ fn take_loop_lag() -> u32 {
 pub(crate) fn report_availability(visible: bool) {
     // Focus and pageshow report "visible" too; only a return from hidden
     // is a wake.
-    if HIDDEN.with(|h| h.replace(!visible)) && visible {
+    let was_hidden = HIDDEN.with(|h| h.replace(!visible));
+    if was_hidden && visible {
         VISIBLE_SINCE.with(|v| v.set(now()));
+        trail::note("visible");
+    } else if !was_hidden && !visible {
+        trail::note("hidden");
     }
     send(&ClientMsg::HostAvailable {
         can_compute: visible,
@@ -832,6 +896,7 @@ fn schedule_reconnect(store: Store, generation: u64) {
         let mode = conn.mode.clone();
         let backoff = conn.backoff_ms;
         conn.backoff_ms = (backoff * 2).min(BACKOFF_MAX_MS);
+        trail::note(&format!("retry in {backoff}ms"));
         Timeout::new(backoff, move || {
             if is_current(generation) {
                 open(store, mode, backoff);
@@ -847,17 +912,24 @@ fn schedule_reconnect(store: Store, generation: u64) {
 
 fn apply(store: Store, msg: ServerMsg) {
     mark_rx();
+    // Only the server's own words count for the watchdog: a page busy
+    // retrying, however hard, hasn't heard from it.
+    trail::heard_from_server();
     // Connected means the server is actually talking to us on this
     // connection — not merely that a QUIC handshake finished. This is what
     // lets the hung-attempt guard recycle a stalled join.
     if store.conn.get_untracked() != ConnStatus::Connected {
-        ACTIVE.with(|a| {
-            if let Some(conn) = &mut *a.borrow_mut() {
-                conn.attempt_started = None;
-            }
+        let attempt = ACTIVE.with(|a| {
+            a.borrow_mut().as_mut().map(|conn| {
+                let times = (conn.attempt_started.take(), conn.ready_at);
+                (times, matches!(conn.mode, Mode::Session(_)))
+            })
         });
         store.conn.set(ConnStatus::Connected);
-        report_reconnect();
+        trail::note("connected");
+        if let Some(((Some(started), ready_at), true)) = attempt {
+            report_connect(started, ready_at.unwrap_or(started));
+        }
         FAILED_ATTEMPTS.with(|c| c.set(0));
         store.quic_blocked.set(false);
     }
@@ -905,6 +977,8 @@ fn apply(store: Store, msg: ServerMsg) {
         ServerMsg::GameSaved { id, .. } => store.saved_id.set(Some(id)),
         ServerMsg::Error(e) => on_error(store, e),
         ServerMsg::Paused(paused) => store.paused.set(paused),
+        ServerMsg::Kicked(by) => on_kicked(store, by.as_ref()),
+        ServerMsg::Left => finish_leaving(),
         ServerMsg::Pong(_) => {}
     }
 }
@@ -926,16 +1000,68 @@ fn on_lobby(store: Store, lobby: LobbyState) {
             store.selected_dir.set(None);
         }
     }
-    // A settings change by anyone (us included) flashes who made it.
-    // The first lobby of a session is not a change.
-    let changed = store.lobby.with_untracked(|old| {
-        old.as_ref()
-            .is_some_and(|old| old.session == lobby.session && old.config_rev != lobby.config_rev)
+    // Our hand of foods holds the lobby's pick, whoever made it.
+    store
+        .food_hand
+        .update(|hand| hand.show_pick(&lobby.config.food_emoji));
+    // Someone else changed the settings: say who, and what. The first lobby
+    // of a session is not a change.
+    store.lobby.with_untracked(|old| {
+        if let Some(old) = old
+            && old.session == lobby.session
+            && old.config_rev != lobby.config_rev
+        {
+            crate::notices::settings_changed(store, old, &lobby);
+        }
     });
-    if changed {
-        store.settings_flash_at.set(now());
-    }
     store.lobby.set(Some(lobby));
+}
+
+/// Whether we're in a game (its lobby or the game itself), so leaving
+/// would mean something.
+pub(crate) fn in_a_game(store: Store) -> bool {
+    store.lobby.with_untracked(Option::is_some) || store.game.with_untracked(Option::is_some)
+}
+
+/// Agree to the next move away from a game, once.
+pub(crate) fn take_leave_allowed() -> bool {
+    LEAVE_ALLOWED.with(|l| l.replace(false))
+}
+
+/// Go to `target` (a URL hash) from a game, taking ourselves out of it on
+/// the way. The server is told first and we go when it confirms (or after
+/// a moment regardless): closing the connection straight after sending
+/// could lose the message, and the seat would only time out.
+pub(crate) fn leave_to(store: Store, target: String) {
+    store.popup.set(None);
+    LEAVING_FOR.with(|l| *l.borrow_mut() = Some(target));
+    if store.conn.get_untracked() == ConnStatus::Connected {
+        send(&ClientMsg::Leave);
+        Timeout::new(LEAVE_WAIT_MS, finish_leaving).forget();
+    } else {
+        finish_leaving();
+    }
+}
+
+/// How long to wait for the server to confirm a leave before going anyway.
+const LEAVE_WAIT_MS: u32 = 1_500;
+
+/// Go wherever we were leaving for, if we still are.
+fn finish_leaving() {
+    if let Some(target) = LEAVING_FOR.with(|l| l.borrow_mut().take()) {
+        LEAVE_ALLOWED.with(|l| l.set(true));
+        crate::app::navigate(&target);
+    }
+}
+
+/// We were taken out of the lobby: back to the home screen, with a toast
+/// saying who did it. Leaving the session's route is what drops the
+/// connection (the server has already let it go).
+fn on_kicked(store: Store, by: Option<&PlayerProfile>) {
+    store.popup.set(None);
+    crate::notices::removed(store, by);
+    LEAVE_ALLOWED.with(|l| l.set(true));
+    crate::app::navigate("#/");
 }
 
 fn on_game_start(
@@ -963,6 +1089,9 @@ fn on_game_start(
     let me = store.me.get_untracked();
     // A fresh game always runs; never inherit the last one's hold.
     store.paused.set(false);
+    // And the lobby's popups belong to the lobby: back from the game, it
+    // starts closed.
+    store.popup.set(None);
     store.selected_dir.set(
         turn.snakes
             .get(&me)

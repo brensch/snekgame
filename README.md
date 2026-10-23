@@ -21,9 +21,11 @@ board ticks in real time, and whoever survives longest wins.
 
 ## Features
 
-- **Real-time multiplayer.** Every snek moves on a fixed tick (0.5, 1 or
-  2 s). Steer with the d-pad, swipes, taps on the board, arrow keys or WASD.
-  Miss a tick and you keep going the way you were heading.
+- **Real-time multiplayer.** Every snek moves on the same tick. Games start
+  chill, normal or fast and speed up steadily as they go, reaching their
+  fastest (0.2 s a tick, whatever the start) at turn 1000. Steer with the d-pad, swipes, taps on the
+  board, arrow keys or WASD. Miss a tick and you keep going the way you were
+  heading.
 - **Battlesnake rules.** Eat to grow and refill health (you lose 1 a turn).
   Walls, bodies and bigger heads kill you; a head-on collision kills the
   shorter snek.

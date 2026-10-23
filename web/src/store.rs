@@ -30,6 +30,22 @@ pub(crate) struct GameView {
     pub turns: Vec<Turn>,
 }
 
+/// The lobby's popups.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Popup {
+    /// Choosing a bot's difficulty.
+    BotPicker,
+    /// Board, speed and food.
+    Settings,
+    /// How to play.
+    Rules,
+    /// "Are you sure?" before removing this player.
+    Kick(PlayerProfile),
+    /// "Are you sure?" before leaving the game for this address (a URL
+    /// hash): the home link, the back button, anywhere.
+    Leave(String),
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Store {
     pub route: RwSignal<Route>,
@@ -38,7 +54,9 @@ pub(crate) struct Store {
     /// Our server-derived public id (empty until `Welcome` arrives).
     pub me: RwSignal<PlayerId>,
     pub show_profile_editor: RwSignal<bool>,
-    pub show_bot_picker: RwSignal<bool>,
+    /// The lobby popup that's open, if any. One field, because only one
+    /// can be open at a time.
+    pub popup: RwSignal<Option<Popup>>,
     pub conn: RwSignal<ConnStatus>,
     pub lobby: RwSignal<Option<LobbyState>>,
     /// Live games list, pushed by the server while watching (home screen).
@@ -49,10 +67,13 @@ pub(crate) struct Store {
     /// Set once we have evidence the network passes TCP but not UDP —
     /// which is a firewall eating QUIC, not a broken site.
     pub quic_blocked: RwSignal<bool>,
-    /// When the lobby's settings last changed under us (ms), so the "last
-    /// changed by" box can flash — and keep flashing across the lobby being
-    /// redrawn for some other reason partway through.
-    pub settings_flash_at: RwSignal<f64>,
+    /// This phone's own hand of lobby foods (see `palette::FoodHand`). It
+    /// lives here, not in the lobby view, because that view is rebuilt
+    /// every time anything in the lobby changes.
+    pub food_hand: RwSignal<crate::palette::FoodHand>,
+    /// The toasts on screen, newest first: brief notes that stack and fade
+    /// on their own (see `notices`).
+    pub toasts: RwSignal<Vec<crate::notices::Toast>>,
     /// Someone has held the game. Server-owned: we only ever mirror what it
     /// tells us, so every screen agrees on whether the clock is running.
     pub paused: RwSignal<bool>,
@@ -74,14 +95,15 @@ impl Store {
             profile: RwSignal::new(load_profile()),
             me: RwSignal::new(String::new()),
             show_profile_editor: RwSignal::new(false),
-            show_bot_picker: RwSignal::new(false),
+            popup: RwSignal::new(None),
             conn: RwSignal::new(ConnStatus::Idle),
             lobby: RwSignal::new(None),
             sessions: RwSignal::new(None),
             game: RwSignal::new(None),
             view_turn: RwSignal::new(None),
             quic_blocked: RwSignal::new(false),
-            settings_flash_at: RwSignal::new(0.0),
+            food_hand: RwSignal::new(crate::palette::FoodHand::dealt(snek_shared::DEFAULT_FOOD)),
+            toasts: RwSignal::new(Vec::new()),
             paused: RwSignal::new(false),
             selected_dir: RwSignal::new(None),
             saved_id: RwSignal::new(None),
@@ -136,11 +158,6 @@ pub(crate) fn random_hex(bytes: usize) -> String {
 
 fn random_secret() -> String {
     random_hex(16)
-}
-
-/// Opaque id for a newly created session — this is what goes in the URL.
-pub(crate) fn new_session_id() -> String {
-    random_hex(8)
 }
 
 fn load_profile() -> ProfileInfo {

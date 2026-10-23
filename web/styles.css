@@ -31,6 +31,12 @@
 }
 
 body {
+  /* Nothing on the page is text to select: on a phone a stray long-press
+     or double tap otherwise highlights words, pops the copy menu, or opens
+     Chrome's Touch to Search. Text boxes are the exception (below). */
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
   margin: 0;
   background: #fff;
   color: #000;
@@ -96,6 +102,11 @@ button.big {
 button.big:hover:not(:disabled),
 button.big:focus-visible {
   box-shadow: 4px 4px 0 #000;
+}
+
+input, textarea {
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 input, select {
@@ -241,14 +252,6 @@ ul.games {
 .game-card a:active {
   transform: translate(2px, 2px);
   box-shadow: 1px 1px 0 #000;
-}
-
-.host-tile {
-  flex: 0 0 64px;
-  display: grid;
-  place-items: center;
-  font-size: 32px;
-  border-right: 2px solid #000;
 }
 
 .game-main {
@@ -902,37 +905,36 @@ button.icon-btn:focus-visible {
 }
 
 /* --- ready? ------------------------------------------------------------
-   The question on the left, a two-sided switch on the right with both
-   answers written on it. The answer you've given is the filled side: "no"
-   in black, "yes" in your colour. One tap anywhere on it flips it. */
+   One two-sided switch the width of the screen, both answers written on
+   it. The answer you've given is the filled side: "not ready" in black,
+   "ready" in your colour. One tap anywhere on it flips it. */
 .ready-row {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
   height: 70px;
 }
 
-.ready-q {
-  font-size: 30px;
-  font-weight: bold;
-}
-
 button.ready-switch {
-  flex: 0 0 auto;
+  flex: 1 1 auto;
   display: grid;
   grid-template-columns: 1fr 1fr;
-  width: 190px;
+  width: 100%;
   height: 64px;
   padding: 0;
   border-width: 3px;
   font-size: 24px;
-  box-shadow: 3px 3px 0 #000;
 }
 
+/* Flat until you're ready: the shadow is part of saying yes. */
+button.ready-switch,
 button.ready-switch:hover:not(:disabled),
 button.ready-switch:focus-visible {
-  box-shadow: 5px 5px 0 #000;
+  box-shadow: none;
+}
+
+button.ready-switch.on,
+button.ready-switch.on:hover:not(:disabled),
+button.ready-switch.on:focus-visible {
+  box-shadow: 4px 4px 0 #000;
 }
 
 button.ready-switch span {
@@ -964,65 +966,118 @@ button.ready-switch.on .yes {
   color: #000;
 }
 
-button.ready-switch.on .yes::before {
-  content: "✓";
-  margin-right: 4px;
-}
 
-/* --- who last changed the settings ------------------------------------ */
-.changed-by {
+
+/* --- toasts -------------------------------------------------------------
+   A stack pinned to the bottom of the screen, the newest nearest the
+   bottom edge. Each card rises in, holds, and fades out over the 3 s it
+   lives (notices.rs removes it at the end): a flat white card with the
+   house border, whoever it is about in their own colour. Taps go through
+   to the page. */
+.toasts {
+  position: fixed;
+  bottom: calc(12px + env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(528px, calc(100vw - 32px));
+  margin: 0;
+  padding: 0;
+  list-style: none;
   display: flex;
-  align-items: center;
+  flex-direction: column-reverse;
   gap: 8px;
-  flex-wrap: wrap;
-  border: 2px dashed #000;
-  padding: 6px 10px;
-  margin: 4px 0 12px;
+  z-index: 300;
+  pointer-events: none;
 }
 
-.changed-by .who {
-  border: 2px solid #000;
-  padding: 2px 8px;
-  font-size: 15px;
+.snek-toast {
+  animation: toast-life 3000ms ease both;
 }
 
-/* Lights up and shakes off when somebody changes something. Played from
-   a negative delay, so a lobby redrawn mid-flash carries on from where it
-   was instead of starting over. */
-.changed-by .who.flash {
-  animation: who-flash 1800ms ease-out both;
-}
-
-@keyframes who-flash {
-  0%, 30%, 60% { box-shadow: 0 0 0 4px #000; transform: scale(1.12); }
-  15%, 45%, 75% { box-shadow: 0 0 0 0 #000; transform: scale(1); }
-  100% { box-shadow: none; transform: none; }
+@keyframes toast-life {
+  0% { opacity: 0; transform: translateY(12px); }
+  8% { opacity: 1; transform: none; }
+  80% { opacity: 1; }
+  100% { opacity: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .changed-by .who.flash { animation: none; }
+  .snek-toast { animation: none; }
 }
 
-/* "ready", "steady", "spagheddi!": the board stays visible behind it (it
-   is already greyed out around your snek), so no veil, just the word on a
-   card that pops in fresh each second. */
-.overlay.countdown {
-  background: none;
+.snek-toast {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+  background: #fff;
+  border: 2px solid #000;
+  padding: 10px 12px;
+  font-family: "snek mono", monospace;
+  font-size: 15px;
+  color: #000;
 }
 
-.overlay.countdown span {
+.snek-toast .who {
+  border: 2px solid #000;
+  padding: 2px 8px;
+  font-weight: bold;
+}
+
+/* --- the board's layers ------------------------------------------------
+   The field is drawn into .board-svg; over it, centred on the board, sits
+   whatever the game lays there (the countdown). The "you!" spotlight is a
+   layer inside the field, shown only while the board is .spotlit. */
+.board-wrap {
+  position: relative;
+}
+
+.board-svg {
+  width: 100%;
+  height: 100%;
+}
+
+.board-wrap:not(.spotlit) .spot {
+  display: none;
+}
+
+/* "ready", "steady", "spagheddi!": all three stacked in the middle of the
+   board, each fading in and out in its own second (their delays are set
+   inline). No veil: the whole board shows while it counts down. */
+.countdown {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+.countdown span {
+  grid-area: 1 / 1;
   background: #fff;
   border: 3px solid #000;
-  box-shadow: 5px 5px 0 #000;
   padding: 10px 22px;
   font-size: 40px;
   font-weight: bold;
-  animation: countdown-pop 220ms ease-out;
+  opacity: 0;
+  animation: count-word 1000ms ease both;
 }
 
-@keyframes countdown-pop {
-  from { transform: scale(0.6); }
-  to { transform: scale(1); }
+@keyframes count-word {
+  0% { opacity: 0; transform: scale(0.6); }
+  20% { opacity: 1; transform: scale(1); }
+  80% { opacity: 1; transform: scale(1); }
+  100% { opacity: 0; transform: scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .countdown span { animation-name: count-word-still; }
+  @keyframes count-word-still {
+    0%, 99% { opacity: 1; }
+    100% { opacity: 0; }
+  }
 }
 
 /* Not connected: the page is the server's last word, possibly stale. It
@@ -1032,4 +1087,216 @@ button.ready-switch.on .yes::before {
   filter: grayscale(1);
   pointer-events: none;
   user-select: none;
+}
+
+/* --- who you are -------------------------------------------------------
+   The first-visit page and the profile editor share one form: three
+   questions, each a section with room around it, then the button. On the
+   first-visit page the form fills the screen and the button sits at the
+   bottom of it, where the thumb is. */
+.profile-form section + section {
+  margin-top: 28px;
+}
+
+.profile-form h3 {
+  margin: 0 0 10px;
+}
+
+.profile-form button.shuffle {
+  margin-top: 10px;
+}
+
+.profile-form .lets-snek {
+  margin-top: 32px;
+}
+
+.setup-page {
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100dvh - 12px - var(--page-pad-bottom));
+}
+
+.setup-page .profile-form {
+  flex: 1 0 auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.setup-page .profile-form .lets-snek {
+  margin-top: auto;
+}
+
+/* Something has to keep the button off the last question when the screen
+   is too short for "auto" to leave any room. */
+.setup-page .profile-form section:last-of-type {
+  margin-bottom: 32px;
+}
+
+/* --- the lobby's two buttons: settings and rules --------------------------
+   Side by side, the same height, settings wide and rules narrow. Settings is labelled with the settings
+   themselves, so the lobby says what game it'll be without opening it. */
+.lobby-buttons {
+  display: grid;
+  /* Settings takes the room it needs; rules only what it needs. */
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  margin: 24px 0 14px;
+}
+
+.lobby-buttons button {
+  min-height: 64px;
+  font-size: 17px;
+  line-height: 1.3;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.settings-button .values {
+  white-space: nowrap;
+}
+
+.settings-button .food,
+.rules-button .book {
+  font-size: 28px;
+  line-height: 1;
+}
+
+/* The popup is narrower than the page: "Normal (1s)" has to fit. */
+.modal select {
+  font-size: 15px;
+  padding: 8px 6px;
+}
+
+.modal.rules p {
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+/* --- the rules popup: a rule a line, each with its picture --------------- */
+.rule-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.rule {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+/* Every picture gets the same box, so the sentences line up. */
+.rule-pic {
+  flex: 0 0 96px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.rule-pic svg {
+  display: block;
+  width: 96px;
+  height: auto;
+  border: 2px solid #000;
+}
+
+.rule-emoji {
+  font-size: 32px;
+  line-height: 1;
+}
+
+/* --- the players: chips that wrap -------------------------------------- */
+.player-chips {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.player-chips .player-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 4px 4px 10px;
+  font-size: 16px;
+  min-height: 38px;
+}
+
+/* Without an × (your own chip) the right side needs its padding back. */
+.player-chips .player-chip > :last-child:not(.chip-x) {
+  margin-right: 6px;
+}
+
+button.chip-x {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: 20px;
+  line-height: 1;
+  text-align: center;
+}
+
+button.chip-x:hover:not(:disabled),
+button.chip-x:focus-visible {
+  box-shadow: none;
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.add-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.confirm-q {
+  font-size: 18px;
+  line-height: 1.5;
+  margin-top: 0;
+}
+
+.confirm-row button {
+  text-align: center;
+}
+
+button.danger {
+  background: #e44;
+  color: #fff;
+}
+
+/* The start button closes the lobby: always there. Until it can be pressed
+   it is plain white and says in red who isn't ready. */
+.start-row {
+  margin-top: 28px;
+}
+
+.start-button {
+  height: auto;
+  min-height: 70px;
+  font-size: 24px;
+  line-height: 1.3;
+  padding: 12px 16px;
+}
+
+.start-button:disabled {
+  font-size: 18px;
+  opacity: 1;
+  background: #fff;
+  color: #c00;
+}
+
+/* The last game's banner opens that game's end-of-game screen. */
+button.last-game {
+  width: 100%;
+  font-size: 15px;
+  text-align: left;
 }

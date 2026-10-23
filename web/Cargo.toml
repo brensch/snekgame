@@ -22,7 +22,7 @@ web-sys = { version = "0.3", features = [
     "WebTransportDatagramDuplexStream", "WebTransportReceiveStream",
     "WebTransportSendStream", "WebTransportCloseInfo",
     "ReadableStream", "WritableStream", "WritableStreamDefaultWriter",
-    "console",
+    "console", "Performance",
 ] }
 wasm-bindgen-futures = "0.4"
 # Pinned to the wasm-streams leptos (server_fn) uses: duplicate versions define

@@ -6,7 +6,7 @@
 
 use crate::num;
 use crate::palette;
-use crate::store::{Store, new_session_id};
+use crate::store::Store;
 use leptos::prelude::*;
 use snek_shared::protocol::SessionSummary;
 
@@ -25,7 +25,9 @@ pub(crate) fn home_page() -> impl IntoView {
         if creating.get_untracked().is_some() {
             return;
         }
-        let id = new_session_id();
+        // Three random words, which are both the link and, until someone
+        // renames it, the game's name.
+        let id = snek_shared::names::game_name(num::random_index);
         creating.set(Some(id.clone()));
         crate::net::ensure_session(store, &id);
         // Fallback: if the join is slow, navigate anyway and let the
@@ -150,7 +152,7 @@ fn live_games(list: &[SessionSummary], page: RwSignal<usize>, store: Store) -> i
 /// you can still get in, and who's in it, sit quietly underneath; the
 /// button says what joining actually does.
 fn game_card(s: SessionSummary) -> impl IntoView {
-    // Everyone's face, host first, bots last: who's in it at a glance,
+    // Everyone's face, in the order they joined: who's in it at a glance,
     // without counting. A crowd is cut short rather than wrapped.
     const FACES: usize = 6;
     let href = format!("#/s/{}", s.id);
@@ -159,11 +161,8 @@ fn game_card(s: SessionSummary) -> impl IntoView {
     view! {
         <li class="game-card" class:playing=s.playing>
             <a href=href>
-                <span class="host-tile" style=format!("background: {};", s.host_colour)>
-                    {s.host_emoji}
-                </span>
                 <span class="game-main">
-                    <span class="game-title">{s.host_name} "'s game"</span>
+                    <span class="game-title">{s.name}</span>
                     <span class="game-meta">
                         <span class="status">{if s.playing { "playing" } else { "lobby" }}</span>
                         <span class="faces">

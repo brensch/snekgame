@@ -31,7 +31,8 @@ pub struct GameConfig {
     pub board_width: u8,
     /// Rows, including the wall on each side.
     pub board_height: u8,
-    /// Real-time tick interval in milliseconds.
+    /// The tick interval the game starts at, in milliseconds. It shortens
+    /// as the game goes on: see [`GameConfig::tick_ms_at`].
     pub tick_ms: u32,
     /// What the food looks like this game. Chosen in the lobby and stored
     /// with the record, so a replay shows what the players actually ate.
@@ -41,35 +42,6 @@ pub struct GameConfig {
 /// What food was before it was choosable, and what every game played up to
 /// then is stamped with.
 pub const DEFAULT_FOOD: &str = "🎃";
-
-/// Things a snake could plausibly want to eat. Only edible things belong
-/// here — the food is the one emoji on the board that has to read as a
-/// snack at a glance.
-pub const FOODS: &[&str] = &[
-    "🎃", "🍎", "🍕", "🍔", "🍩", "🍒", "🍓", "🌮", "🍗", "🥑", "🍇", "🍌", "🥕", "🧀", "🍰", "🍪",
-    "🥨", "🌭", "🍤", "🍣", "🥩", "🍉", "🍍", "🥞", "🍦", "🍫", "🥐", "🌽", "🍄", "🥟", "🍭", "🧁",
-    "🍿", "🥓", "🍑", "🥝", "🫐", "🍆", "🥦", "🦴", "🍋", "🥯", "🍠", "🧇",
-];
-
-/// How many foods the lobby offers at once.
-pub const FOOD_HAND: usize = 8;
-
-/// A hand of [`FOOD_HAND`] foods with `keep` at the front.
-///
-/// The rest are drawn from [`FOODS`] by `pick`, which is given how many are
-/// left to choose from and returns an index below that. Whatever is
-/// currently chosen always survives a shuffle, in the same place, so the
-/// choice just made can't be shuffled out from under anyone.
-pub fn deal_food_hand(keep: &str, mut pick: impl FnMut(usize) -> usize) -> Vec<String> {
-    let mut rest: Vec<&str> = FOODS.iter().copied().filter(|f| *f != keep).collect();
-    let mut hand = Vec::with_capacity(FOOD_HAND);
-    hand.push(keep.to_owned());
-    while hand.len() < FOOD_HAND && !rest.is_empty() {
-        let i = pick(rest.len()).min(rest.len() - 1);
-        hand.push(rest.swap_remove(i).to_owned());
-    }
-    hand
-}
 
 impl Default for GameConfig {
     fn default() -> Self {
@@ -83,7 +55,33 @@ impl Default for GameConfig {
     }
 }
 
+/// How many turns a game takes to reach its fastest.
+pub const RAMP_TURNS: u32 = 1000;
+/// The tick every game reaches by [`RAMP_TURNS`], whatever speed it started
+/// at, and never goes below.
+///
+/// Any shorter and a phone's own latency starts deciding games, and the
+/// bots get no time to think.
+pub const FASTEST_TICK_MS: u32 = 200;
+
 impl GameConfig {
+    /// The wait for the next turn once `turns_played` turns have been
+    /// played (the first wait is the starting interval). Games speed up
+    /// gently and steadily: every turn takes the same slice off the wait,
+    /// from the starting interval down to the floor at [`RAMP_TURNS`], and
+    /// it stays there. The floor is [`FASTEST_TICK_MS`] for every speed (or
+    /// the start, should a game start quicker). Integer arithmetic, so every
+    /// machine agrees to the millisecond.
+    #[must_use]
+    pub fn tick_ms_at(&self, turns_played: u32) -> u32 {
+        let floor = FASTEST_TICK_MS.min(self.tick_ms);
+        let ramp = u64::from(self.tick_ms - floor);
+        let done = u64::from(turns_played.min(RAMP_TURNS));
+        let taken = ramp * done / u64::from(RAMP_TURNS);
+        // `taken` is at most `ramp`, which came from a u32.
+        self.tick_ms - u32::try_from(taken).unwrap_or(self.tick_ms - floor)
+    }
+
     /// Every cell on the board, walls included: the length of a per-cell
     /// array indexed by [`Pos`].
     #[must_use]
@@ -289,4 +287,143 @@ pub struct GameRecord {
     pub seed: u64,
     /// Every turn, from the starting position to the last.
     pub turns: Vec<Turn>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Games speed up turn by turn, reach their floor at turn 1000, and
+    /// stay there.
+    #[test]
+    fn ticks_get_faster_then_level_off() {
+        let normal = GameConfig::default();
+        assert_eq!(normal.tick_ms_at(0), 1000);
+        assert_eq!(normal.tick_ms_at(4), 997, "barely faster at first");
+        let mut last = normal.tick_ms_at(0);
+        for turn in 1..=RAMP_TURNS {
+            let tick = normal.tick_ms_at(turn);
+            assert!(tick <= last, "turn {turn} got slower");
+            last = tick;
+        }
+        assert_eq!(normal.tick_ms_at(500), 600, "halfway there at turn 500");
+        assert_eq!(normal.tick_ms_at(RAMP_TURNS - 1), 201, "not quite there");
+        assert_eq!(normal.tick_ms_at(RAMP_TURNS), FASTEST_TICK_MS, "flat out");
+        assert_eq!(
+            normal.tick_ms_at(10_000),
+            FASTEST_TICK_MS,
+            "and it stays there"
+        );
+        // Every speed ends up in the same place.
+        for start in [500, 2000, 10_000] {
+            let config = GameConfig {
+                tick_ms: start,
+                ..GameConfig::default()
+            };
+            assert_eq!(
+                config.tick_ms_at(RAMP_TURNS),
+                FASTEST_TICK_MS,
+                "from {start}"
+            );
+        }
+        let quickest = GameConfig {
+            tick_ms: 250,
+            ..GameConfig::default()
+        };
+        assert_eq!(
+            quickest.tick_ms_at(RAMP_TURNS),
+            FASTEST_TICK_MS,
+            "the quickest start still speeds up"
+        );
+    }
+
+    /// The lobby's limits: boards 7..=25 a side, ticks 250..=10000 ms, and
+    /// one glyph of food (which may be several chars).
+    #[test]
+    fn config_validation_enforces_the_lobby_limits() {
+        let ok = GameConfig::default();
+        assert!(ok.valid());
+        let with = |f: fn(&mut GameConfig)| {
+            let mut c = ok.clone();
+            f(&mut c);
+            c.valid()
+        };
+        assert!(with(|c| c.board_width = 7) && with(|c| c.board_height = 25));
+        assert!(!with(|c| c.board_width = 6));
+        assert!(!with(|c| c.board_height = 26));
+        assert!(with(|c| c.tick_ms = 250) && with(|c| c.tick_ms = 10_000));
+        assert!(!with(|c| c.tick_ms = 249));
+        assert!(!with(|c| c.tick_ms = 10_001));
+        assert!(!with(|c| c.food_emoji = String::new()));
+        assert!(
+            with(|c| c.food_emoji = "👩🏽‍🍳".to_owned()),
+            "a ZWJ glyph is one food"
+        );
+        assert!(!with(|c| c.food_emoji = "pumpkins!".to_owned()));
+    }
+
+    /// The wall ring is exactly the perimeter: every listed cell is a wall,
+    /// none twice, and nothing inside is.
+    #[test]
+    fn walls_are_the_perimeter_ring() {
+        let c = GameConfig {
+            board_width: 9,
+            board_height: 7,
+            ..GameConfig::default()
+        };
+        let mut walls = c.walls();
+        walls.sort_unstable();
+        walls.dedup();
+        assert_eq!(walls.len(), 2 * 9 + 2 * 7 - 4);
+        assert_eq!(c.cells(), 63);
+        for pos in 0..63 {
+            assert_eq!(c.is_wall(pos), walls.contains(&pos), "cell {pos}");
+        }
+    }
+
+    #[test]
+    fn directions_and_their_opposites() {
+        for d in Dir::ALL {
+            let (dx, dy) = d.delta();
+            assert_eq!(dx.abs() + dy.abs(), 1, "{d:?} is one step");
+            assert_eq!(d.opposite().delta(), (-dx, -dy));
+            assert_eq!(d.opposite().opposite(), d);
+        }
+    }
+
+    #[test]
+    fn every_death_reads_differently() {
+        let all = [
+            ClashReason::Wall,
+            ClashReason::SelfCollision,
+            ClashReason::HeadOn,
+            ClashReason::Body,
+            ClashReason::Starved,
+        ];
+        let mut texts: Vec<&str> = all.iter().map(ClashReason::text).collect();
+        texts.sort_unstable();
+        texts.dedup();
+        assert_eq!(texts.len(), all.len());
+    }
+
+    #[test]
+    fn bots_are_told_apart_by_id() {
+        assert!(is_bot("bot-1"));
+        assert!(!is_bot("3fa9c1"));
+        assert!(!is_bot("robot-1"));
+    }
+
+    /// A draw is a shared top survival count, not any tie further down.
+    #[test]
+    fn a_draw_is_a_shared_top() {
+        let w = |player: &str, survival_turns| Winner {
+            player: player.to_owned(),
+            survival_turns,
+            length: 0,
+        };
+        assert!(is_draw(&[w("a", 9), w("b", 9)]));
+        assert!(!is_draw(&[w("a", 10), w("b", 9), w("c", 9)]));
+        assert!(!is_draw(&[w("solo", 40)]));
+        assert!(!is_draw(&[]));
+    }
 }

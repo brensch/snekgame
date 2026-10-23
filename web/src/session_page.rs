@@ -1,19 +1,19 @@
 //! The session page: lobby (ready-up, config, roster) and the live game
 //! (board, countdown, results, scrubber). Mirrors tac's GameSetup/GameActive.
 
-use crate::board::board_view;
+use crate::board::{Extras, board_view};
 use crate::net;
-use crate::store::{ConnStatus, GameView, Store};
+use crate::palette;
+use crate::store::{ConnStatus, GameView, Popup, Store};
 use leptos::prelude::*;
 use snek_shared::protocol::{ClientMsg, LobbyState};
-use snek_shared::{BotDifficulty, Dir, GameConfig, Pos, Turn, is_bot, is_draw};
+use snek_shared::{BotDifficulty, Dir, GameConfig, PlayerProfile, Pos, Turn, is_bot, is_draw};
 
-const BOARD_SIZES: &[(&str, u8)] = &[("Small", 11), ("Medium", 13), ("Large", 17)];
-const SPEEDS: &[(&str, u32)] = &[
-    ("Chill (2s)", 2000),
-    ("Normal (1s)", 1000),
-    ("Fast (0.5s)", 500),
-];
+pub(crate) const BOARD_SIZES: &[(&str, u8)] = &[("Small", 11), ("Medium", 13), ("Large", 17)];
+/// The speeds on offer, by the tick each game starts at. Every game then
+/// speeds up as it goes (`GameConfig::tick_ms_at`), so the name is all the
+/// lobby shows.
+pub(crate) const SPEEDS: &[(&str, u32)] = &[("Chill", 2000), ("Normal", 1000), ("Fast", 500)];
 
 pub(crate) fn session_page(_session: String) -> impl IntoView {
     let store = Store::use_store();
@@ -48,6 +48,34 @@ pub(crate) fn session_page(_session: String) -> impl IntoView {
                     )
             }}
             </div>
+            // Outside the greyed-out part: you can always leave.
+            {move || match store.popup.get() {
+                Some(Popup::Leave(target)) => Some(leave_confirm(target)),
+                _ => None,
+            }}
+        </div>
+    }
+}
+
+/// "Are you sure?" before leaving the game for `target`.
+fn leave_confirm(target: String) -> impl IntoView {
+    let store = Store::use_store();
+    let name = store
+        .lobby
+        .with_untracked(|l| l.as_ref().map(|l| l.name.clone()))
+        .unwrap_or_else(|| "this game".to_owned());
+    let stay = move |_| store.popup.set(None);
+    view! {
+        <div class="modal-back" on:click=stay>
+            <div class="modal" on:click=move |ev| ev.stop_propagation()>
+                <p class="confirm-q">"are you sure you want to leave " <b>{name}</b> "?"</p>
+                <div class="row confirm-row">
+                    <button on:click=stay>"stay"</button>
+                    <button class="danger" on:click=move |_| net::leave_to(store, target.clone())>
+                        "leave"
+                    </button>
+                </div>
+            </div>
         </div>
     }
 }
@@ -56,133 +84,91 @@ pub(crate) fn session_page(_session: String) -> impl IntoView {
 // Lobby
 // ---------------------------------------------------------------------------
 
-/// Agreeing to play, wherever you do it. The lobby and the end of a game
-/// are the same decision, so they get the same button, the same rules and
-/// the same list of who everyone is still waiting on.
-fn ready_panel(lobby: &LobbyState) -> impl IntoView + use<> {
+/// Agreeing to play, wherever you do it (the lobby and the end of a game
+/// are the same decision): one switch the width of the screen with both
+/// answers on it, so which one you've given is never in doubt. Exactly what
+/// the server says, on every phone alike: while we are not connected the
+/// whole page is greyed out and can't be touched (see `session_page`).
+fn ready_switch(lobby: &LobbyState) -> impl IntoView + use<> {
     let store = Store::use_store();
     let me = store.me.get();
-    let humans: Vec<_> = lobby
+    let i_am_in = lobby.players.iter().any(|p| p.id == me);
+    let i_am_ready = lobby.ready.contains(&me);
+    let my_colour = store.profile.get_untracked().colour;
+    view! {
+        <div class="ready-row">
+            <button
+                class="ready-switch"
+                class:on=i_am_ready
+                role="switch"
+                aria-checked=if i_am_ready { "true" } else { "false" }
+                aria-label="ready"
+                style=format!("--mine: {my_colour};")
+                disabled=!i_am_in
+                on:click=move |_| net::send(&ClientMsg::SetReady(!i_am_ready))
+            >
+                <span class="no">"not ready"</span>
+                <span class="yes">"ready"</span>
+            </button>
+        </div>
+    }
+}
+
+/// The start button, always there. Until every human is ready it can't be
+/// pressed and says, in red, who isn't; then it goes live (and shakes).
+fn start_button(lobby: &LobbyState) -> impl IntoView + use<> {
+    let store = Store::use_store();
+    let my_colour = store.profile.get_untracked().colour;
+    let waiting_on: Vec<String> = lobby
         .players
         .iter()
-        .filter(|p| !is_bot(&p.id))
-        .cloned()
-        .collect();
-    let i_am_in = humans.iter().any(|p| p.id == me);
-    // Exactly what the server says, on every phone alike. While we are not
-    // connected the whole page is greyed out and can't be touched (see
-    // `session_page`), so there is never a tap the server hasn't heard.
-    let i_am_ready = lobby.ready.contains(&me);
-    let is_ready = |id: &str| lobby.ready.iter().any(|r| r == id);
-    let all_ready = !humans.is_empty() && humans.iter().all(|p| is_ready(&p.id));
-    let my_colour = store.profile.get_untracked().colour;
-    let not_ready: Vec<String> = humans
-        .iter()
-        .filter(|p| !is_ready(&p.id))
+        .filter(|p| !is_bot(&p.id) && !lobby.ready.contains(&p.id))
         .map(|p| p.name.clone())
         .collect();
-
-    let toggle = move |_| net::send(&ClientMsg::SetReady(!i_am_ready));
-
+    let all_ready = waiting_on.is_empty();
     view! {
-        <div>
-            // A question and a switch with both answers on it, so which one
-            // you've given is never in doubt.
-            <div class="ready-row">
-                <span class="ready-q">"Ready?"</span>
-                <button
-                    class="ready-switch"
-                    class:on=i_am_ready
-                    role="switch"
-                    aria-checked=if i_am_ready { "true" } else { "false" }
-                    aria-label="ready"
-                    style=format!("--mine: {my_colour};")
-                    disabled=!i_am_in
-                    on:click=toggle
-                >
-                    <span class="no">"no"</span>
-                    <span class="yes">"yes"</span>
-                </button>
-            </div>
-            {all_ready
-                .then(|| {
-                    view! {
-                        <button
-                            class="big shake"
-                            style=format!("margin-top: 12px; background: {my_colour};")
-                            on:click=move |_| net::send(&ClientMsg::Start)
-                        >
-                            "Start game"
-                        </button>
-                    }
-                })}
-            {(i_am_ready && !not_ready.is_empty())
-                .then(|| {
-                    view! {
-                        <p style="color: #c00; margin: 8px 0 0;">
-                            "Waiting on: " {not_ready.join(", ")}
-                        </p>
-                    }
-                })}
-        </div>
-    }
-}
-
-/// Who last touched the settings. Changing them un-readies everyone, so
-/// whoever did it is worth knowing — and the moment it happens the name
-/// flashes, so a toggle flipping back to "no" never comes out of nowhere.
-fn settings_by(lobby: &LobbyState) -> impl IntoView + use<> {
-    let store = Store::use_store();
-    let who = lobby.config_changed_by.as_ref().map(|id| {
-        lobby.players.iter().find(|p| &p.id == id).map_or_else(
-            || ("someone who left".to_owned(), "#fff".to_owned()),
-            |p| (format!("{} {}", p.emoji, p.name), p.colour.clone()),
-        )
-    });
-    // The lobby is rebuilt whenever anything in it changes, so the flash
-    // picks up where it is rather than starting again from the top.
-    let since = net::now() - store.settings_flash_at.get_untracked();
-    let flashing = since < SETTINGS_FLASH_MS;
-    view! {
-        <div class="changed-by">
-            {match who {
-                None => view! { <span class="footnote">"nobody's touched these yet"</span> }.into_any(),
-                Some((name, colour)) => {
-                    view! {
-                        <span class="footnote">"last changed by"</span>
-                        <span
-                            class="who"
-                            class:flash=flashing
-                            style=format!(
-                                "background: {colour}; animation-delay: -{:.0}ms;",
-                                since.max(0.0),
-                            )
-                        >
-                            {name}
-                        </span>
-                    }
-                        .into_any()
-                }
+        <button
+            class="big start-button"
+            class:shake=all_ready
+            style=all_ready.then(|| format!("background: {my_colour};"))
+            disabled=!all_ready
+            on:click=move |_| net::send(&ClientMsg::Start)
+        >
+            {if all_ready {
+                "Start game".to_owned()
+            } else {
+                format!("not ready: {}", waiting_on.join(", "))
             }}
-        </div>
+        </button>
     }
 }
 
-const SETTINGS_FLASH_MS: f64 = 1800.0;
-
-/// How the last game in this lobby ended, if there was one.
+/// How the last game in this lobby ended, if there was one. Tapping it
+/// opens that game's end-of-game screen (results and replay).
 fn last_game_banner(lobby: &LobbyState) -> Option<AnyView> {
     let winner = lobby.last_winners.first()?;
+    let store = Store::use_store();
+    let open = lobby
+        .last_game_id
+        .map(|id| move |_| open_finished_game(store, id));
     if is_draw(&lobby.last_winners) {
         return Some(
             view! {
-                <div class="banner rainbow">"💀 Last game: a draw — nobody made it out"</div>
+                <button class="banner rainbow last-game" disabled=open.is_none() on:click=move |ev| {
+                    if let Some(open) = open {
+                        open(ev);
+                    }
+                }>
+                    "💀 Last game: a draw — nobody made it out"
+                </button>
             }
             .into_any(),
         );
     }
+    // Looked up among who played, not who's here now: the winner may well
+    // have left since.
     let name = lobby
-        .players
+        .last_players
         .iter()
         .find(|p| p.id == winner.player)
         .map_or_else(
@@ -192,21 +178,49 @@ fn last_game_banner(lobby: &LobbyState) -> Option<AnyView> {
     let turns = winner.survival_turns;
     Some(
         view! {
-            <div class="banner rainbow">
+            <button class="banner rainbow last-game" disabled=open.is_none() on:click=move |ev| {
+                if let Some(open) = open {
+                    open(ev);
+                }
+            }>
                 "🏆 Last game: " {name} " survived " {turns} " turns"
-            </div>
+            </button>
         }
         .into_any(),
     )
 }
 
-/// The foods on offer, as the server dealt them, so every phone shows the
-/// same hand. Shuffling asks the server for a new one; whatever is picked
-/// always survives into it, at the front.
-fn food_picker(config: &GameConfig, food_hand: Vec<String>) -> impl IntoView + use<> {
+/// Show a finished game's end-of-game screen, fetched from history: the
+/// same screen everyone saw when it ended, results, replay and all.
+fn open_finished_game(store: Store, id: i64) {
+    leptos::task::spawn_local(async move {
+        let url = format!("/api/history/{id}");
+        let Ok(resp) = gloo_net::http::Request::get(&url).send().await else {
+            return;
+        };
+        let Ok(bytes) = resp.binary().await else {
+            return;
+        };
+        if let Ok(record) = postcard::from_bytes::<snek_shared::GameRecord>(&bytes) {
+            store.view_turn.set(None);
+            store.game.set(Some(GameView {
+                config: record.config,
+                players: record.players,
+                turns: record.turns,
+            }));
+        }
+    });
+}
+
+/// The foods on offer. The hand is this phone's own (see
+/// [`palette::FoodHand`]): shuffling deals a new one here and tells no one.
+/// Picking from it changes the lobby's food for everyone.
+fn food_picker(config: &GameConfig) -> impl IntoView + use<> {
+    let store = Store::use_store();
     let current_width = config.board_width;
     let current_tick = config.tick_ms;
     let picked = config.food_emoji.clone();
+    let for_shuffle = picked.clone();
     view! {
         <div style="margin-top: 10px;">
             // Heading and shuffle on one line, the hand full width beneath —
@@ -216,39 +230,41 @@ fn food_picker(config: &GameConfig, food_hand: Vec<String>) -> impl IntoView + u
                 <button
                     class="mini"
                     style="flex: 0 0 auto;"
-                    on:click=move |_| net::send(&ClientMsg::ShuffleFood)
+                    on:click=move |_| store.food_hand.set(palette::FoodHand::dealt(&for_shuffle))
                 >
                     "🎲 shuffle"
                 </button>
             </div>
-            <div>
-                <div class="food-hand">
-                    {food_hand
-                            .into_iter()
-                            .map(|f| {
-                                let is_picked = f == picked;
-                                let send = f.clone();
-                                view! {
-                                    <div
-                                        class="pick"
-                                        class:selected=is_picked
-                                        on:click=move |_| {
-                                            net::send(
-                                                &ClientMsg::Configure(GameConfig {
-                                                    board_width: current_width,
-                                                    board_height: current_width,
-                                                    tick_ms: current_tick,
-                                                    food_emoji: send.clone(),
-                                                }),
-                                            );
-                                        }
-                                    >
-                                        {f}
-                                    </div>
-                                }
-                            })
-                            .collect_view()}
-                </div>
+            <div class="food-hand">
+                {move || {
+                    store
+                        .food_hand
+                        .with(|hand| hand.foods().to_vec())
+                        .into_iter()
+                        .map(|f| {
+                            let is_picked = f == picked;
+                            let send = f.clone();
+                            view! {
+                                <div
+                                    class="pick"
+                                    class:selected=is_picked
+                                    on:click=move |_| {
+                                        net::send(
+                                            &ClientMsg::Configure(GameConfig {
+                                                board_width: current_width,
+                                                board_height: current_width,
+                                                tick_ms: current_tick,
+                                                food_emoji: send.clone(),
+                                            }),
+                                        );
+                                    }
+                                >
+                                    {f}
+                                </div>
+                            }
+                        })
+                        .collect_view()
+                }}
             </div>
         </div>
     }
@@ -312,76 +328,202 @@ fn config_row(config: &GameConfig) -> impl IntoView + use<> {
     }
 }
 
-/// Everyone in the lobby, whether they're ready, a bin to kick them, and
-/// the way to add a bot.
+/// Everyone in the lobby as chips that wrap onto as many lines as they
+/// need: emoji, name, and an × to remove them
+/// (asked about first, see [`kick_confirm`]). Nobody gets an × on their own
+/// chip. Then the ways to add someone.
 fn roster(lobby: &LobbyState) -> impl IntoView + use<> {
     let store = Store::use_store();
+    let me = store.me.get_untracked();
+    let session = lobby.session.clone();
+    let copied = RwSignal::new(false);
     view! {
-        <table class="players">
-            <tbody>
-                {lobby
-                    .players
-                    .iter()
-                    .map(|p| {
-                        let ready = is_bot(&p.id) || lobby.ready.contains(&p.id);
-                        let id = p.id.clone();
-                        view! {
-                            <tr style=format!("background: {};", p.colour)>
-                                <td>{p.emoji.clone()} " " {p.name.clone()}</td>
-                                <td class="right">{if ready { "ready" } else { "not ready" }}</td>
-                                <td
-                                    class="right kick"
-                                    on:click=move |_| net::send(&ClientMsg::Kick(id.clone()))
-                                >
-                                    "🗑️"
-                                </td>
-                            </tr>
+        <ul class="player-chips">
+            {lobby
+                .players
+                .iter()
+                .map(|p| {
+                    let removable = p.id != me;
+                    let who = p.clone();
+                    view! {
+                        <li class="player-chip" style=format!("background: {};", p.colour)>
+                            <span>{p.emoji.clone()} " " {p.name.clone()}</span>
+                            {removable
+                                .then(|| {
+                                    view! {
+                                        <button
+                                            class="chip-x"
+                                            aria-label=format!("remove {}", who.name)
+                                            on:click=move |_| store.popup.set(Some(Popup::Kick(who.clone())))
+                                        >
+                                            "×"
+                                        </button>
+                                    }
+                                })}
+                        </li>
+                    }
+                })
+                .collect_view()}
+        </ul>
+        <div class="add-row">
+            <button class="mini" on:click=move |_| store.popup.set(Some(Popup::BotPicker))>
+                "🤖 add a bot"
+            </button>
+            // A human is added the only way one can be: by sending them the
+            // link. Same as the share button up top.
+            <button class="mini" on:click=move |_| crate::app::share_session(&session, copied)>
+                {move || if copied.get() { "copied ✓" } else { "🧑 add a human" }}
+            </button>
+        </div>
+    }
+}
+
+/// "Are you sure?" before anyone is taken out of the lobby.
+fn kick_confirm(who: &PlayerProfile) -> impl IntoView + use<> {
+    let store = Store::use_store();
+    let close = move |_| store.popup.set(None);
+    let id = who.id.clone();
+    view! {
+        <div class="modal-back" on:click=close>
+            <div class="modal" on:click=move |ev| ev.stop_propagation()>
+                <p class="confirm-q">
+                    "are you sure you want to remove " <b>{who.emoji.clone()} " " {who.name.clone()}</b>
+                    " from the lobby?"
+                </p>
+                <div class="row confirm-row">
+                    <button on:click=close>"no, keep them"</button>
+                    <button
+                        class="danger"
+                        on:click=move |_| {
+                            net::send(&ClientMsg::Kick(id.clone()));
+                            store.popup.set(None);
                         }
-                    })
-                    .collect_view()}
-                <tr class="add-bot-row">
-                    <td colspan="3">
-                        <button class="mini" on:click=move |_| store.show_bot_picker.set(true)>
-                            "➕ add a bot"
-                        </button>
-                    </td>
-                </tr>
-            </tbody>
-        </table>
+                    >
+                        "yes, remove"
+                    </button>
+                </div>
+            </div>
+        </div>
     }
 }
 
 fn lobby_view(lobby: &LobbyState) -> impl IntoView + use<> {
     let store = Store::use_store();
 
-    // A game is known by its host: the first human in the lobby. Bots are
-    // always ready; only humans gate the start.
-    let host_line = lobby.players.iter().find(|p| !is_bot(&p.id)).map_or_else(
-        || "new game".to_owned(),
-        |p| format!("{} {}'s game", p.emoji, p.name),
-    );
-    let current_food = lobby.config.food_emoji.clone();
+    let config = lobby.config.clone();
+    let name = lobby.name.clone();
+    let food = lobby.config.food_emoji.clone();
 
     view! {
         <div>
-            <h2 style="margin-top: 22px; margin-bottom: 14px;">{host_line}</h2>
-            {ready_panel(lobby)}
+            <h2 style="margin-top: 22px; margin-bottom: 14px;">{lobby.name.clone()}</h2>
+            {ready_switch(lobby)}
             {last_game_banner(lobby)}
-            <h3 style="margin-top: 24px;">"Players"</h3>
-            {roster(lobby)}
-            <h3 style="margin-top: 24px;">"Settings"</h3>
-            {settings_by(lobby)}
-            <div>
-                {config_row(&lobby.config)}
-                {food_picker(&lobby.config, lobby.food_hand.clone())}
+            // The settings and the rules, side by side, each a button that
+            // opens its own popup, so the lobby itself is just who's playing.
+            <div class="lobby-buttons">
+                <button class="settings-button" on:click=move |_| store.popup.set(Some(Popup::Settings))>
+                    {settings_summary(&lobby.config)}
+                </button>
+                <button class="rules-button" on:click=move |_| store.popup.set(Some(Popup::Rules))>
+                    <span class="book">{move || book(store.now_ms.get())}</span>
+                    "rules"
+                </button>
             </div>
-            {move || store.show_bot_picker.get().then(bot_picker)}
-            <p class="footnote" style="margin-top: 18px;">
-                "Steer with swipes, taps, arrows or WASD. Eat " {current_food}
-                " to grow and "
-                "refill health; you lose 1 health per turn. Walls, bodies and "
-                "bigger heads kill you. Outlive everyone."
-            </p>
+            <h3 style="margin-top: 22px;">"Players"</h3>
+            {roster(lobby)}
+            // Last thing on the page, always there: the game starts here.
+            <div class="start-row">{start_button(lobby)}</div>
+            {move || {
+                store
+                    .popup
+                    .get()
+                    .map(|popup| match popup {
+                        Popup::BotPicker => bot_picker().into_any(),
+                        Popup::Settings => settings_popup(&config, &name).into_any(),
+                        Popup::Rules => crate::rules::rules_popup(&food).into_any(),
+                        Popup::Kick(who) => kick_confirm(&who).into_any(),
+                        // Drawn by the session page, game or lobby alike.
+                        Popup::Leave(_) => ().into_any(),
+                    })
+            }}
+        </div>
+    }
+}
+
+/// The settings as they stand, as the settings button's label: the food,
+/// big, then the board and the speed, each named.
+fn settings_summary(config: &GameConfig) -> impl IntoView + use<> {
+    let board = BOARD_SIZES
+        .iter()
+        .find(|(_, w)| *w == config.board_width)
+        .map_or("Custom", |(name, _)| name);
+    let speed = SPEEDS
+        .iter()
+        .find(|(_, ms)| *ms == config.tick_ms)
+        .map_or("Custom", |(name, _)| name);
+    view! {
+        <span class="food">{config.food_emoji.clone()}</span>
+        <span class="values">"board " <b>{board}</b> <br /> "speed " <b>{speed}</b></span>
+    }
+}
+
+/// Something rule-ish for the rules button (books, scales, judges, ...),
+/// a different one every so often.
+fn book(now_ms: f64) -> &'static str {
+    const RULEY: &[&str] = &[
+        "📖",
+        "⚖️",
+        "📚",
+        "🧑‍⚖️",
+        "📕",
+        "🔨",
+        "📗",
+        "👩‍⚖️",
+        "📘",
+        "🏛️",
+        "📙",
+        "👨‍⚖️",
+        "📜",
+        "📏",
+        "📓",
+        "📋",
+    ];
+    const EVERY_MS: f64 = 700.0;
+    RULEY[crate::num::to_usize(now_ms / EVERY_MS) % RULEY.len()]
+}
+
+/// Board, speed and food, in a popup. Any change goes straight to the
+/// lobby (and everyone else gets a toast saying so).
+fn settings_popup(config: &GameConfig, name: &str) -> impl IntoView + use<> {
+    let store = Store::use_store();
+    let close = move |_| store.popup.set(None);
+    view! {
+        <div class="modal-back" on:click=close>
+            <div class="modal" on:click=move |ev| ev.stop_propagation()>
+                // The name goes when it's settled (enter, or leaving the
+                // box), not with every letter: each one would be a rename,
+                // and a toast, for everyone else.
+                <label>
+                    "Name"
+                    <input
+                        type="text"
+                        maxlength="40"
+                        prop:value=name.to_owned()
+                        on:change=move |ev| {
+                            let name = event_target_value(&ev);
+                            if snek_shared::protocol::valid_game_name(&name) {
+                                net::send(&ClientMsg::Rename(name));
+                            }
+                        }
+                    />
+                </label>
+                <div style="margin-top: 12px;">{config_row(config)}</div>
+                {food_picker(config)}
+                <button class="big" style="margin-top: 18px;" on:click=close>
+                    "done"
+                </button>
+            </div>
         </div>
     }
 }
@@ -392,11 +534,11 @@ fn bot_picker() -> impl IntoView {
     let pick = move |d: BotDifficulty| {
         move |_| {
             net::send(&ClientMsg::AddBot(d));
-            store.show_bot_picker.set(false);
+            store.popup.set(None);
         }
     };
     view! {
-        <div class="modal-back" on:click=move |_| store.show_bot_picker.set(false)>
+        <div class="modal-back" on:click=move |_| store.popup.set(None)>
             <div class="modal" on:click=move |ev| ev.stop_propagation()>
                 <h3 style="margin-top: 0;">"Add a bot"</h3>
                 <button class="big" style="margin-bottom: 10px;" on:click=pick(BotDifficulty::Easy)>
@@ -497,34 +639,67 @@ fn dir_towards(head: Pos, pos: Pos, width: i32) -> Option<Dir> {
     })
 }
 
-/// "ready", "steady", "spagheddi!" a second each, after the board has
-/// spotlit you for a few seconds. The clock is read *inside* the closure:
-/// otherwise the whole game view (board SVG included) would re-render five
-/// times a second with the shared clock.
-fn countdown(show_countdown: bool) -> impl IntoView {
+/// The countdown words, a second each, which take the last three seconds
+/// of the server's countdown; the "you!" spotlight has the time before.
+const WORDS: [&str; 3] = ["ready", "steady", "spagheddi!"];
+const WORD_MS: f64 = 1000.0;
+const WORDS_MS: f64 = 3.0 * WORD_MS;
+
+/// Where the start of a game has got to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Start {
+    /// The board spotlights you.
+    You,
+    /// The plain board, with the countdown over it.
+    Countdown,
+    /// Under way (or not starting at all).
+    Done,
+}
+
+/// The start's phase, from the shared clock. A memo, so the board and the
+/// words only hear about it when the phase changes, not five times a
+/// second: the whole game view (board SVG included) would otherwise re-render
+/// with every tick of the clock.
+fn start_phase(starting: bool) -> Memo<Start> {
     let store = Store::use_store();
-    // A memo, so the word's card is only rebuilt (and pops in) when the
-    // word changes, not on every tick of the clock.
-    let word = Memo::new(move |_| {
-        if !show_countdown {
-            return None;
+    Memo::new(move |_| {
+        if !starting {
+            return Start::Done;
         }
-        match store.countdown_ends.get() - store.now_ms.get() {
-            r if r > 3000.0 => None,
-            r if r > 2000.0 => Some("ready"),
-            r if r > 1000.0 => Some("steady"),
-            r if r > 0.0 => Some("spagheddi!"),
-            _ => None,
+        let remaining = store.countdown_ends.get() - store.now_ms.get();
+        if remaining > WORDS_MS {
+            Start::You
+        } else if remaining > 0.0 {
+            Start::Countdown
+        } else {
+            Start::Done
         }
-    });
-    move || {
-        word.get().map(|word| {
-            view! {
-                <div class="overlay countdown">
-                    <span>{word}</span>
-                </div>
-            }
-        })
+    })
+}
+
+/// "ready", "steady", "spagheddi!", laid over the middle of the board, each
+/// fading in and out in its own second. All three are there from the start
+/// with their own delays, so each one gets the whole animation: swapping one
+/// word's text for the next would only animate the first. Anyone arriving
+/// partway through joins the animation where it is (a negative delay).
+fn countdown_words() -> impl IntoView {
+    let store = Store::use_store();
+    let left = (store.countdown_ends.get_untracked() - store.now_ms.get_untracked()).max(0.0);
+    let elapsed = WORDS_MS - left;
+    view! {
+        <div class="countdown">
+            {WORDS
+                .iter()
+                .zip([0.0, WORD_MS, 2.0 * WORD_MS])
+                .map(|(word, start)| {
+                    view! {
+                        <span style=format!("animation-delay: {:.0}ms;", start - elapsed)>
+                            {*word}
+                        </span>
+                    }
+                })
+                .collect_view()}
+        </div>
     }
 }
 
@@ -615,7 +790,13 @@ fn results(
             // here. Agreeing to a rematch is agreeing to a game, so it is
             // the lobby's control, not a second one that behaves almost
             // the same.
-            {lobby_now.map(ready_panel)}
+            {lobby_now
+                .map(|lobby| {
+                    view! {
+                        {ready_switch(lobby)}
+                        <div style="margin-top: 12px;">{start_button(lobby)}</div>
+                    }
+                })}
             <table class="players">
                 <tbody>{rows}</tbody>
             </table>
@@ -668,6 +849,7 @@ fn game_view(game: &GameView) -> Option<impl IntoView + use<>> {
     // Before the first tick: the board spotlights you (see board_view) for
     // a few seconds, then the countdown.
     let show_countdown = !over && turn_count == 1;
+    let phase = start_phase(show_countdown);
 
     // Direction input: tap a cell relative to my head.
     let my_head: Option<Pos> = turn.snakes.get(&me).and_then(|s| s.first().copied());
@@ -694,7 +876,7 @@ fn game_view(game: &GameView) -> Option<impl IntoView + use<>> {
                 let note = if store.paused.get() {
                     Some("held ⏸️")
                 } else if spectating {
-                    Some("spectating — next game starts from the lobby")
+                    Some("spectating — you can join next game")
                 } else if i_died {
                     Some("you died 💀 watch the rest")
                 } else {
@@ -702,7 +884,18 @@ fn game_view(game: &GameView) -> Option<impl IntoView + use<>> {
                 };
                 note.map(|n| view! { <p class="play-note">{n}</p> })
             }}
-            {board_view(&game.config, &game.players, &turn, &me, show_countdown, on_cell)}
+            {board_view(
+                &game.config,
+                &game.players,
+                &turn,
+                &me,
+                Extras {
+                    spotlight: show_countdown,
+                    spot_on: Signal::derive(move || phase.get() == Start::You),
+                    overlay: move || (phase.get() == Start::Countdown).then(countdown_words),
+                },
+                on_cell,
+            )}
             {over.then(|| scrubber(viewing, last))}
             // One bottom half, whichever state the game is in. Two layouts
             // meant two sets of rules for the same board, and the board
@@ -712,7 +905,6 @@ fn game_view(game: &GameView) -> Option<impl IntoView + use<>> {
                 {show_dpad.then(dpad)}
                 {over.then(|| results(game, last_turn, lobby_now.as_ref()))}
             </div>
-            {countdown(show_countdown)}
         </div>
     })
 }

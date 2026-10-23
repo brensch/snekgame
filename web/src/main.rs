@@ -20,15 +20,24 @@ mod compute_page;
 mod games_page;
 mod history_page;
 mod net;
+mod notices;
 mod num;
 mod palette;
+mod rules;
 mod session_page;
 mod store;
+mod trail;
 
 use leptos::prelude::*;
 
 fn main() {
-    console_error_panic_hook::set_once();
+    // A panic stops this page's code dead while the screen stays as it was,
+    // so it goes on the connection trail too (the watchdog in index.html
+    // reloads the page, and the trail tells the server why).
+    std::panic::set_hook(Box::new(|info| {
+        trail::note(&format!("crashed: {info}"));
+        console_error_panic_hook::hook(info);
+    }));
     // The bot worker boots this same bundle to reach `snek_bot_compute`.
     // There is no DOM on that thread, so the UI must not mount there.
     if web_sys::window().is_none() {

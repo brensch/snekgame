@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 19;
+pub const PROTOCOL_VERSION: u16 = 20;
 
 /// The client-editable part of a profile.
 ///
@@ -57,6 +57,11 @@ pub enum ClientMsg {
     SetReady(bool),
     /// Change the lobby's settings for the next game.
     Configure(GameConfig),
+    /// Rename the game (between games; see [`valid_game_name`]).
+    Rename(String),
+    /// I'm leaving: take me out of the lobby now (no held seat). Answered
+    /// with [`ServerMsg::Left`].
+    Leave,
     /// Start the game now.
     Start,
     /// Steer: applied at the next tick, if it arrives in time.
@@ -115,13 +120,8 @@ pub enum ClientMsg {
         /// How the device spent the request, for the server's logs.
         tm: ComputeTelemetry,
     },
-    /// Deal the lobby a new hand of foods to pick from. Everyone sees the
-    /// same hand; the food currently picked stays in it.
-    ShuffleFood,
-    /// Sent once a dropped connection is back, saying how the reconnect
-    /// went, so a slow one can be explained from the server's log rather
-    /// than guessed at.
-    Reconnected(ReconnectReport),
+    /// How getting this connection went (see [`ConnectReport`]).
+    Connected(ConnectReport),
 }
 
 /// Everything about a lobby that its members see.
@@ -141,31 +141,50 @@ pub struct LobbyState {
     pub ready: Vec<PlayerId>,
     /// Winners of the last finished game in this session, if any.
     pub last_winners: Vec<Winner>,
+    /// Everyone who played the last finished game, so it can still be told
+    /// who they were after they've left.
+    pub last_players: Vec<PlayerProfile>,
     /// History id of the last finished game, if saved.
     pub last_game_id: Option<i64>,
     /// Who last changed the settings (None until somebody does).
     pub config_changed_by: Option<PlayerId>,
-    /// Bumped on every settings change, so a client can tell a fresh change
-    /// from the same lobby being sent again for some other reason.
+    /// Bumped on every settings change (the name included), so a client can
+    /// tell a fresh change from the same lobby being sent again for some
+    /// other reason.
     pub config_rev: u32,
-    /// The foods on offer to pick from, the picked one among them. Held by
-    /// the server so every phone shows the same hand.
-    pub food_hand: Vec<String>,
+    /// What the game is called. It starts as its link's three words and
+    /// anyone can change it; the link itself never changes.
+    pub name: String,
 }
 
-/// How a reconnect went, timed by the client. All times are milliseconds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReconnectReport {
-    /// Connection attempts it took, this one included.
+/// How getting connected went, as the client saw it.
+///
+/// Sent once the server has answered a new connection, so a slow or stuck
+/// one can be explained from the server's log rather than guessed at. Times
+/// are milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectReport {
+    /// Whether this replaces a connection that was lost (as opposed to the
+    /// page's first).
+    pub reconnect: bool,
+    /// Attempts it took, this one included.
     pub attempts: u32,
-    /// From the last thing heard on the old connection to the first thing
-    /// heard on this one: how long the player was cut off.
-    pub silent_ms: u32,
-    /// From the first attempt starting to the server answering.
-    pub reconnect_ms: u32,
+    /// For a reconnect: from the last thing heard on the old connection to
+    /// the first thing heard on this one, i.e. how long the player was cut
+    /// off.
+    pub silent_ms: Option<u32>,
     /// From the page coming back into view to the server answering, if it
     /// was hidden (a locked phone, another app) when the connection went.
     pub since_visible_ms: Option<u32>,
+    /// From the page starting to load to now.
+    pub page_ms: u32,
+    /// This attempt: opening the connection until it was ready.
+    pub handshake_ms: u32,
+    /// This attempt: from ready to the server's first word (the join).
+    pub join_ms: u32,
+    /// The page's recent connection events, oldest first, including those
+    /// of the page before a reload: what it was doing when it got stuck.
+    pub trail: Vec<String>,
 }
 
 /// Everything the server sends: on the control stream, or (`Turn`,
@@ -238,6 +257,12 @@ pub enum ServerMsg {
     Pong(u32),
     /// The game is held, or running again.
     Paused(bool),
+    /// You were taken out of the lobby, by this player (None if they have
+    /// since left). Nothing more comes on this connection.
+    Kicked(Option<PlayerProfile>),
+    /// You've left (see [`ClientMsg::Leave`]). Nothing more comes on this
+    /// connection.
+    Left,
 }
 
 /// Postcard bytes of a message, as framed on the stream or sent as a
@@ -263,20 +288,15 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Option<T> {
     postcard::from_bytes(bytes).ok()
 }
 
-/// One row of the active-games list. Games aren't named — they're known by
-/// their host (the first human in the lobby). `players` counts humans only,
-/// so bot-only lobbies vanish the moment everyone leaves.
+/// One row of the active-games list. A game is known by its name; nobody
+/// in it owns it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
-    /// The lobby's id, as in its link.
+    /// The game's id, as in its link (see [`crate::names`]).
     pub id: String,
-    /// The host's display name.
-    pub host_name: String,
-    /// The host's emoji.
-    pub host_emoji: String,
-    /// The host's colour.
-    pub host_colour: String,
-    /// Everyone in it, host first, bots last.
+    /// What it's called now (see [`LobbyState::name`]).
+    pub name: String,
+    /// Everyone in it, in the order they joined.
     pub emojis: Vec<String>,
     /// Humans in the lobby.
     pub players: u32,
@@ -402,4 +422,280 @@ pub struct HistoryEntry {
     pub players: Vec<PlayerProfile>,
     /// Final standings, best first.
     pub winners: Vec<Winner>,
+}
+
+/// The name a game starts with: its link's words, spaced out.
+#[must_use]
+pub fn default_game_name(id: &str) -> String {
+    id.replace('-', " ")
+}
+
+/// Whether `name` will do as a game's name: something to read (not just
+/// spaces), and at most 40 characters.
+#[must_use]
+pub fn valid_game_name(name: &str) -> bool {
+    !name.trim().is_empty() && name.chars().count() <= 40
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Clash, ClashReason};
+    use std::collections::BTreeMap;
+
+    /// Which variant a message is. Exhaustive, no wildcard: a new message
+    /// doesn't compile until it's listed here, and then the test below
+    /// fails until it has a sample.
+    const fn client_variant(msg: &ClientMsg) -> usize {
+        match msg {
+            ClientMsg::Join { .. } => 0,
+            ClientMsg::UpdateProfile(_) => 1,
+            ClientMsg::SetReady(_) => 2,
+            ClientMsg::Configure(_) => 3,
+            ClientMsg::Rename(_) => 4,
+            ClientMsg::Leave => 5,
+            ClientMsg::Start => 6,
+            ClientMsg::Move(_) => 7,
+            ClientMsg::AddBot(_) => 8,
+            ClientMsg::Kick(_) => 9,
+            ClientMsg::Ping(_) => 10,
+            ClientMsg::SetPaused(_) => 11,
+            ClientMsg::HostAvailable { .. } => 12,
+            ClientMsg::ComputeFailed { .. } => 13,
+            ClientMsg::WatchGames => 14,
+            ClientMsg::Benchmark { .. } => 15,
+            ClientMsg::BotMove { .. } => 16,
+            ClientMsg::Connected(_) => 17,
+        }
+    }
+    const CLIENT_VARIANTS: usize = 18;
+
+    /// See [`client_variant`].
+    const fn server_variant(msg: &ServerMsg) -> usize {
+        match msg {
+            ServerMsg::Welcome { .. } => 0,
+            ServerMsg::Lobby(_) => 1,
+            ServerMsg::GameStart { .. } => 2,
+            ServerMsg::Turn(_) => 3,
+            ServerMsg::GameInProgress { .. } => 4,
+            ServerMsg::GameSaved { .. } => 5,
+            ServerMsg::Sessions(_) => 6,
+            ServerMsg::ComputeRequest { .. } => 7,
+            ServerMsg::Error(_) => 8,
+            ServerMsg::Pong(_) => 9,
+            ServerMsg::Paused(_) => 10,
+            ServerMsg::Kicked(_) => 11,
+            ServerMsg::Left => 12,
+        }
+    }
+    const SERVER_VARIANTS: usize = 13;
+
+    fn player() -> PlayerProfile {
+        PlayerProfile {
+            id: "abc123def456".to_owned(),
+            name: "brendy".to_owned(),
+            emoji: "🐉".to_owned(),
+            colour: "hsl(320, 85%, 70%)".to_owned(),
+        }
+    }
+
+    fn turn() -> Turn {
+        Turn {
+            turn_number: 7,
+            snakes: BTreeMap::from([("abc123def456".to_owned(), vec![20, 21, 22])]),
+            health: BTreeMap::from([("abc123def456".to_owned(), 93)]),
+            alive: vec!["abc123def456".to_owned()],
+            food: vec![40, 41],
+            moves: BTreeMap::from([("abc123def456".to_owned(), Dir::Left)]),
+            clashes: vec![Clash {
+                pos: 5,
+                players: vec!["bot-1".to_owned()],
+                reason: ClashReason::Body,
+            }],
+            winners: vec![Winner {
+                player: "bot-1".to_owned(),
+                survival_turns: 6,
+                length: 4,
+            }],
+        }
+    }
+
+    /// One of every message, every field filled in (no empty lists, no
+    /// Nones), so a change to any message's shape changes these bytes.
+    fn samples() -> (Vec<ClientMsg>, Vec<ServerMsg>) {
+        (client_samples(), server_samples())
+    }
+
+    fn client_samples() -> Vec<ClientMsg> {
+        let info = ProfileInfo {
+            name: "brendy".to_owned(),
+            emoji: "🐉".to_owned(),
+            colour: "red".to_owned(),
+        };
+        let config = GameConfig::default();
+        vec![
+            ClientMsg::Join {
+                version: PROTOCOL_VERSION,
+                session: "lukewarm-mandatory-potluck".to_owned(),
+                secret: "0123456789abcdef".to_owned(),
+                profile: info.clone(),
+            },
+            ClientMsg::UpdateProfile(info),
+            ClientMsg::SetReady(true),
+            ClientMsg::Configure(config),
+            ClientMsg::Rename("the friday grudge match".to_owned()),
+            ClientMsg::Leave,
+            ClientMsg::Start,
+            ClientMsg::Move(Dir::Up),
+            ClientMsg::AddBot(BotDifficulty::Hard),
+            ClientMsg::Kick("bot-1".to_owned()),
+            ClientMsg::Ping(9),
+            ClientMsg::SetPaused(true),
+            ClientMsg::HostAvailable { can_compute: true },
+            ClientMsg::ComputeFailed {
+                request_id: 3,
+                reason: "no worker".to_owned(),
+            },
+            ClientMsg::WatchGames,
+            ClientMsg::Benchmark {
+                sims_per_sec: 50_000,
+                device: "Pixel 9".to_owned(),
+                cores: 8,
+            },
+            ClientMsg::BotMove {
+                request_id: 3,
+                dir: Dir::Right,
+                proof: 77,
+                tm: ComputeTelemetry {
+                    queue_ms: 1,
+                    search_ms: 2,
+                    total_ms: 3,
+                    think_ms: 4,
+                    sims: 5,
+                    slices: 6,
+                    fallback: true,
+                    loop_lag_ms: 7,
+                },
+            },
+            ClientMsg::Connected(ConnectReport {
+                reconnect: true,
+                attempts: 2,
+                silent_ms: Some(9_000),
+                since_visible_ms: Some(40),
+                page_ms: 120_000,
+                handshake_ms: 60,
+                join_ms: 8,
+                trail: vec!["open #2".to_owned()],
+            }),
+        ]
+    }
+
+    fn server_samples() -> Vec<ServerMsg> {
+        let config = GameConfig::default();
+        vec![
+            ServerMsg::Welcome {
+                your_id: "abc123def456".to_owned(),
+            },
+            ServerMsg::Lobby(LobbyState {
+                session: "lukewarm-mandatory-potluck".to_owned(),
+                game_running: true,
+                config: config.clone(),
+                players: vec![player()],
+                ready: vec!["abc123def456".to_owned()],
+                last_winners: turn().winners,
+                last_players: vec![player()],
+                last_game_id: Some(12),
+                config_changed_by: Some("abc123def456".to_owned()),
+                config_rev: 3,
+                name: "the friday grudge match".to_owned(),
+            }),
+            ServerMsg::GameStart {
+                config: config.clone(),
+                players: vec![player()],
+                turn: turn(),
+                countdown_ms: 4000,
+            },
+            ServerMsg::Turn(turn()),
+            ServerMsg::GameInProgress {
+                config: config.clone(),
+                players: vec![player()],
+                turns: vec![turn()],
+            },
+            ServerMsg::GameSaved {
+                id: 12,
+                compute: vec![ComputeStat {
+                    name: "🐉 brendy".to_owned(),
+                    device: "Pixel 9".to_owned(),
+                    moves: 40,
+                    sims: 2_000_000,
+                    wall_ms: 9_000,
+                }],
+            },
+            ServerMsg::Sessions(vec![SessionSummary {
+                id: "lukewarm-mandatory-potluck".to_owned(),
+                name: "the friday grudge match".to_owned(),
+                emojis: vec!["🐉".to_owned()],
+                players: 1,
+                bots: 1,
+                playing: true,
+            }]),
+            ServerMsg::ComputeRequest {
+                request_id: 3,
+                bot_id: "bot-1".to_owned(),
+                bot_name: "lad".to_owned(),
+                config,
+                turn: turn(),
+                think_ms: 250,
+                nonce: 99,
+            },
+            ServerMsg::Error("refresh".to_owned()),
+            ServerMsg::Pong(9),
+            ServerMsg::Paused(true),
+            ServerMsg::Kicked(Some(player())),
+            ServerMsg::Left,
+        ]
+    }
+
+    /// FNV-1a: small, stable, and enough to notice any change.
+    fn fingerprint(bytes: impl IntoIterator<Item = u8>) -> u64 {
+        bytes.into_iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    /// The wire format is pinned to the protocol version. Changing any
+    /// message changes the fingerprint, and this fails until
+    /// `PROTOCOL_VERSION` goes up and the new fingerprint is recorded with
+    /// it. Without that, a page loaded before a deploy keeps talking to the
+    /// new server, each misreading the other, and nothing tells it to
+    /// reload.
+    #[test]
+    fn the_wire_format_matches_the_protocol_version() {
+        let (client, server) = samples();
+        let mut seen: Vec<usize> = client.iter().map(client_variant).collect();
+        seen.dedup();
+        assert_eq!(
+            seen,
+            (0..CLIENT_VARIANTS).collect::<Vec<_>>(),
+            "a ClientMsg has no sample"
+        );
+        let mut seen: Vec<usize> = server.iter().map(server_variant).collect();
+        seen.dedup();
+        assert_eq!(
+            seen,
+            (0..SERVER_VARIANTS).collect::<Vec<_>>(),
+            "a ServerMsg has no sample"
+        );
+
+        let bytes = client
+            .iter()
+            .flat_map(encode)
+            .chain(server.iter().flat_map(encode));
+        let print = fingerprint(bytes);
+        assert_eq!(
+            (PROTOCOL_VERSION, print),
+            (20, 0x470c_a4da_b20d_1e25),
+            "the wire format changed: bump PROTOCOL_VERSION and record its new fingerprint"
+        );
+    }
 }

@@ -624,7 +624,7 @@ fn remove_dead(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{DEFAULT_FOOD, PlayerProfile};
+    use crate::types::{DEFAULT_FOOD, PlayerProfile, is_draw};
 
     fn config() -> GameConfig {
         GameConfig {
@@ -888,6 +888,105 @@ mod tests {
         assert_eq!(next.snakes[&b][0], 57, "B lands on the vacated cell");
         assert!(next.game_over(), "sole survivor ends the game");
         assert_eq!(next.winners.first().map(|w| w.player.clone()), Some(b));
+    }
+
+    /// A mid-game turn with these bodies (head first), all on 90 health.
+    fn turn_with(snakes: &[(&str, Vec<Pos>)]) -> Turn {
+        Turn {
+            turn_number: 30,
+            snakes: snakes
+                .iter()
+                .map(|(p, b)| ((*p).to_owned(), b.clone()))
+                .collect(),
+            health: snakes.iter().map(|(p, _)| ((*p).to_owned(), 90)).collect(),
+            alive: snakes.iter().map(|(p, _)| (*p).to_owned()).collect(),
+            food: Vec::new(),
+            moves: BTreeMap::new(),
+            clashes: Vec::new(),
+            winners: Vec::new(),
+        }
+    }
+
+    fn reasons(turn: &Turn, player: &str) -> Vec<ClashReason> {
+        turn.clashes
+            .iter()
+            .filter(|c| c.players[0] == player)
+            .map(|c| c.reason)
+            .collect()
+    }
+
+    /// Running into another snek's body kills the runner, and only the
+    /// runner: its corpse is marked with whose body it hit.
+    #[test]
+    fn running_into_a_body_kills_the_runner() {
+        let mut e = two_player_engine();
+        // a heads Right into (6,5), which b's neck covers once b moves Down.
+        let turn = turn_with(&[("a", vec![70, 69, 68]), ("b", vec![84, 71, 58])]);
+        let next = e.next_turn(&turn, &moves(&[("a", Dir::Right), ("b", Dir::Down)]));
+        assert_eq!(next.alive, vec!["b".to_owned()]);
+        assert_eq!(
+            reasons(&next, "a"),
+            vec![ClashReason::Body; 3],
+            "a clash per corpse cell"
+        );
+        assert!(next.clashes.iter().all(|c| c.players == ["a", "b"]));
+        assert_eq!(next.snakes["b"], vec![97, 84, 71]);
+        assert_eq!(next.winners[0].player, "b");
+    }
+
+    /// Head-on, the longer snek survives and the shorter dies.
+    #[test]
+    fn head_on_kills_the_shorter() {
+        let mut e = two_player_engine();
+        let turn = turn_with(&[("a", vec![70, 69, 68]), ("b", vec![72, 73, 74, 75])]);
+        let next = e.next_turn(&turn, &moves(&[("a", Dir::Right), ("b", Dir::Left)]));
+        assert_eq!(next.alive, vec!["b".to_owned()]);
+        assert_eq!(reasons(&next, "a"), vec![ClashReason::HeadOn; 3]);
+        assert_eq!(next.snakes["b"][0], 71, "the winner keeps the cell");
+        assert!(!is_draw(&next.winners));
+    }
+
+    /// Head-on between equals kills both, and a game nobody outlasted is a
+    /// draw.
+    #[test]
+    fn head_on_between_equals_kills_both() {
+        let mut e = two_player_engine();
+        let turn = turn_with(&[("a", vec![70, 69, 68]), ("b", vec![72, 73, 74])]);
+        let next = e.next_turn(&turn, &moves(&[("a", Dir::Right), ("b", Dir::Left)]));
+        assert!(next.alive.is_empty());
+        assert_eq!(reasons(&next, "a"), vec![ClashReason::HeadOn; 3]);
+        assert_eq!(reasons(&next, "b"), vec![ClashReason::HeadOn; 3]);
+        assert!(next.game_over());
+        assert!(is_draw(&next.winners), "{:?}", next.winners);
+        assert!(next.winners.iter().all(|w| w.length == 0));
+    }
+
+    /// A snek that doesn't eat for its whole health starves on the tick it
+    /// reaches 0, and a solo game ends with it.
+    #[test]
+    fn running_out_of_health_starves() {
+        let mut e = Engine::new(config(), vec!["solo".into()], 1);
+        let mut turn = turn_with(&[("solo", vec![70, 69, 68])]);
+        turn.health.insert("solo".into(), 2);
+        let next = e.next_turn(&turn, &moves(&[("solo", Dir::Down)]));
+        assert_eq!(next.health["solo"], 1, "one tick from starving");
+        let last = e.next_turn(&next, &moves(&[("solo", Dir::Down)]));
+        assert!(last.alive.is_empty());
+        assert_eq!(reasons(&last, "solo"), vec![ClashReason::Starved; 3]);
+        assert!(last.game_over(), "a solo game ends when its snek dies");
+    }
+
+    /// Only orthogonal neighbours have a direction between them.
+    #[test]
+    fn dir_between_only_names_neighbours() {
+        let w = 13;
+        assert_eq!(dir_between(70, 57, w), Some(Dir::Up));
+        assert_eq!(dir_between(70, 83, w), Some(Dir::Down));
+        assert_eq!(dir_between(70, 69, w), Some(Dir::Left));
+        assert_eq!(dir_between(70, 71, w), Some(Dir::Right));
+        assert_eq!(dir_between(70, 44, w), None, "two cells up");
+        assert_eq!(dir_between(70, 72, w), None, "two cells right");
+        assert_eq!(dir_between(70, 84, w), None, "diagonal");
     }
 
     #[test]

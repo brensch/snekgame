@@ -11,12 +11,11 @@
 use crate::db::Db;
 use crate::lock;
 use snek_shared::protocol::{
-    ClientMsg, ComputeStat, ComputeTelemetry, LobbyState, ReconnectReport, ServerMsg,
-    SessionSummary, encode,
+    ClientMsg, ComputeStat, ComputeTelemetry, ConnectReport, LobbyState, ServerMsg, SessionSummary,
+    default_game_name, encode, valid_game_name,
 };
 use snek_shared::{
-    BotDifficulty, DEFAULT_FOOD, Dir, Engine, GameConfig, GameRecord, PlayerId, PlayerProfile,
-    Turn, Winner, bot,
+    BotDifficulty, Dir, Engine, GameConfig, GameRecord, PlayerId, PlayerProfile, Turn, Winner, bot,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,8 +24,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
-/// Three seconds of "this one's you", then ready, steady, go.
-pub const COUNTDOWN_MS: u32 = 6000;
+/// A second of "this one's you", then ready, steady, go.
+pub const COUNTDOWN_MS: u32 = 4000;
 const MAX_PLAYERS: usize = 8;
 /// Outbound frames buffered per connection before we call the client dead.
 const CONN_BUFFER: usize = 256;
@@ -114,15 +113,12 @@ impl Registry {
         self.next_conn_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Sessions with someone actually in them, for the games list.
+    /// Every game there is, by name, for the games list. A game exists until
+    /// it has had nobody connected for a minute (see `EMPTY_GRACE`).
     #[must_use]
     pub fn active_sessions(&self) -> Vec<SessionSummary> {
-        let mut list: Vec<SessionSummary> = lock(&self.infos)
-            .values()
-            .filter(|s| s.players > 0)
-            .cloned()
-            .collect();
-        list.sort_by(|a, b| a.host_name.cmp(&b.host_name).then(a.id.cmp(&b.id)));
+        let mut list: Vec<SessionSummary> = lock(&self.infos).values().cloned().collect();
+        list.sort_by(|a, b| a.id.cmp(&b.id));
         list
     }
 
@@ -363,22 +359,32 @@ struct SessionActor {
     /// stops being true.
     away: HashMap<PlayerId, Instant>,
     last_winners: Vec<Winner>,
+    last_players: Vec<PlayerProfile>,
     last_game_id: Option<i64>,
     config_changed_by: Option<PlayerId>,
     config_rev: u32,
-    /// The foods on offer in the lobby, the same on every phone.
-    food_hand: Vec<String>,
+    /// What the game is called (see `LobbyState::name`).
+    title: String,
 }
 
 impl SessionActor {
     fn spawn(name: String, registry: Registry, db: Arc<Db>) -> mpsc::Sender<Cmd> {
+        let actor = Self::new(name, registry, db);
+        let tx = actor.self_sender.clone();
+        tokio::spawn(actor.run());
+        tx
+    }
+
+    /// A session with nobody in it yet, not yet running.
+    fn new(name: String, registry: Registry, db: Arc<Db>) -> Self {
         let (tx, rx) = mpsc::channel(1024);
-        let actor = Self {
+        Self {
+            title: default_game_name(&name),
             name,
             registry,
             db,
             rx,
-            self_sender: tx.clone(),
+            self_sender: tx,
             conns: HashMap::new(),
             config: GameConfig::default(),
             lobby: Vec::new(),
@@ -395,39 +401,19 @@ impl SessionActor {
             empty_deadline: None,
             away: HashMap::new(),
             last_winners: Vec::new(),
+            last_players: Vec::new(),
             last_game_id: None,
             config_changed_by: None,
             config_rev: 0,
-            food_hand: deal_food_hand(DEFAULT_FOOD),
-        };
-        tokio::spawn(actor.run());
-        tx
+        }
     }
 
     fn publish_info(&self) {
-        // Humans only — presence in the lobby means a live connection, so
-        // this count drops the moment someone leaves and the game disappears
-        // from the list when the last human does (bots don't keep it listed).
         let humans = self.lobby.len().saturating_sub(self.bots.len());
-        // Games aren't named; they're known by their host — the first human
-        // currently in the lobby.
-        let host = self.lobby.iter().find(|p| !self.bots.contains_key(&p.id));
         self.registry.publish(SessionSummary {
             id: self.name.clone(),
-            host_name: host.map(|p| p.name.clone()).unwrap_or_default(),
-            host_emoji: host.map(|p| p.emoji.clone()).unwrap_or_default(),
-            host_colour: host.map(|p| p.colour.clone()).unwrap_or_default(),
-            emojis: host
-                .into_iter()
-                .chain(
-                    self.lobby
-                        .iter()
-                        .filter(|p| host.is_none_or(|h| h.id != p.id))
-                        .filter(|p| !self.bots.contains_key(&p.id)),
-                )
-                .chain(self.lobby.iter().filter(|p| self.bots.contains_key(&p.id)))
-                .map(|p| p.emoji.clone())
-                .collect(),
+            name: self.title.clone(),
+            emojis: self.lobby.iter().map(|p| p.emoji.clone()).collect(),
             players: count(humans),
             bots: count(self.bots.len()),
             playing: self.game.is_some(),
@@ -462,8 +448,8 @@ impl SessionActor {
                 },
                 () = tick_sleep => self.tick().await,
                 () = empty_sleep => {
-                    if self.conns.is_empty() {
-                        break; // nobody came back — tidy up
+                    if self.conns.is_empty() || !self.has_people() {
+                        break; // nobody came back, or nobody's left: tidy up
                     }
                     self.empty_deadline = None;
                 }
@@ -624,6 +610,8 @@ impl SessionActor {
                 self.broadcast_lobby();
             }
             ClientMsg::Configure(config) => self.configure(player, config),
+            ClientMsg::Rename(name) => self.rename(player, &name),
+            ClientMsg::Leave => self.leave(&player),
             ClientMsg::SetPaused(paused) => {
                 if self.game.is_some() && self.paused != paused {
                     self.paused = paused;
@@ -645,7 +633,7 @@ impl SessionActor {
                 }
             }
             ClientMsg::AddBot(difficulty) => self.add_bot(difficulty),
-            ClientMsg::Kick(target) => self.kick(&target),
+            ClientMsg::Kick(target) => self.kick(&player, &target),
             ClientMsg::Benchmark {
                 sims_per_sec,
                 device,
@@ -681,8 +669,7 @@ impl SessionActor {
             ClientMsg::Ping(n) => {
                 self.send_to(conn_id, control_frame(&ServerMsg::Pong(n)));
             }
-            ClientMsg::ShuffleFood => self.shuffle_food(),
-            ClientMsg::Reconnected(report) => self.log_reconnect(&player, conn_id, report),
+            ClientMsg::Connected(report) => self.log_connect(&player, conn_id, &report),
             // Handled at the transport layer before a session exists.
             ClientMsg::WatchGames => {}
         }
@@ -691,55 +678,127 @@ impl SessionActor {
     /// Change the settings for the next game, between games only.
     fn configure(&mut self, player: PlayerId, config: GameConfig) {
         // Picking what is already picked changes nothing, so it shouldn't
-        // un-ready anyone or claim the settings either.
+        // claim the settings either.
         if self.game.is_some() || !config.valid() || config == self.config {
             return;
-        }
-        // Picks come from the shared hand; one that doesn't (an older
-        // client's) gets a hand of its own around it.
-        if !self.food_hand.contains(&config.food_emoji) {
-            self.food_hand = deal_food_hand(&config.food_emoji);
         }
         self.config = config;
         self.config_changed_by = Some(player);
         self.config_rev = self.config_rev.wrapping_add(1);
-        // Changing the deal un-readies everyone.
-        self.ready.clear();
+        // Readiness stands: agreeing to play isn't agreeing to one exact set
+        // of rules, and everyone is told who changed what as it happens.
         self.broadcast_lobby();
     }
 
-    /// Deal the lobby a new hand of foods, between games only.
-    fn shuffle_food(&mut self) {
-        if self.game.is_none() {
-            self.food_hand = deal_food_hand(&self.config.food_emoji);
-            self.broadcast_lobby();
+    /// Someone leaving on purpose: out of the lobby at once, rather than
+    /// holding a seat the way a dropped connection does. Their connections
+    /// are told and let go, so when the transport closes there is nothing
+    /// left to hold a seat for. A running game carries on without them.
+    fn leave(&mut self, player: &PlayerId) {
+        self.lobby.retain(|p| p.id != *player);
+        self.ready.remove(player);
+        self.away.remove(player);
+        let theirs: Vec<u64> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.player == *player)
+            .map(|(&id, _)| id)
+            .collect();
+        tracing::info!(session = %self.name, %player, "left");
+        for conn_id in theirs {
+            self.send_to(conn_id, control_frame(&ServerMsg::Left));
+            self.conns.remove(&conn_id);
         }
+        if !self.has_people() {
+            // The last person out: the game goes now, not in a minute.
+            self.empty_deadline = Some(Instant::now());
+        } else if self.conns.is_empty() {
+            self.empty_deadline = Some(Instant::now() + EMPTY_GRACE);
+        }
+        self.assign_bots();
+        self.broadcast_lobby();
+    }
+
+    /// Whether any human is still in the lobby (holding a seat counts; bots
+    /// don't).
+    fn has_people(&self) -> bool {
+        self.lobby.iter().any(|p| !self.bots.contains_key(&p.id))
+    }
+
+    /// Call the game something else, between games. A rename is a settings
+    /// change like any other: it's credited to whoever made it and everyone
+    /// else is told.
+    fn rename(&mut self, player: PlayerId, name: &str) {
+        let name = name.trim();
+        if self.game.is_some() || !valid_game_name(name) || name == self.title {
+            return;
+        }
+        name.clone_into(&mut self.title);
+        self.config_changed_by = Some(player);
+        self.config_rev = self.config_rev.wrapping_add(1);
+        self.broadcast_lobby();
     }
 
     /// A client's account of how its reconnect went, for the log: the only
     /// place a slow one on somebody's phone can be seen afterwards.
-    fn log_reconnect(&self, player: &PlayerId, conn_id: u64, report: ReconnectReport) {
+    fn log_connect(&self, player: &PlayerId, conn_id: u64, report: &ConnectReport) {
+        /// A misbehaving client can't fill the log: this much trail at most.
+        const TRAIL_EVENTS: usize = 40;
+        const EVENT_CHARS: usize = 120;
+        let skip = report.trail.len().saturating_sub(TRAIL_EVENTS);
+        let trail = report
+            .trail
+            .iter()
+            .skip(skip)
+            .map(|e| e.chars().take(EVENT_CHARS).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" | ");
         tracing::info!(
             session = %self.name, %player, conn = conn_id,
+            reconnect = report.reconnect,
             attempts = report.attempts,
-            silent_ms = report.silent_ms,
-            reconnect_ms = report.reconnect_ms,
+            silent_ms = ?report.silent_ms,
             since_visible_ms = ?report.since_visible_ms,
-            "reconnected"
+            page_ms = report.page_ms,
+            handshake_ms = report.handshake_ms,
+            join_ms = report.join_ms,
+            %trail,
+            "connect report"
         );
     }
 
     /// Take a player or bot out of the lobby, between games only.
-    fn kick(&mut self, target: &PlayerId) {
-        if self.game.is_none() {
-            self.lobby.retain(|p| p.id != *target);
-            self.bots.remove(target);
-            self.ready.remove(target);
-            // Removing someone settles it — no held seat should outlive the
-            // decision and put them back.
-            self.away.remove(target);
-            self.broadcast_lobby();
+    ///
+    /// Nobody can remove themselves (that's what leaving is for). The player
+    /// removed is told so, and by whom, and their connections are let go:
+    /// their phone goes back to the home screen rather than sitting in a
+    /// lobby it is no longer in.
+    fn kick(&mut self, kicker: &PlayerId, target: &PlayerId) {
+        if self.game.is_some() || kicker == target {
+            return;
         }
+        let by = self.lobby.iter().find(|p| p.id == *kicker).cloned();
+        self.lobby.retain(|p| p.id != *target);
+        self.bots.remove(target);
+        self.ready.remove(target);
+        // Removing someone settles it — no held seat should outlive the
+        // decision and put them back.
+        self.away.remove(target);
+        let theirs: Vec<u64> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.player == *target)
+            .map(|(&id, _)| id)
+            .collect();
+        if !theirs.is_empty() {
+            tracing::info!(session = %self.name, player = %target, by = %kicker, "removed from the lobby");
+        }
+        for conn_id in theirs {
+            self.send_to(conn_id, control_frame(&ServerMsg::Kicked(by.clone())));
+            self.conns.remove(&conn_id);
+        }
+        self.assign_bots();
+        self.broadcast_lobby();
     }
 
     /// What a device says about whether it can think for bots right now —
@@ -917,7 +976,7 @@ impl SessionActor {
         // all is a *forced* one — a single legal option, decided without
         // searching — which is correct, not poor.
         let forced = tm.slices == 0 && tm.sims == 0;
-        if !forced && (tm.fallback || tm.sims < 800 || tm.total_ms > self.config.tick_ms) {
+        if !forced && (tm.fallback || tm.sims < 800 || tm.total_ms > self.tick_ms_now()) {
             tracing::info!(
                 session = %self.name, conn = conn_id, bot = %pending.bot_id,
                 think_ms = tm.think_ms, queue_ms = tm.queue_ms,
@@ -1067,7 +1126,7 @@ impl SessionActor {
             // Fixed cadence from the due time. If we somehow fell more than
             // a period behind (stall, load), skip forward instead of
             // machine-gunning catch-up ticks.
-            let period = Duration::from_millis(u64::from(self.config.tick_ms));
+            let period = Duration::from_millis(u64::from(self.tick_ms_now()));
             let mut next = due + period;
             let now = Instant::now();
             if next <= now {
@@ -1148,6 +1207,7 @@ impl SessionActor {
             seed: game.engine.initial_seed(),
             turns: game.turns.clone(),
         };
+        self.last_players.clone_from(&record.players);
         self.last_winners = record
             .turns
             .last()
@@ -1258,11 +1318,23 @@ impl SessionActor {
         }
     }
 
+    /// The wait until the next turn, at the speed the game has reached (see
+    /// `GameConfig::tick_ms_at`; turns are numbered from 1). Outside a
+    /// game, the starting speed.
+    fn tick_ms_now(&self) -> u32 {
+        let turn = self
+            .game
+            .as_ref()
+            .and_then(|g| g.turns.last())
+            .map_or(0, |t| t.turn_number.saturating_sub(1));
+        self.config.tick_ms_at(turn)
+    }
+
     /// Start the clock again, unless someone has deliberately stopped it.
     fn resume_tick(&mut self) {
         if self.game.is_some() && self.next_tick.is_none() && !self.paused {
             self.next_tick =
-                Some(Instant::now() + Duration::from_millis(u64::from(self.config.tick_ms)));
+                Some(Instant::now() + Duration::from_millis(u64::from(self.tick_ms_now())));
         }
     }
 
@@ -1343,7 +1415,7 @@ impl SessionActor {
             // point the bot had already been defaulted onto its old heading.
             // Three of those in one game, and one of them was a bot holding
             // Left into a wall with a good move sitting in flight.
-            let mut window = (f64::from(self.config.tick_ms) * 0.5).max(25.0);
+            let mut window = (f64::from(self.tick_ms_now()) * 0.5).max(25.0);
             // Bots on a device think concurrently, one worker each. If they
             // outnumber the threads available, asking each for the full
             // window pins the phone at 100% and makes the whole device feel
@@ -1412,10 +1484,11 @@ impl SessionActor {
             players: self.lobby.clone(),
             ready: self.ready.iter().cloned().collect(),
             last_winners: self.last_winners.clone(),
+            last_players: self.last_players.clone(),
             last_game_id: self.last_game_id,
             config_changed_by: self.config_changed_by.clone(),
             config_rev: self.config_rev,
-            food_hand: self.food_hand.clone(),
+            name: self.title.clone(),
         };
         self.publish_info();
         self.broadcast(&control_frame(&ServerMsg::Lobby(state)));
@@ -1468,7 +1541,1111 @@ pub fn conn_channel() -> (mpsc::Sender<Frame>, mpsc::Receiver<Frame>) {
     mpsc::channel(CONN_BUFFER)
 }
 
-/// A fresh hand of foods around `keep`, drawn at random.
-fn deal_food_hand(keep: &str) -> Vec<String> {
-    snek_shared::deal_food_hand(keep, |n| rand::random_range(0..n))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{Logs, profile, temp_path};
+    use snek_shared::protocol::{ProfileInfo, decode};
+
+    /// One end of a connection as the session sees it: its frames, decoded.
+    struct Peer {
+        conn_id: u64,
+        id: PlayerId,
+        rx: mpsc::Receiver<Frame>,
+    }
+
+    impl Peer {
+        /// Everything sent so far, oldest first, with whether it rode the
+        /// stream (`true`) or a datagram.
+        fn frames(&mut self) -> Vec<(bool, ServerMsg)> {
+            let mut out = Vec::new();
+            while let Ok(frame) = self.rx.try_recv() {
+                let (control, bytes) = match frame {
+                    Frame::Control(b) => (true, b),
+                    Frame::Snapshot(b) => (false, b),
+                };
+                out.push((control, decode(&bytes).expect("undecodable frame")));
+            }
+            out
+        }
+
+        fn msgs(&mut self) -> Vec<ServerMsg> {
+            self.frames().into_iter().map(|(_, m)| m).collect()
+        }
+
+        /// The newest lobby sent, if any was.
+        fn lobby(&mut self) -> Option<LobbyState> {
+            self.msgs().into_iter().rev().find_map(|m| match m {
+                ServerMsg::Lobby(l) => Some(l),
+                _ => None,
+            })
+        }
+
+        /// Compute requests sent, each once (they go out both ways).
+        fn requests(&mut self) -> Vec<Request> {
+            let mut out: Vec<Request> = Vec::new();
+            for msg in self.msgs() {
+                if let ServerMsg::ComputeRequest {
+                    request_id,
+                    bot_id,
+                    config,
+                    turn,
+                    think_ms,
+                    nonce,
+                    ..
+                } = msg
+                    && !out.iter().any(|r| r.id == request_id)
+                {
+                    out.push(Request {
+                        id: request_id,
+                        bot: bot_id,
+                        config,
+                        turn,
+                        think_ms,
+                        nonce,
+                    });
+                }
+            }
+            out
+        }
+    }
+
+    struct Request {
+        id: u64,
+        bot: PlayerId,
+        config: GameConfig,
+        turn: Turn,
+        think_ms: u32,
+        nonce: u64,
+    }
+
+    impl Request {
+        /// A real answer: a short search, properly bound to the request.
+        fn answer(&self) -> ClientMsg {
+            let mut search = bot::begin(&self.config, &self.turn, &self.bot, 200, self.nonce);
+            while !search.step(64) {}
+            let (dir, _) = search.result();
+            self.answer_with(dir, bot::bind_proof(self.nonce, self.id, dir))
+        }
+
+        fn answer_with(&self, dir: Dir, proof: u64) -> ClientMsg {
+            ClientMsg::BotMove {
+                request_id: self.id,
+                dir,
+                proof,
+                tm: telemetry(),
+            }
+        }
+    }
+
+    fn telemetry() -> ComputeTelemetry {
+        ComputeTelemetry {
+            queue_ms: 1,
+            search_ms: 40,
+            total_ms: 45,
+            think_ms: 50,
+            sims: 2_000,
+            slices: 4,
+            fallback: false,
+            loop_lag_ms: 0,
+        }
+    }
+
+    fn session() -> SessionActor {
+        let db = Arc::new(Db::open(&temp_path("session.db")).unwrap());
+        SessionActor::new("test".to_owned(), Registry::new(Arc::clone(&db)), db)
+    }
+
+    fn join(actor: &mut SessionActor, name: &str) -> Peer {
+        join_as(actor, &format!("{name}-id"), name)
+    }
+
+    fn join_as(actor: &mut SessionActor, id: &str, name: &str) -> Peer {
+        let conn_id = actor.registry.new_conn_id();
+        let (tx, rx) = conn_channel();
+        actor.handle(Cmd::Connect {
+            conn_id,
+            profile: profile(id, name),
+            ip: "10.0.0.1".to_owned(),
+            tx,
+        });
+        Peer {
+            conn_id,
+            id: id.to_owned(),
+            rx,
+        }
+    }
+
+    fn say(actor: &mut SessionActor, peer: &Peer, msg: ClientMsg) {
+        actor.handle(Cmd::Msg {
+            conn_id: peer.conn_id,
+            msg,
+        });
+    }
+
+    fn info(name: &str) -> ProfileInfo {
+        ProfileInfo {
+            name: name.to_owned(),
+            emoji: "🦊".to_owned(),
+            colour: "red".to_owned(),
+        }
+    }
+
+    fn benchmark(actor: &mut SessionActor, peer: &Peer, cores: u32) {
+        say(
+            actor,
+            peer,
+            ClientMsg::Benchmark {
+                sims_per_sec: 50_000,
+                device: "test phone".to_owned(),
+                cores,
+            },
+        );
+    }
+
+    /// Everyone ready, then go.
+    fn start(actor: &mut SessionActor, peers: &[&Peer]) {
+        for p in peers {
+            say(actor, p, ClientMsg::SetReady(true));
+        }
+        say(actor, peers[0], ClientMsg::Start);
+        assert!(actor.game.is_some(), "the game didn't start");
+    }
+
+    /// Tick until the game is over, answering nothing.
+    async fn play_out(actor: &mut SessionActor) {
+        for _ in 0..200 {
+            if actor.game.is_none() {
+                return;
+            }
+            actor.tick().await;
+        }
+        panic!("the game never ended");
+    }
+
+    #[tokio::test]
+    async fn profile_changes_apply_to_your_own_seat_only() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+
+        say(&mut s, &bob, ClientMsg::UpdateProfile(info("robert")));
+        let lobby = alice.lobby().unwrap();
+        let names: Vec<(&str, &str)> = lobby
+            .players
+            .iter()
+            .map(|p| (p.id.as_str(), p.name.as_str()))
+            .collect();
+        assert_eq!(names, [("alice-id", "alice"), ("bob-id", "robert")]);
+
+        // A blank or oversized profile changes nothing and tells nobody.
+        for bad in ["  ", &"x".repeat(33)] {
+            say(&mut s, &bob, ClientMsg::UpdateProfile(info(bad)));
+        }
+        assert!(alice.lobby().is_none());
+
+        // A Join sent mid-session is only a profile change, whatever it says.
+        say(
+            &mut s,
+            &bob,
+            ClientMsg::Join {
+                version: 0,
+                session: "elsewhere".to_owned(),
+                secret: "alice-secret".to_owned(),
+                profile: info("bobby"),
+            },
+        );
+        let lobby = alice.lobby().unwrap();
+        assert_eq!(lobby.session, "test");
+        assert_eq!(lobby.players[1].name, "bobby");
+        assert_eq!(lobby.players[0].name, "alice");
+    }
+
+    #[tokio::test]
+    async fn readying_up_can_be_taken_back() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        say(&mut s, &alice, ClientMsg::SetReady(true));
+        assert_eq!(alice.lobby().unwrap().ready, ["alice-id"]);
+        say(&mut s, &alice, ClientMsg::SetReady(false));
+        assert!(alice.lobby().unwrap().ready.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bots_fill_the_lobby_to_eight_and_no_further() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Easy));
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Medium));
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Hard));
+        let lobby = alice.lobby().unwrap();
+        let names: Vec<&str> = lobby.players.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["alice", "cool guy", "dude", "lad"]);
+
+        for _ in 0..10 {
+            say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Easy));
+        }
+        assert_eq!(alice.lobby().unwrap().players.len(), MAX_PLAYERS);
+
+        // A ninth person can still come in, to watch.
+        let mut carol = join(&mut s, "carol");
+        let lobby = carol.lobby().unwrap();
+        assert_eq!(lobby.players.len(), MAX_PLAYERS);
+        assert!(!lobby.players.iter().any(|p| p.id == carol.id));
+    }
+
+    #[tokio::test]
+    async fn kicking_removes_players_and_bots_between_games() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Easy));
+        say(&mut s, &bob, ClientMsg::SetReady(true));
+        // Bob's tab goes away, so he's holding a seat; kicking settles it.
+        s.handle(Cmd::Disconnect {
+            conn_id: bob.conn_id,
+        });
+        say(&mut s, &alice, ClientMsg::Kick("bot-1".to_owned()));
+        say(&mut s, &alice, ClientMsg::Kick(bob.id.clone()));
+        let lobby = alice.lobby().unwrap();
+        assert_eq!(lobby.players.len(), 1);
+        assert!(lobby.ready.is_empty());
+        assert!(s.bots.is_empty());
+        assert!(s.away.is_empty(), "the held seat outlived the kick");
+
+        // Not during a game: nobody can be taken out of one, or added.
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Easy));
+        let carol = join(&mut s, "carol");
+        start(&mut s, &[&alice, &carol]);
+        alice.msgs();
+        say(&mut s, &alice, ClientMsg::Kick(carol.id.clone()));
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Hard));
+        assert_eq!(s.lobby.len(), 3);
+        assert!(alice.lobby().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_game_starts_only_when_every_human_is_ready() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Easy));
+        say(&mut s, &alice, ClientMsg::SetReady(true));
+        say(&mut s, &alice, ClientMsg::Start);
+        assert!(s.game.is_none(), "started with bob not ready");
+
+        say(&mut s, &bob, ClientMsg::SetReady(true));
+        say(&mut s, &alice, ClientMsg::Start);
+        let started = alice.msgs().into_iter().find_map(|m| match m {
+            ServerMsg::GameStart {
+                players,
+                turn,
+                countdown_ms,
+                ..
+            } => Some((players, turn, countdown_ms)),
+            _ => None,
+        });
+        let (players, turn, countdown_ms) = started.expect("no game start");
+        assert_eq!(players.len(), 3, "bots play too");
+        assert_eq!(turn.alive.len(), 3);
+        assert_eq!(countdown_ms, COUNTDOWN_MS);
+
+        // Starting again does nothing; a late joiner is caught up.
+        say(&mut s, &bob, ClientMsg::Start);
+        assert!(
+            !alice
+                .msgs()
+                .iter()
+                .any(|m| matches!(m, ServerMsg::GameStart { .. }))
+        );
+        let mut carol = join(&mut s, "carol");
+        assert!(
+            carol.msgs().iter().any(
+                |m| matches!(m, ServerMsg::GameInProgress { players, .. } if players.len() == 3)
+            ),
+            "a late joiner wasn't caught up"
+        );
+    }
+
+    #[tokio::test]
+    async fn nobody_can_remove_themselves() {
+        let mut s = session();
+        let alice = join(&mut s, "alice");
+        say(&mut s, &alice, ClientMsg::Kick(alice.id.clone()));
+        assert_eq!(s.lobby.len(), 1);
+        assert!(s.conns.contains_key(&alice.conn_id));
+    }
+
+    #[tokio::test]
+    async fn whoever_is_removed_is_told_by_whom_and_let_go() {
+        let mut s = session();
+        let alice = join(&mut s, "alice");
+        let mut bob = join(&mut s, "bob");
+        bob.msgs();
+        say(&mut s, &alice, ClientMsg::Kick(bob.id.clone()));
+        let told = bob.msgs().into_iter().find_map(|m| match m {
+            ServerMsg::Kicked(by) => Some(by),
+            _ => None,
+        });
+        assert_eq!(told.flatten().map(|p| p.name), Some("alice".to_owned()));
+        assert!(
+            !s.conns.contains_key(&bob.conn_id),
+            "bob's connection was kept"
+        );
+        assert_eq!(s.lobby.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn settings_change_only_between_games_and_only_when_valid() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+
+        let config = GameConfig {
+            food_emoji: "🦀".to_owned(),
+            ..GameConfig::default()
+        };
+        say(&mut s, &alice, ClientMsg::Configure(config.clone()));
+        assert_eq!(alice.lobby().unwrap().config, config);
+
+        // Settings that aren't valid are ignored.
+        let silly = GameConfig {
+            board_width: 200,
+            ..GameConfig::default()
+        };
+        say(&mut s, &alice, ClientMsg::Configure(silly));
+        assert!(alice.lobby().is_none());
+
+        // Nor do they change mid-game.
+        start(&mut s, &[&alice]);
+        alice.msgs();
+        say(&mut s, &alice, ClientMsg::Configure(GameConfig::default()));
+        assert!(alice.lobby().is_none());
+        assert_eq!(s.config, config);
+    }
+
+    #[tokio::test]
+    async fn leaving_takes_you_out_at_once() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        let mut bob = join(&mut s, "bob");
+        say(&mut s, &bob, ClientMsg::SetReady(true));
+        alice.msgs();
+        bob.msgs();
+        say(&mut s, &bob, ClientMsg::Leave);
+        assert!(bob.msgs().contains(&ServerMsg::Left), "bob wasn't told");
+        let lobby = alice.lobby().unwrap();
+        assert_eq!(lobby.players.len(), 1);
+        assert!(lobby.ready.is_empty());
+        // The transport closing afterwards holds no seat.
+        s.handle(Cmd::Disconnect {
+            conn_id: bob.conn_id,
+        });
+        assert!(s.away.is_empty(), "a seat was held for someone who left");
+
+        // The last person out ends the game there and then, bots or no.
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Easy));
+        say(&mut s, &alice, ClientMsg::Leave);
+        assert!(!s.has_people());
+        assert!(s.empty_deadline.is_some_and(|t| t <= Instant::now()));
+    }
+
+    /// Run for real, the last person leaving takes the game off the list
+    /// at once.
+    #[tokio::test(start_paused = true)]
+    async fn the_last_person_leaving_deletes_the_game() {
+        let registry = Registry::new(Arc::new(Db::open(&temp_path("solo.db")).unwrap()));
+        let mut watch = registry.watch_games();
+        let (tx, mut rx) = conn_channel();
+        let actor = registry
+            .connect("solo", 1, profile("alice-id", "alice"), String::new(), tx)
+            .await;
+        watch.changed().await.unwrap();
+        assert_eq!(watch.borrow_and_update().len(), 1);
+        actor
+            .send(Cmd::Msg {
+                conn_id: 1,
+                msg: ClientMsg::Leave,
+            })
+            .await
+            .unwrap();
+        while let Some(frame) = rx.recv().await {
+            if let Frame::Control(bytes) = frame
+                && decode::<ServerMsg>(&bytes) == Some(ServerMsg::Left)
+            {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(
+            registry.active_sessions().is_empty(),
+            "the game outlived its last player"
+        );
+    }
+
+    #[tokio::test]
+    async fn anyone_can_rename_the_game_between_games() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+        alice.msgs();
+        assert_eq!(s.title, default_game_name(&s.name));
+
+        say(
+            &mut s,
+            &bob,
+            ClientMsg::Rename("  the big one  ".to_owned()),
+        );
+        let lobby = alice.lobby().unwrap();
+        assert_eq!(lobby.name, "the big one", "the name wasn't trimmed");
+        assert_eq!(lobby.config_changed_by, Some(bob.id.clone()));
+
+        // Nothing to read, too long, or the same again: ignored.
+        say(&mut s, &bob, ClientMsg::Rename("   ".to_owned()));
+        say(&mut s, &bob, ClientMsg::Rename("x".repeat(41)));
+        say(&mut s, &bob, ClientMsg::Rename("the big one".to_owned()));
+        assert!(alice.lobby().is_none());
+
+        // Nor mid-game.
+        start(&mut s, &[&alice, &bob]);
+        say(&mut s, &bob, ClientMsg::Rename("sneaky".to_owned()));
+        assert_eq!(s.title, "the big one");
+    }
+
+    #[tokio::test]
+    async fn a_stream_ping_is_answered_on_the_stream() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        alice.msgs();
+        say(&mut s, &alice, ClientMsg::Ping(9));
+        assert!(matches!(alice.frames()[..], [(true, ServerMsg::Pong(9))]));
+        // The home screen's subscription means nothing inside a session.
+        say(&mut s, &alice, ClientMsg::WatchGames);
+        assert!(alice.frames().is_empty());
+    }
+
+    /// Messages from a connection the session no longer has (dropped as
+    /// slow, say) are ignored, not taken as some other player's.
+    #[tokio::test]
+    async fn an_unknown_connection_is_ignored() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        alice.msgs();
+        s.handle(Cmd::Msg {
+            conn_id: 999,
+            msg: ClientMsg::SetReady(true),
+        });
+        s.handle(Cmd::Alive { conn_id: 999 });
+        s.handle(Cmd::Disconnect { conn_id: 999 });
+        let lobby = alice.lobby().unwrap();
+        assert!(lobby.ready.is_empty());
+        assert_eq!(lobby.players.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_is_dropped() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        // Bob's buffer holds one frame, which his welcome lobby fills.
+        let conn_id = s.registry.new_conn_id();
+        let (tx, _bob_rx) = mpsc::channel(1);
+        s.handle(Cmd::Connect {
+            conn_id,
+            profile: profile("bob-id", "bob"),
+            ip: "10.0.0.2".to_owned(),
+            tx,
+        });
+        assert!(s.conns.contains_key(&conn_id));
+        say(&mut s, &alice, ClientMsg::SetReady(true));
+        assert!(!s.conns.contains_key(&conn_id), "a stuck client was kept");
+        // His seat is untouched: he reconnects into it.
+        assert_eq!(alice.lobby().unwrap().players.len(), 2);
+
+        // Same for a reply meant for him alone.
+        let (tx, _carol_rx) = mpsc::channel(1);
+        let carol = s.registry.new_conn_id();
+        s.handle(Cmd::Connect {
+            conn_id: carol,
+            profile: profile("carol-id", "carol"),
+            ip: "10.0.0.3".to_owned(),
+            tx,
+        });
+        s.handle(Cmd::Msg {
+            conn_id: carol,
+            msg: ClientMsg::Ping(1),
+        });
+        assert!(!s.conns.contains_key(&carol));
+    }
+
+    #[tokio::test]
+    async fn reconnects_and_compute_failures_are_logged() {
+        let logs = Logs::capture();
+        let mut s = session();
+        let alice = join(&mut s, "alice");
+        say(
+            &mut s,
+            &alice,
+            ClientMsg::Connected(ConnectReport {
+                reconnect: true,
+                attempts: 3,
+                silent_ms: Some(4_000),
+                since_visible_ms: Some(50),
+                page_ms: 90_000,
+                handshake_ms: 1_234,
+                join_ms: 20,
+                trail: vec!["open".to_owned(), "x".repeat(500)],
+            }),
+        );
+        assert!(logs.has(&[
+            "connect report",
+            "attempts=3",
+            "handshake_ms=1234",
+            "open | xxx"
+        ]));
+        assert!(
+            !logs.has(&[&"x".repeat(121)]),
+            "a trail event wasn't cut short"
+        );
+
+        let mut alice = alice;
+        benchmark(&mut s, &alice, 8);
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Easy));
+        start(&mut s, &[&alice]);
+        let request = alice.requests().pop().expect("no compute request");
+        say(
+            &mut s,
+            &alice,
+            ClientMsg::ComputeFailed {
+                request_id: request.id,
+                reason: "worker crashed".to_owned(),
+            },
+        );
+        assert!(logs.has(&["could not compute", "bot=bot-1", "worker crashed"]));
+    }
+
+    #[tokio::test]
+    async fn a_hold_stops_the_clock_until_it_is_lifted() {
+        let mut s = session();
+        let alice = join(&mut s, "alice");
+        let mut bob = join(&mut s, "bob");
+        // No game, nothing to hold.
+        say(&mut s, &alice, ClientMsg::SetPaused(true));
+        assert!(!bob.msgs().iter().any(|m| matches!(m, ServerMsg::Paused(_))));
+
+        start(&mut s, &[&alice, &bob]);
+        bob.msgs();
+        say(&mut s, &alice, ClientMsg::SetPaused(true));
+        say(&mut s, &alice, ClientMsg::SetPaused(true));
+        let held: Vec<ServerMsg> = bob.msgs();
+        assert!(matches!(held[..], [ServerMsg::Paused(true)]), "{held:?}");
+        assert_eq!(s.next_tick, None);
+        // Nothing a player does in the meantime restarts it.
+        say(&mut s, &bob, ClientMsg::HostAvailable { can_compute: true });
+        s.handle(Cmd::Alive {
+            conn_id: bob.conn_id,
+        });
+        assert_eq!(s.next_tick, None);
+
+        say(&mut s, &bob, ClientMsg::SetPaused(false));
+        assert!(matches!(bob.msgs()[..], [ServerMsg::Paused(false)]));
+        assert!(s.next_tick.is_some());
+    }
+
+    #[tokio::test]
+    async fn moves_steer_the_mover_only_while_alive() {
+        let mut s = session();
+        let alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+        start(&mut s, &[&alice, &bob]);
+        // Carol arrives mid-game: she watches, steering nothing.
+        let mut carol = join(&mut s, "carol");
+        assert!(
+            !s.game
+                .as_ref()
+                .unwrap()
+                .players
+                .iter()
+                .any(|p| p.id == carol.id)
+        );
+        let heading = |s: &SessionActor, id: &str| {
+            let turn = s.game.as_ref().unwrap().turns.last().unwrap().clone();
+            snek_shared::clockwise_start_dir(&s.config, turn.snakes[id][0])
+        };
+        let alice_dir = heading(&s, &alice.id);
+        say(&mut s, &alice, ClientMsg::Move(alice_dir));
+        say(&mut s, &carol, ClientMsg::Move(Dir::Up));
+        s.tick().await;
+        let turn = carol
+            .msgs()
+            .into_iter()
+            .find_map(|m| match m {
+                ServerMsg::Turn(t) => Some(t),
+                _ => None,
+            })
+            .expect("no turn snapshot");
+        assert_eq!(turn.turn_number, 2);
+        assert_eq!(turn.moves.get(&alice.id), Some(&alice_dir));
+        assert!(!turn.moves.contains_key(&carol.id));
+    }
+
+    #[tokio::test]
+    async fn a_finished_game_is_saved_and_the_lobby_comes_back() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+        start(&mut s, &[&alice, &bob]);
+        play_out(&mut s).await;
+
+        let msgs = alice.msgs();
+        let id = msgs
+            .iter()
+            .find_map(|m| match m {
+                ServerMsg::GameSaved { id, compute } => {
+                    assert!(compute.is_empty(), "no bots, nothing computed");
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .expect("game not saved");
+        let ServerMsg::Lobby(lobby) = msgs.last().unwrap() else {
+            panic!("the lobby didn't come back last: {msgs:?}");
+        };
+        assert!(!lobby.game_running);
+        assert_eq!(lobby.last_game_id, Some(id));
+        assert_eq!(lobby.last_winners.len(), 2);
+        assert_eq!(
+            lobby.last_players.len(),
+            2,
+            "the lobby forgot who played the last game"
+        );
+        assert!(lobby.ready.is_empty(), "a game clears everyone's ready");
+
+        let meta = s.db.get_game_meta(id).unwrap().unwrap();
+        assert_eq!(meta.players.len(), 2);
+        assert_eq!(meta.winners, lobby.last_winners);
+    }
+
+    #[tokio::test]
+    async fn a_game_that_cannot_be_saved_still_ends() {
+        let logs = Logs::capture();
+        let path = temp_path("unsaveable.db");
+        let db = Arc::new(Db::open(&path).unwrap());
+        let mut s = SessionActor::new("test".to_owned(), Registry::new(Arc::clone(&db)), db);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE games;")
+            .unwrap();
+        let mut alice = join(&mut s, "alice");
+        start(&mut s, &[&alice]);
+        play_out(&mut s).await;
+
+        let msgs = alice.msgs();
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ServerMsg::GameSaved { .. }))
+        );
+        let lobby = lobby_in(&msgs);
+        assert!(!lobby.game_running);
+        assert_eq!(lobby.last_game_id, None);
+        assert!(logs.has(&["failed to save game", "no such table"]));
+    }
+
+    fn lobby_in(msgs: &[ServerMsg]) -> LobbyState {
+        msgs.iter()
+            .rev()
+            .find_map(|m| match m {
+                ServerMsg::Lobby(l) => Some(l.clone()),
+                _ => None,
+            })
+            .expect("no lobby")
+    }
+
+    /// The bots' moves come from players' devices: a request out to the
+    /// host, both ways, and its answer steers the bot; the device's work
+    /// is credited to it when the game is saved.
+    #[tokio::test]
+    async fn a_hosted_bot_is_steered_by_its_hosts_answers() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        let mut bob = join(&mut s, "bob");
+        benchmark(&mut s, &alice, 8);
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Medium));
+        start(&mut s, &[&alice, &bob]);
+
+        let frames = alice.frames();
+        let copies: Vec<bool> = frames
+            .iter()
+            .filter(|(_, m)| matches!(m, ServerMsg::ComputeRequest { .. }))
+            .map(|(control, _)| *control)
+            .collect();
+        assert_eq!(copies, [false, true], "datagram first, then the stream");
+        assert!(bob.requests().is_empty(), "bob never benchmarked");
+
+        let mut answered = 0;
+        while s.game.is_some() {
+            let requests = alice.requests();
+            for r in &requests {
+                assert_eq!(r.bot, "bot-1");
+                say(&mut s, &alice, r.answer());
+                let game = s.game.as_ref().unwrap();
+                assert!(game.pending.contains_key("bot-1"), "the answer was dropped");
+            }
+            answered += requests.len();
+            s.tick().await;
+        }
+        assert!(answered > 0);
+        let saved = bob
+            .msgs()
+            .into_iter()
+            .find_map(|m| match m {
+                ServerMsg::GameSaved { compute, .. } => Some(compute),
+                _ => None,
+            })
+            .expect("not saved");
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "🐍 alice");
+        assert_eq!(saved[0].device, "test phone");
+        assert_eq!(saved[0].moves, u32::try_from(answered).unwrap());
+    }
+
+    /// Bots on one device think in parallel, a worker each, until they
+    /// outnumber its threads; then they share the time.
+    #[tokio::test]
+    async fn bots_share_the_window_when_they_outnumber_threads() {
+        fn windows(cores: u32) -> Vec<u32> {
+            let mut s = session();
+            let mut alice = join(&mut s, "alice");
+            benchmark(&mut s, &alice, cores);
+            say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Hard));
+            say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Hard));
+            start(&mut s, &[&alice]);
+            alice.requests().iter().map(|r| r.think_ms).collect()
+        }
+        // Half of the default 1s tick each, with threads to spare.
+        assert_eq!(windows(8), [500, 500]);
+        // Two cores leave one thread for the two of them.
+        assert_eq!(windows(2), [250, 250]);
+    }
+
+    /// A bad checksum or an answer to someone else's request is a strike;
+    /// three and the device stops hosting, until the next game.
+    #[tokio::test]
+    async fn misbehaving_hosts_are_struck_off() {
+        let logs = Logs::capture();
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+        benchmark(&mut s, &alice, 8);
+        for _ in 0..4 {
+            say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Easy));
+        }
+        start(&mut s, &[&alice, &bob]);
+
+        let mut requests = alice.requests();
+        let request = requests.remove(0);
+        let bot = request.bot.clone();
+        // Bob answers alice's request.
+        say(&mut s, &bob, request.answer());
+        assert!(logs.has(&["strike", "answered another host's request"]));
+        assert!(!s.game.as_ref().unwrap().pending.contains_key(&bot));
+
+        // Alice gets the checksum wrong on the other three.
+        for request in requests {
+            say(&mut s, &alice, request.answer_with(Dir::Up, 12345));
+        }
+        assert!(logs.has(&["bad response checksum", "strikes=3"]));
+        assert!(s.bot_hosts.is_empty(), "a struck-off device still hosts");
+        assert!(s.game.as_ref().unwrap().pending.is_empty());
+        // A bot without a host freezes the game rather than playing blind.
+        let before = s.game.as_ref().unwrap().turns.len();
+        s.tick().await;
+        assert_eq!(s.game.as_ref().unwrap().turns.len(), before);
+        assert_eq!(s.next_tick, None);
+    }
+
+    /// An answer that misses its tick is still recognised: it shrinks the
+    /// host's thinking window, once per request (answers come twice), and
+    /// answering in time earns it back.
+    #[tokio::test]
+    async fn lateness_shrinks_the_window_and_punctuality_restores_it() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+        benchmark(&mut s, &alice, 8);
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Hard));
+        start(&mut s, &[&alice, &bob]);
+
+        let first = alice.requests().pop().unwrap();
+        assert_eq!(first.think_ms, 500);
+        s.tick().await;
+        let second = alice.requests().pop().unwrap();
+        // The first answer turns up a tick late, twice; and bob replays it.
+        say(&mut s, &alice, first.answer());
+        say(&mut s, &alice, first.answer());
+        say(&mut s, &bob, first.answer());
+        say(&mut s, &alice, second.answer());
+        s.tick().await;
+        // Shares of half the tick, which shortens a little every turn.
+        let share = |s: &SessionActor, percent: u32| s.tick_ms_now() * percent / 200;
+        let third = alice.requests().pop().unwrap();
+        assert!(
+            third.think_ms.abs_diff(share(&s, 75)) <= 1,
+            "0.7 for the late one, +0.05 for the next: {}",
+            third.think_ms
+        );
+        say(&mut s, &alice, third.answer());
+        s.tick().await;
+        let fourth = alice.requests().pop().unwrap();
+        assert!(
+            fourth.think_ms.abs_diff(share(&s, 80)) <= 1,
+            "{}",
+            fourth.think_ms
+        );
+    }
+
+    /// A device that goes quiet without saying so is presumed asleep after
+    /// two missed ticks, and the first sign of life brings it back.
+    #[tokio::test]
+    async fn a_silent_host_is_presumed_asleep_until_it_speaks() {
+        let logs = Logs::capture();
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+        benchmark(&mut s, &alice, 8);
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Easy));
+        start(&mut s, &[&alice, &bob]);
+        s.tick().await;
+        s.tick().await;
+        assert!(logs.has(&["no answer before the tick", "bot=bot-1"]));
+        assert!(logs.has(&["silent for two ticks"]));
+        assert!(s.bot_hosts.is_empty());
+        // The tick that wrote it off still went ahead; the next one doesn't.
+        let turns = s.game.as_ref().unwrap().turns.len();
+        s.tick().await;
+        assert_eq!(s.game.as_ref().unwrap().turns.len(), turns);
+        assert_eq!(s.next_tick, None, "ticking on with nobody thinking");
+
+        alice.msgs();
+        s.handle(Cmd::Alive {
+            conn_id: alice.conn_id,
+        });
+        assert!(logs.has(&["awake again"]));
+        assert!(s.next_tick.is_some(), "the game didn't resume");
+        s.tick().await;
+        assert_eq!(alice.requests().len(), 1);
+    }
+
+    /// A device that says its page is hidden stops being asked; saying it's
+    /// back restarts the game it was holding up.
+    #[tokio::test]
+    async fn a_hidden_page_stops_hosting_until_it_returns() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        benchmark(&mut s, &alice, 8);
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Easy));
+        start(&mut s, &[&alice]);
+        say(
+            &mut s,
+            &alice,
+            ClientMsg::HostAvailable { can_compute: false },
+        );
+        alice.msgs();
+        s.tick().await;
+        assert!(alice.msgs().is_empty(), "ticked with the only host hidden");
+        // Keepalives from a hidden page don't count as it being back.
+        s.handle(Cmd::Alive {
+            conn_id: alice.conn_id,
+        });
+        assert_eq!(s.next_tick, None);
+        say(
+            &mut s,
+            &alice,
+            ClientMsg::HostAvailable { can_compute: true },
+        );
+        assert!(s.next_tick.is_some());
+    }
+
+    /// With nobody watching, the game waits; the first one back restarts it.
+    #[tokio::test]
+    async fn a_game_nobody_is_watching_waits_for_someone() {
+        let mut s = session();
+        let alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+        start(&mut s, &[&alice, &bob]);
+        for p in [&alice, &bob] {
+            s.handle(Cmd::Disconnect { conn_id: p.conn_id });
+        }
+        s.tick().await;
+        assert_eq!(s.game.as_ref().unwrap().turns.len(), 1);
+        assert_eq!(s.next_tick, None);
+        assert!(s.empty_deadline.is_some());
+
+        let mut alice = join_as(&mut s, "alice-id", "alice");
+        assert!(s.next_tick.is_some());
+        assert_eq!(s.empty_deadline, None);
+        assert!(s.away.contains_key("bob-id") && !s.away.contains_key("alice-id"));
+        assert!(
+            alice
+                .msgs()
+                .iter()
+                .any(|m| matches!(m, ServerMsg::GameInProgress { .. }))
+        );
+    }
+
+    /// The beat is kept from when each tick was due. One that falls more
+    /// than a period behind skips ahead instead of firing catch-up ticks.
+    #[tokio::test]
+    async fn a_stalled_clock_skips_ahead_rather_than_catching_up() {
+        let mut s = session();
+        let alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+        start(&mut s, &[&alice, &bob]);
+        let due = Instant::now();
+        s.next_tick = Some(due);
+        s.tick().await;
+        // At the speed the game has reached (see `GameConfig::tick_ms_at`).
+        let period = Duration::from_millis(u64::from(s.tick_ms_now()));
+        assert_eq!(s.next_tick, Some(due + period), "on the beat");
+
+        let long_ago = Instant::now().checked_sub(period * 5).unwrap();
+        s.next_tick = Some(long_ago);
+        s.tick().await;
+        let next = s.next_tick.unwrap();
+        assert!(next > Instant::now(), "a catch-up tick was scheduled");
+        assert!(next <= Instant::now() + period);
+    }
+
+    /// Someone hosting bots without a seat (the lobby was full) is
+    /// credited for their work all the same.
+    #[tokio::test]
+    async fn a_spectating_host_is_credited_too() {
+        let mut s = session();
+        let alice = join(&mut s, "alice");
+        for _ in 0..7 {
+            say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Easy));
+        }
+        let mut carol = join(&mut s, "carol");
+        benchmark(&mut s, &carol, 64);
+        start(&mut s, &[&alice]);
+        while s.game.is_some() {
+            for r in carol.requests() {
+                say(&mut s, &carol, r.answer());
+            }
+            s.tick().await;
+        }
+        let compute = carol
+            .msgs()
+            .into_iter()
+            .find_map(|m| match m {
+                ServerMsg::GameSaved { compute, .. } => Some(compute),
+                _ => None,
+            })
+            .expect("not saved");
+        assert_eq!(compute[0].name, "departed");
+        assert!(compute[0].moves > 0);
+    }
+
+    /// The registry's view: one actor per session, listed while someone is
+    /// in it, a fresh one for a session whose actor has just gone.
+    #[tokio::test]
+    async fn the_registry_lists_sessions_with_someone_in_them() {
+        let db = Arc::new(Db::open(&temp_path("registry.db")).unwrap());
+        let registry = Registry::new(db);
+        let mut watch = registry.watch_games();
+        assert!(registry.active_sessions().is_empty());
+
+        // An actor that has just exited, still in the map.
+        let (dead, _) = mpsc::channel(1);
+        lock(&registry.inner).insert("zed".to_owned(), dead);
+
+        let (tx, mut rx) = conn_channel();
+        let actor = registry
+            .connect("zed", 1, profile("z-id", "zoe"), "ip".to_owned(), tx)
+            .await;
+        actor
+            .send(Cmd::Msg {
+                conn_id: 1,
+                msg: ClientMsg::Ping(5),
+            })
+            .await
+            .unwrap();
+        let mut ponged = false;
+        while let Some(Frame::Control(bytes)) = rx.recv().await {
+            if matches!(decode(&bytes), Some(ServerMsg::Pong(5))) {
+                ponged = true;
+                break;
+            }
+        }
+        assert!(ponged, "the replacement session isn't answering");
+
+        watch.changed().await.unwrap();
+        let listed = watch.borrow_and_update().clone();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "zed");
+        assert_eq!(listed[0].emojis.len(), 1, "zoe isn't listed in it");
+        assert_eq!(registry.active_sessions(), listed);
+    }
+
+    /// A dropped connection keeps its seat for a while, then gives it up;
+    /// a session left empty is tidied away a minute later.
+    #[tokio::test(start_paused = true)]
+    async fn seats_and_sessions_outlast_a_dropped_connection_for_a_while() {
+        let db = Arc::new(Db::open(&temp_path("grace.db")).unwrap());
+        let registry = Registry::new(db);
+        let connect = |id: &str, conn_id| {
+            let (tx, rx) = conn_channel();
+            let registry = registry.clone();
+            let profile = profile(&format!("{id}-id"), id);
+            async move {
+                let actor = registry
+                    .connect("grace", conn_id, profile, "ip".to_owned(), tx)
+                    .await;
+                (actor, rx)
+            }
+        };
+        let (actor, _alice_rx) = connect("alice", 1).await;
+        let (_, mut bob_rx) = connect("bob", 2).await;
+        actor
+            .send(Cmd::Msg {
+                conn_id: 1,
+                msg: ClientMsg::SetReady(true),
+            })
+            .await
+            .unwrap();
+        actor.send(Cmd::Disconnect { conn_id: 1 }).await.unwrap();
+
+        let latest_lobby = |rx: &mut mpsc::Receiver<Frame>| {
+            let mut last = None;
+            while let Ok(Frame::Control(bytes)) = rx.try_recv() {
+                if let Some(ServerMsg::Lobby(l)) = decode(&bytes) {
+                    last = Some(l);
+                }
+            }
+            last
+        };
+        tokio::time::sleep(Duration::from_secs(44)).await;
+        let lobby = latest_lobby(&mut bob_rx).unwrap();
+        assert_eq!(lobby.players.len(), 2, "alice's seat went early");
+        assert_eq!(lobby.ready, ["alice-id"]);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let lobby = latest_lobby(&mut bob_rx).expect("nobody was told");
+        assert_eq!(lobby.players.len(), 1, "alice's seat was never released");
+        assert!(lobby.ready.is_empty());
+
+        // Bob goes too: the session lingers a minute, then it's gone.
+        actor.send(Cmd::Disconnect { conn_id: 2 }).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert!(lock(&registry.inner).contains_key("grace"));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!lock(&registry.inner).contains_key("grace"));
+        assert!(registry.active_sessions().is_empty());
+
+        // Coming back now is a fresh lobby.
+        let (_, mut rx) = connect("alice", 3).await;
+        tokio::task::yield_now().await;
+        let lobby = latest_lobby(&mut rx).unwrap();
+        assert_eq!(lobby.players.len(), 1);
+        assert!(lobby.ready.is_empty());
+    }
 }

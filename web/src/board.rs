@@ -13,8 +13,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use wasm_bindgen::JsCast;
 
-const CHECKER_A: &str = "#dcedc8";
-const CHECKER_B: &str = "#cfe6b8";
+/// The board's two field colours, alternating cell by cell.
+pub(crate) const CHECKER_A: &str = "#dcedc8";
+/// See [`CHECKER_A`].
+pub(crate) const CHECKER_B: &str = "#cfe6b8";
 
 // Vertical centering uses dy="0.36em" instead of dominant-baseline, which
 // WebKit ignores on SVG <text> — dy is honoured identically everywhere.
@@ -24,7 +26,9 @@ fn emoji_text(x: f64, y: f64, size: f64, glyph: &str) -> String {
     )
 }
 
-fn number_text(x: f64, y: f64, value: &str) -> String {
+/// A number drawn on a snek's body the way the board draws length and
+/// health: small, bold, centred in its cell.
+pub(crate) fn number_text(x: f64, y: f64, value: &str) -> String {
     format!(
         r##"<text x="{x}" y="{y}" dy="0.36em" font-size="0.44" font-weight="bold" font-family="snek mono, monospace" fill="#000" text-anchor="middle">{value}</text>"##
     )
@@ -227,14 +231,15 @@ fn clashes_svg(grid: Grid, turn: &Turn, emoji_of: &HashMap<&str, &str>) -> Strin
     clashes
 }
 
-/// The spotlight: a white veil over everything drawn so far, my snek
+/// The spotlight, as its own layer (`.spot`, shown only while the board
+/// is `.spotlit`): a white veil over everything drawn so far, my snek
 /// (`mine`) on top of it, a red box around my head and "you!" over it
 /// (under it if the head is on the top row and there's no room above).
 fn spotlight_svg(grid: Grid, head: Pos, mine: &str) -> String {
     let (x, y) = (f64::from(grid.x(head)), f64::from(grid.y(head)));
     let label_y = if y <= 1.0 { y + 1.75 } else { y - 0.55 };
     format!(
-        r##"<rect x="0" y="0" width="{w}" height="{h}" fill="#fff" opacity="0.72"/>{mine}<rect x="{bx}" y="{by}" width="1.36" height="1.36" fill="none" stroke="#e00" stroke-width="0.14"/><text x="{tx}" y="{label_y}" font-size="0.8" font-weight="bold" font-family="snek mono, monospace" fill="#e00" stroke="#fff" stroke-width="0.12" paint-order="stroke" text-anchor="middle">you!</text>"##,
+        r##"<g class="spot"><rect x="0" y="0" width="{w}" height="{h}" fill="#fff" opacity="0.72"/>{mine}<rect x="{bx}" y="{by}" width="1.36" height="1.36" fill="none" stroke="#e00" stroke-width="0.14"/><text x="{tx}" y="{label_y}" font-size="0.8" font-weight="bold" font-family="snek mono, monospace" fill="#e00" stroke="#fff" stroke-width="0.12" paint-order="stroke" text-anchor="middle">you!</text></g>"##,
         w = grid.w,
         h = grid.h,
         bx = x - 0.18,
@@ -243,7 +248,30 @@ fn spotlight_svg(grid: Grid, head: Pos, mine: &str) -> String {
     )
 }
 
-pub(crate) fn board_view<F: Fn(Pos) + Copy + 'static>(
+/// What a board shows on top of the field: the "you!" spotlight, drawn in
+/// but only shown while `spot_on` says so, and anything else laid over the
+/// board's middle (the countdown).
+pub(crate) struct Extras<V> {
+    /// Draw the spotlight layer at all (before the first tick).
+    pub spotlight: bool,
+    /// Whether it's showing right now.
+    pub spot_on: Signal<bool>,
+    /// Laid over the board, centred on it.
+    pub overlay: V,
+}
+
+impl Extras<()> {
+    /// A plain board: no spotlight, nothing over it.
+    pub(crate) fn none() -> Self {
+        Self {
+            spotlight: false,
+            spot_on: Signal::stored(false),
+            overlay: (),
+        }
+    }
+}
+
+pub(crate) fn board_view<F: Fn(Pos) + Copy + 'static, V: IntoView + 'static>(
     config: &GameConfig,
     players: &[PlayerProfile],
     turn: &Turn,
@@ -251,9 +279,14 @@ pub(crate) fn board_view<F: Fn(Pos) + Copy + 'static>(
     // Before the first tick: grey out everything but my snek and put a red
     // box and a "you!" over it, so nobody spends the start looking for
     // themselves.
-    spotlight: bool,
+    extras: Extras<V>,
     on_cell: F,
-) -> impl IntoView + use<F> {
+) -> impl IntoView + use<F, V> {
+    let Extras {
+        spotlight,
+        spot_on,
+        overlay,
+    } = extras;
     let grid = Grid {
         w: u16::from(config.board_width),
         h: u16::from(config.board_height),
@@ -277,7 +310,8 @@ pub(crate) fn board_view<F: Fn(Pos) + Copy + 'static>(
         .collect();
 
     // --- sneks ------------------------------------------------------------
-    // Spotlit, my snek is drawn apart from the rest, to go over the veil.
+    // With a spotlight, my snek is also drawn a second time, in the
+    // spotlight's layer over the veil.
     let my_head = turn
         .snakes
         .get(my_id)
@@ -286,15 +320,17 @@ pub(crate) fn board_view<F: Fn(Pos) + Copy + 'static>(
     let mut sneks = String::new();
     let mut mine = String::new();
     for (player_id, snake) in &turn.snakes {
-        let spotlit = my_head.is_some() && player_id == my_id;
-        let out = if spotlit { &mut mine } else { &mut sneks };
-        out.push_str(&snek_svg(
+        let drawn = snek_svg(
             grid,
             snake,
             turn.health.get(player_id).copied().unwrap_or(0),
             colour_of.get(player_id.as_str()).copied().unwrap_or("#999"),
             emoji_of.get(player_id.as_str()).copied().unwrap_or("🐍"),
-        ));
+        );
+        if my_head.is_some() && player_id == my_id {
+            mine.clone_from(&drawn);
+        }
+        sneks.push_str(&drawn);
     }
 
     let clashes = clashes_svg(grid, turn, &emoji_of);
@@ -313,12 +349,15 @@ pub(crate) fn board_view<F: Fn(Pos) + Copy + 'static>(
     view! {
         <div
             class="board-wrap"
+            class:spotlit=move || spot_on.get()
             on:click=move |ev: web_sys::MouseEvent| {
                 if let Some(pos) = grid.cell_at(&ev) {
                     on_cell(pos);
                 }
             }
-            inner_html=svg
-        ></div>
+        >
+            <div class="board-svg" inner_html=svg></div>
+            {overlay}
+        </div>
     }
 }

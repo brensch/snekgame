@@ -49,7 +49,7 @@ pub fn build_endpoint(port: u16, identity: &Identity) -> anyhow::Result<Endpoint
 /// Accept sessions forever, one task each. A session that fails only ends
 /// itself, so its error is logged at debug: a client vanishing mid-join is
 /// routine, not news.
-pub async fn serve(endpoint: Endpoint<Server>, registry: Registry) {
+pub async fn serve(endpoint: Arc<Endpoint<Server>>, registry: Registry) {
     loop {
         let incoming = endpoint.accept().await;
         let registry = registry.clone();
@@ -383,7 +383,8 @@ pub fn public_id(secret: &str) -> String {
         })
 }
 
-/// Session words: lowercase letters/digits/dashes, 1..=24 chars.
+/// Session names: lowercase letters/digits/dashes, 1..=48 chars (three
+/// words fit).
 #[must_use]
 pub fn normalize_session(raw: &str) -> Option<String> {
     let s: String = raw
@@ -391,7 +392,7 @@ pub fn normalize_session(raw: &str) -> Option<String> {
         .to_lowercase()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .take(24)
+        .take(48)
         .collect();
     if s.is_empty() { None } else { Some(s) }
 }
@@ -405,17 +406,17 @@ fn valid_profile(p: &PlayerProfile) -> bool {
         && p.colour.len() <= 32
 }
 
-/// Load the TLS identity: real certs if the env points at them, otherwise a
-/// self-signed one (dev / tests).
+/// Load the TLS identity: the certificate and key in `tls`, or a
+/// self-signed one (dev / tests) if there are none.
 ///
 /// # Errors
 ///
 /// Fails if the PEM files can't be read or parsed, or a self-signed
 /// identity can't be generated.
-pub async fn load_identity() -> anyhow::Result<Identity> {
-    if let (Ok(cert), Ok(key)) = (std::env::var("SNEK_CERT"), std::env::var("SNEK_KEY")) {
-        let identity = Identity::load_pemfiles(&cert, &key).await?;
-        tracing::info!("loaded TLS identity from {cert}");
+pub async fn load_identity(tls: Option<&crate::TlsFiles>) -> anyhow::Result<Identity> {
+    if let Some(files) = tls {
+        let identity = Identity::load_pemfiles(&files.cert, &files.key).await?;
+        tracing::info!("loaded TLS identity from {}", files.cert.display());
         Ok(identity)
     } else {
         tracing::warn!("SNEK_CERT/SNEK_KEY unset — using a self-signed identity");

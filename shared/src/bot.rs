@@ -51,13 +51,15 @@ pub const fn budget_ms(difficulty: BotDifficulty) -> u32 {
     }
 }
 
-const C_UCT: f32 = 1.2;
+/// The shipped UCB exploration constant.
+pub const C_UCT: f32 = 1.2;
 const DRAW_VALUE: f32 = -0.25;
 const MAX_SIMS: usize = 200_000;
 /// Tree size cap, counting nodes carried over from earlier turns: a node is
 /// a few hundred bytes, and a phone's tab must not balloon.
 const MAX_NODES: usize = 150_000;
-const MAX_SNAKES: usize = 8;
+/// The most snakes a search handles (the server seats at most this many).
+pub const MAX_SNAKES: usize = 8;
 
 // Voronoi blend weights (positive terms sum to 0.85; trap only subtracts).
 const W_AREA: f32 = 0.40;
@@ -87,16 +89,11 @@ pub fn think(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32, nonce: 
     };
     let board = FastBoard::from_turn(config, turn, &order);
 
-    let root_cands = safe_candidates(&board, me_idx);
-    match root_cands.len() {
-        0 => return (Dir::Up, fnv1a(&[nonce, 1])),
-        1 => {
-            let d = root_cands[0];
-            return (d, fnv1a(&[nonce, 2, dir_index(d)]));
-        }
-        _ => {}
+    // Never empty (see `candidates`), so one move or a real choice.
+    if let &[d] = &*safe_candidates(&board, me_idx) {
+        return (d, fnv1a(&[nonce, 2, dir_index(d)]));
     }
-    search(&board, me_idx, sims as usize, nonce, EVAL)
+    search(&board, me_idx, sims as usize, nonce)
 }
 
 /// The response checksum a compute host must include: binds the server's
@@ -136,15 +133,13 @@ fn fnv1a(words: &[u64]) -> u64 {
 /// Bit-exact `ln` across native and wasm: IEEE mul/add/div/sqrt are exactly
 /// rounded everywhere, but libm's `ln` is not — so UCB uses this polynomial
 /// (exponent split + cubic in the mantissa). Accuracy ~1e-3, plenty for
-/// exploration terms; determinism is the point.
+/// exploration terms; determinism is the point. Only for `x >= 1` (UCB
+/// passes a visit total plus one), so the sign and zero cases never arise.
 #[expect(
     clippy::suboptimal_flops,
     reason = "mul_add rounds differently (moving every search result) and is a slow libm call on wasm"
 )]
 fn fast_ln(x: f32) -> f32 {
-    if x <= 0.0 {
-        return 0.0;
-    }
     let bits = x.to_bits();
     // Shifting out the sign bit leaves the biased exponent in the top byte.
     let exponent = f32::from((bits << 1).to_be_bytes()[0]) - 127.0;
@@ -176,8 +171,11 @@ impl Snake {
     }
 }
 
+/// A position as the search sees it: the engine's rules on indexed state,
+/// with no food spawns. Public so the tuning tools in `examples/` can time
+/// and score positions directly; its insides stay private.
 #[derive(Clone)]
-struct FastBoard {
+pub struct FastBoard {
     w: u16,
     h: u16,
     snakes: Vec<Snake>,
@@ -188,7 +186,10 @@ struct FastBoard {
 }
 
 impl FastBoard {
-    fn from_turn(config: &GameConfig, turn: &Turn, order: &[&PlayerId]) -> Self {
+    /// The board of `turn`, with snake `k` being player `order[k]` (every
+    /// one of them alive in `turn`).
+    #[must_use]
+    pub fn from_turn(config: &GameConfig, turn: &Turn, order: &[&PlayerId]) -> Self {
         let snakes = order
             .iter()
             .map(|p| Snake {
@@ -260,8 +261,9 @@ impl FastBoard {
     /// One tick of the real rules (minus random food spawns): wall/self
     /// deaths resolve first and their corpses leave the board (a snake that
     /// died this tick cannot kill anyone), then head-on/body collisions
-    /// among the survivors, then eating and starvation.
-    fn step(&mut self, moves: &[Dir]) {
+    /// among the survivors, then eating and starvation. `moves[k]` is snake
+    /// `k`'s move (ignored once it is dead).
+    pub fn step(&mut self, moves: &[Dir]) {
         let n = self.snakes.len();
 
         // Movement (tail pops before self-check, exactly like the engine);
@@ -354,9 +356,10 @@ fn last_dir(board: &FastBoard, i: usize) -> Option<Dir> {
 }
 
 /// Up to four moves, inline: candidate lists are built for every snake at
-/// every node, so they must never touch the heap.
+/// every node, so they must never touch the heap. Reads as a slice of
+/// moves.
 #[derive(Clone, Copy)]
-struct Cands {
+pub struct Cands {
     dirs: [Dir; 4],
     n: u8,
 }
@@ -390,8 +393,9 @@ impl IntoIterator for Cands {
 }
 
 /// Non-reversing, on-board, non-wall moves; a trapped snake keeps all four
-/// (the search picks the least bad); the dead get a dummy.
-fn candidates(board: &FastBoard, i: usize) -> Cands {
+/// (the search picks the least bad); the dead get a dummy. Never empty.
+#[must_use]
+pub fn candidates(board: &FastBoard, i: usize) -> Cands {
     let mut v = Cands::empty();
     if !board.snakes[i].alive {
         v.push(Dir::Up);
@@ -455,10 +459,13 @@ fn safe_candidates(board: &FastBoard, i: usize) -> Cands {
 // Decoupled-UCT search over joint moves
 // ---------------------------------------------------------------------------
 
+/// One position in the search tree.
+///
 /// Per-snake statistics live inline (four moves at most); children are a
 /// short list keyed by the joint move — a node rarely has more than a
-/// dozen, and a linear scan of a few words beats hashing.
-struct Node {
+/// dozen, and a linear scan of a few words beats hashing. Public only so
+/// the profiling example can time building one.
+pub struct Node {
     board: FastBoard,
     cands: [Cands; MAX_SNAKES],
     /// (visits, summed value) per snake per candidate, at `i * 4 + c` —
@@ -471,7 +478,9 @@ struct Node {
 }
 
 impl Node {
-    fn new(board: FastBoard) -> Self {
+    /// A fresh, unvisited node for `board`, its candidates already pruned.
+    #[must_use]
+    pub fn new(board: FastBoard) -> Self {
         let terminal = board.is_terminal();
         let mut cands = [Cands::empty(); MAX_SNAKES];
         for (i, c) in cands.iter_mut().enumerate().take(board.snakes.len()) {
@@ -525,7 +534,9 @@ impl Node {
     }
 }
 
-type EvalFn = fn(&FastBoard) -> [f32; MAX_SNAKES];
+/// A leaf evaluation: a value in [-1, 1] for every snake on the board, by
+/// board index.
+pub type EvalFn = fn(&FastBoard) -> [f32; MAX_SNAKES];
 /// The production evaluation.
 const EVAL: EvalFn = evaluate;
 
@@ -568,6 +579,43 @@ impl Search {
     #[must_use]
     pub const fn tree_size(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Roughly what the tree's nodes allocate beyond their inline size, in
+    /// bytes: statistics, children lists, snakes, bodies and food. Together
+    /// with `size_of::<Node>()` a node apiece, it is what [`MAX_NODES`]
+    /// keeps a phone's tab from ballooning past.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|n| {
+                n.stats.capacity() * size_of::<[f32; 2]>()
+                    + n.children.capacity() * size_of::<(u32, u32)>()
+                    + n.board.snakes.capacity() * size_of::<Snake>()
+                    + n.board
+                        .snakes
+                        .iter()
+                        .map(|s| s.body.capacity() * size_of::<u16>())
+                        .sum::<usize>()
+                    + n.board.food.capacity() * size_of::<u16>()
+            })
+            .sum()
+    }
+
+    /// Score leaves with `eval` instead of the shipped [`evaluate`]: how
+    /// the arena examples pit tunings against each other.
+    #[must_use]
+    pub fn with_eval(mut self, eval: EvalFn) -> Self {
+        self.eval = eval;
+        self
+    }
+
+    /// Explore with `c_uct` instead of [`C_UCT`].
+    #[must_use]
+    pub const fn with_c_uct(mut self, c_uct: f32) -> Self {
+        self.c_uct = c_uct;
+        self
     }
 
     /// The chosen move and its proof. Valid once `step` has returned true.
@@ -656,7 +704,7 @@ fn readout(nodes: &[Node], me: usize, nonce: u64) -> (Dir, u64) {
     (dir, fnv1a(&words))
 }
 
-fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64, eval: EvalFn) -> (Dir, u64) {
+fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64) -> (Dir, u64) {
     let mut s = Search {
         nodes: vec![Node::new(root.clone())],
         path: Vec::with_capacity(64),
@@ -664,7 +712,7 @@ fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64, eval: EvalFn
         me,
         remaining: max_sims.min(MAX_SIMS),
         nonce,
-        eval,
+        eval: EVAL,
         c_uct: C_UCT,
         immediate: None,
     };
@@ -714,37 +762,31 @@ pub fn begin_from(
     };
     let refs: Vec<&PlayerId> = order.iter().collect();
     let board = FastBoard::from_turn(config, turn, &refs);
-    let cands = safe_candidates(&board, me_idx);
-    match cands.len() {
-        0 => finished((Dir::Up, fnv1a(&[nonce, 1]))),
-        1 => {
-            let d = cands[0];
-            finished((d, fnv1a(&[nonce, 2, dir_index(d)])))
-        }
-        _ => {
-            let nodes = prev
-                .filter(|p| p.immediate.is_none() && p.order == order && !p.nodes.is_empty())
-                .and_then(|p| {
-                    let next = p.nodes[0]
-                        .children
-                        .iter()
-                        .map(|&(_, id)| id as usize)
-                        .find(|&id| p.nodes[id].board.same_position(&board))?;
-                    Some(reroot(p.nodes, next))
-                })
-                .unwrap_or_else(|| vec![Node::new(board)]);
-            Search {
-                nodes,
-                path: Vec::with_capacity(64),
-                order,
-                me: me_idx,
-                remaining: (sims as usize).min(MAX_SIMS),
-                nonce,
-                eval: EVAL,
-                c_uct: C_UCT,
-                immediate: None,
-            }
-        }
+    // Never empty (see `candidates`), so one move or a real choice.
+    if let &[d] = &*safe_candidates(&board, me_idx) {
+        return finished((d, fnv1a(&[nonce, 2, dir_index(d)])));
+    }
+    let nodes = prev
+        .filter(|p| p.immediate.is_none() && p.order == order && !p.nodes.is_empty())
+        .and_then(|p| {
+            let next = p.nodes[0]
+                .children
+                .iter()
+                .map(|&(_, id)| id as usize)
+                .find(|&id| p.nodes[id].board.same_position(&board))?;
+            Some(reroot(p.nodes, next))
+        })
+        .unwrap_or_else(|| vec![Node::new(board)]);
+    Search {
+        nodes,
+        path: Vec::with_capacity(64),
+        order,
+        me: me_idx,
+        remaining: (sims as usize).min(MAX_SIMS),
+        nonce,
+        eval: EVAL,
+        c_uct: C_UCT,
+        immediate: None,
     }
 }
 
@@ -780,44 +822,48 @@ fn reroot(nodes: Vec<Node>, root: usize) -> Vec<Node> {
 const UNCLAIMED: u8 = u8::MAX;
 const CONTESTED: u8 = u8::MAX - 1;
 
+/// The evaluation's knobs.
+///
 /// Length-awareness experiments, ablated: `growth` makes food urgency
 /// scale with a length deficit (not just hunger); `length_heavy` shifts
-/// weight from health onto relative length. `evaluate` is the incumbent.
+/// weight from health onto relative length. Public so the arena examples
+/// can pit variants against [`TUNING`].
 #[derive(Clone, Copy, PartialEq)]
-struct Tuning {
+pub struct Tuning {
     /// Strength of length-deficit food urgency (0.0 = hunger only).
-    growth: f32,
-    length_heavy: bool,
+    pub growth: f32,
+    /// Move weight from health onto relative length.
+    pub length_heavy: bool,
     /// Treat "not strictly longer than the biggest rival" as maximum
     /// growth urgency: +1 is the head-on threshold (equal length kills
     /// both, +1 wins outright), so parity is not good enough.
-    bully_target: bool,
+    pub bully_target: bool,
     /// Multiplier on growth urgency while everyone is still short — the
     /// early game is when a length lead is cheapest to win and most
     /// punishing to hold (1.0 = off).
-    early_boost: f32,
+    pub early_boost: f32,
     /// Explicit value for standing at the head-on threshold: rewards being
     /// strictly longer, penalises exact parity (mutual death) (0.0 = off).
-    dominance: f32,
+    pub dominance: f32,
     /// Longest snake on the board below which the early boost applies.
-    early_until: f32,
+    pub early_until: f32,
     /// Continuous food model: appetite (baseline + hunger + length
     /// deficit) times a smooth proximity gradient, instead of the old
     /// saturating can-I-reach-it-before-starving term.
-    gradient_food: bool,
+    pub gradient_food: bool,
     /// Appetite of a healthy snake at parity — what makes it eat
     /// opportunistically while doing space control.
-    appetite_base: f32,
+    pub appetite_base: f32,
     /// Distance scale of the proximity gradient (cells).
-    food_scale: f32,
+    pub food_scale: f32,
     /// Weight of food we only *tie* the race to (contested) versus food we
     /// outright own. Contested food is risky, not invisible — at a
     /// symmetric start the centre food is contested by everyone.
-    contested_food: f32,
+    pub contested_food: f32,
 }
 
 /// Shipping tuning: one continuous appetite, no thresholds. Every value
-/// earned in two-seat deterministic duels (see the `arena_*` tests).
+/// earned in two-seat deterministic duels (see `examples/arena.rs`).
 ///
 /// The food term is `appetite × proximity`, where appetite = a baseline
 /// (opportunistic eating while doing space control) + hunger + length
@@ -839,7 +885,7 @@ struct Tuning {
 /// The pre-gradient knobs below it (`growth`, `early_boost`, `dominance`,
 /// `length_heavy`, `bully_target`) are inert here and survive only as
 /// arena benchmarks documenting what lost.
-const TUNING: Tuning = Tuning {
+pub const TUNING: Tuning = Tuning {
     growth: 0.0,
     length_heavy: false,
     bully_target: false,
@@ -852,107 +898,10 @@ const TUNING: Tuning = Tuning {
     contested_food: 0.6,
 };
 
-/// The threshold-based tuning this replaced (growth urgency + a 1.6x boost
-/// under length 9), kept as the arena's benchmark opponent.
-#[cfg(test)]
-const PRE_GRADIENT: Tuning = Tuning {
-    growth: 0.7,
-    early_boost: 1.6,
-    gradient_food: false,
-    appetite_base: 0.0,
-    contested_food: 0.0,
-    ..TUNING
-};
-
-/// The original evaluation, before any length awareness.
-#[cfg(test)]
-const LEGACY: Tuning = Tuning {
-    growth: 0.0,
-    length_heavy: false,
-    bully_target: false,
-    early_boost: 1.0,
-    dominance: 0.0,
-    early_until: 9.0,
-    gradient_food: false,
-    appetite_base: 0.0,
-    food_scale: 5.0,
-    contested_food: 0.0,
-};
-
-// Experiments, each isolated against the tuning it challenged.
-#[cfg(test)]
-const APPETITE_022: Tuning = Tuning {
-    appetite_base: 0.22,
-    ..TUNING
-};
-#[cfg(test)]
-const APPETITE_060: Tuning = Tuning {
-    appetite_base: 0.60,
-    ..TUNING
-};
-#[cfg(test)]
-const BLIND_CONTESTED: Tuning = Tuning {
-    contested_food: 0.0,
-    ..TUNING
-};
-#[cfg(test)]
-const LENGTH_HEAVY_ONLY: Tuning = Tuning {
-    length_heavy: true,
-    ..LEGACY
-};
-#[cfg(test)]
-const GROWTH_ONLY: Tuning = Tuning {
-    growth: 0.7,
-    ..LEGACY
-};
-#[cfg(test)]
-const BULLY: Tuning = Tuning {
-    bully_target: true,
-    ..PRE_GRADIENT
-};
-
-fn evaluate(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, TUNING)
-}
-
-#[cfg(test)]
-fn evaluate_pre_gradient(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, PRE_GRADIENT)
-}
-
-#[cfg(test)]
-fn evaluate_legacy(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, LEGACY)
-}
-
-#[cfg(test)]
-fn evaluate_appetite_022(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, APPETITE_022)
-}
-
-#[cfg(test)]
-fn evaluate_appetite_060(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, APPETITE_060)
-}
-
-#[cfg(test)]
-fn evaluate_blind_contested(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, BLIND_CONTESTED)
-}
-
-#[cfg(test)]
-fn evaluate_growth_only(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, GROWTH_ONLY)
-}
-
-#[cfg(test)]
-fn evaluate_length_heavy(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, LENGTH_HEAVY_ONLY)
-}
-
-#[cfg(test)]
-fn evaluate_bully(board: &FastBoard) -> [f32; MAX_SNAKES] {
-    evaluate_impl(board, BULLY)
+/// The production evaluation: [`evaluate_tuned`] with [`TUNING`].
+#[must_use]
+pub fn evaluate(board: &FastBoard) -> [f32; MAX_SNAKES] {
+    evaluate_tuned(board, TUNING)
 }
 
 /// Buffers the evaluation reuses on every call (one set per thread). An
@@ -983,7 +932,11 @@ thread_local! {
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
 }
 
-fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
+/// The time-expanded Voronoi blend under `tuning`: per-snake values in
+/// [-1, 1] by board index (the dead get -1, a sole survivor +1, a board with
+/// nobody left the draw value all round).
+#[must_use]
+pub fn evaluate_tuned(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
     SCRATCH.with(|scratch| evaluate_with(&mut scratch.borrow_mut(), board, tuning))
 }
 
@@ -1377,9 +1330,9 @@ fn reachable_cells(
 mod tests {
     use super::*;
     use crate::engine::Engine;
+    use crate::rng::Rng;
     use crate::types::DEFAULT_FOOD;
     use std::collections::BTreeMap;
-    use std::hint::black_box;
 
     fn config() -> GameConfig {
         GameConfig {
@@ -1388,6 +1341,39 @@ mod tests {
             tick_ms: 1000,
             food_emoji: DEFAULT_FOOD.to_owned(),
         }
+    }
+
+    fn sized(width: u8, height: u8) -> GameConfig {
+        GameConfig {
+            board_width: width,
+            board_height: height,
+            ..config()
+        }
+    }
+
+    /// A mid-game turn with these bodies (head first) and health, no food.
+    fn turn_with(snakes: &[(&str, Vec<u16>, u8)]) -> Turn {
+        Turn {
+            turn_number: 20,
+            snakes: snakes
+                .iter()
+                .map(|(p, b, _)| ((*p).to_owned(), b.clone()))
+                .collect(),
+            health: snakes
+                .iter()
+                .map(|(p, _, h)| ((*p).to_owned(), *h))
+                .collect(),
+            alive: snakes.iter().map(|(p, _, _)| (*p).to_owned()).collect(),
+            food: Vec::new(),
+            moves: BTreeMap::new(),
+            clashes: Vec::new(),
+            winners: Vec::new(),
+        }
+    }
+
+    fn board_of(config: &GameConfig, turn: &Turn) -> FastBoard {
+        let order: Vec<&PlayerId> = turn.alive.iter().collect();
+        FastBoard::from_turn(config, turn, &order)
     }
 
     fn play_duel(a_sims: u32, b_sims: u32, seed: u64) -> (u32, u32) {
@@ -1470,16 +1456,11 @@ mod tests {
     /// More simulations must buy strength.
     #[test]
     fn more_sims_win() {
-        let mut strong_wins = 0;
-        let mut weak_wins = 0;
-        for seed in 0..5u64 {
-            let (strong, weak) = play_duel(6000, 300, 42 + seed);
-            if strong > weak {
-                strong_wins += 1;
-            } else if weak > strong {
-                weak_wins += 1;
-            }
-        }
+        let duels: Vec<(u32, u32)> = (0..5u64)
+            .map(|seed| play_duel(6000, 300, 42 + seed))
+            .collect();
+        let strong_wins = duels.iter().filter(|(strong, weak)| strong > weak).count();
+        let weak_wins = duels.iter().filter(|(strong, weak)| weak > strong).count();
         assert!(
             strong_wins > weak_wins,
             "more sims should outlast fewer (strong {strong_wins} vs weak {weak_wins})"
@@ -1542,609 +1523,407 @@ mod tests {
         assert_eq!(board.winner(), Some(1));
     }
 
-    fn think_with(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32, eval: EvalFn) -> Dir {
-        let order: Vec<&PlayerId> = turn.alive.iter().collect();
-        let Some(me_idx) = order.iter().position(|p| *p == me) else {
-            return Dir::Up;
-        };
-        let board = FastBoard::from_turn(config, turn, &order);
-        let cands = safe_candidates(&board, me_idx);
-        match cands.len() {
-            0 => Dir::Up,
-            1 => cands[0],
-            _ => search(&board, me_idx, sims as usize, 0, eval).0,
-        }
+    /// Harder bots think for longer; that is all difficulty is.
+    #[test]
+    fn harder_bots_think_longer() {
+        let [easy, medium, hard] = [
+            BotDifficulty::Easy,
+            BotDifficulty::Medium,
+            BotDifficulty::Hard,
+        ]
+        .map(budget_ms);
+        assert!(
+            0 < easy && easy < medium && medium < hard,
+            "{easy} {medium} {hard}"
+        );
     }
 
-    fn arena_config() -> GameConfig {
-        board_config(11)
+    /// Asked to move for someone who isn't playing (dead, or never was),
+    /// both entry points answer at once with the same placeholder rather
+    /// than searching a world without them.
+    #[test]
+    fn a_player_not_in_the_game_gets_a_placeholder() {
+        let mut engine = Engine::new(config(), vec!["a".into(), "b".into()], 3);
+        let turn = engine.first_turn();
+        let ghost: PlayerId = "ghost".into();
+        let thought = think(&config(), &turn, &ghost, 1_000, 5);
+        let mut s = begin(&config(), &turn, &ghost, 1_000, 5);
+        assert!(s.step(0), "nothing to search");
+        assert_eq!(s.tree_size(), 0);
+        assert_eq!(s.result(), thought);
+        assert_eq!(thought.0, Dir::Up);
+        assert_ne!(
+            think(&config(), &turn, &ghost, 1_000, 6).1,
+            thought.1,
+            "proof must bind the nonce"
+        );
     }
 
-    fn board_config(size: u8) -> GameConfig {
-        GameConfig {
-            board_width: size,
-            board_height: size,
-            tick_ms: 1000,
-            food_emoji: DEFAULT_FOOD.to_owned(),
-        }
-    }
-
-    /// Final length of `p`'s snake (0 if dead), for arena scores.
-    fn final_length(turn: &Turn, p: &PlayerId) -> u32 {
-        turn.snakes
-            .get(p)
-            .map_or(0, |s| u32::try_from(s.len()).unwrap())
-    }
-
-    /// Mean of `total` over `n` games, for arena printouts.
-    fn mean(total: u32, n: usize) -> f64 {
-        f64::from(total) / f64::from(u32::try_from(n).unwrap())
-    }
-
-    /// One deterministic duel. Returns (challenger score, incumbent score)
-    /// where a score is (survival turns, final length) — length breaks the
-    /// "both alive at the cap" ties that make survival-only tests blind.
-    fn duel(
-        challenger: EvalFn,
-        incumbent: EvalFn,
-        sims: u32,
-        seed: u64,
-        swap: bool,
-        board: u8,
-    ) -> ((u32, u32), (u32, u32)) {
-        let cfg = board_config(board);
+    /// Heading up into the top-left corner, the only move that isn't a
+    /// wall or the neck is Right: that's the answer, with no search.
+    #[test]
+    fn a_forced_move_needs_no_search() {
+        // (1,1), (1,2), (1,3) on a 13-wide board.
+        let turn = turn_with(&[("a", vec![14, 27, 40], 80)]);
         let a: PlayerId = "a".into();
-        let b: PlayerId = "b".into();
-        let mut engine = Engine::new(cfg.clone(), vec![a.clone(), b.clone()], seed);
-        let mut turn = engine.first_turn();
-        for _ in 0..250 {
-            if turn.game_over() {
-                break;
-            }
-            let mut moves = BTreeMap::new();
-            for p in [&a, &b] {
-                if !turn.alive.contains(p) {
-                    continue;
-                }
-                let is_challenger = (p == &a) ^ swap;
-                let eval = if is_challenger { challenger } else { incumbent };
-                moves.insert(p.clone(), think_with(&cfg, &turn, p, sims, eval));
-            }
-            turn = engine.next_turn(&turn, &moves);
-        }
-        let score = |p: &PlayerId| {
-            let survived = turn
-                .winners
-                .iter()
-                .find(|w| &w.player == p)
-                .map_or(turn.turn_number, |w| w.survival_turns);
-            (survived, final_length(&turn, p))
-        };
-        if swap {
-            (score(&b), score(&a))
-        } else {
-            (score(&a), score(&b))
-        }
+        let (dir, proof) = think(&config(), &turn, &a, 1_000, 9);
+        assert_eq!(dir, Dir::Right);
+        let mut s = begin(&config(), &turn, &a, 1_000, 9);
+        assert!(s.step(0), "a forced move is already finished");
+        assert_eq!(s.tree_size(), 0);
+        assert_eq!(s.result(), (dir, proof));
     }
 
-    /// Head-to-head arena, parallel across cores. Run with
-    /// `--ignored --nocapture` to see the score.
-    fn run_arena(name: &str, challenger: EvalFn, incumbent: EvalFn, seeds: u64, sims: u32) {
-        run_arena_on(name, challenger, incumbent, seeds, sims, 11);
-    }
-
-    fn run_arena_on(
-        name: &str,
-        challenger: EvalFn,
-        incumbent: EvalFn,
-        seeds: u64,
-        sims: u32,
-        board: u8,
-    ) {
-        let jobs: Vec<(u64, bool)> = (0..seeds)
-            .flat_map(|s| [(100 + s, false), (100 + s, true)])
-            .collect();
-        let results: Vec<((u32, u32), (u32, u32))> = std::thread::scope(|scope| {
-            // Every thread starts before the first join.
-            let mut handles = Vec::new();
-            for chunk in jobs.chunks(jobs.len().div_ceil(12).max(1)) {
-                handles.push(scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|&(seed, swap)| duel(challenger, incumbent, sims, seed, swap, board))
-                        .collect::<Vec<_>>()
-                }));
-            }
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().unwrap())
-                .collect()
-        });
-
-        let (mut wins, mut losses, mut draws) = (0, 0, 0);
-        let (mut ch_len, mut in_len) = (0u32, 0u32);
-        for (ch, inc) in &results {
-            ch_len += ch.1;
-            in_len += inc.1;
-            match ch.cmp(inc) {
-                Ordering::Greater => wins += 1,
-                Ordering::Less => losses += 1,
-                Ordering::Equal => draws += 1,
-            }
-        }
-        let n = results.len();
-        println!(
-            "ARENA {name}: {wins}W {losses}L {draws}D of {n} @ {sims} sims, {board}x{board} \
-             | mean final length {:.1} vs {:.1}",
-            mean(ch_len, n),
-            mean(in_len, n),
-        );
-    }
-
-    /// Do the two evals even disagree? (Sanity check for arena power.)
+    /// The search's board must follow the engine's rules exactly, or the
+    /// bot plans for a game nobody is playing. Random three-snake games,
+    /// stepped on both, must agree on every body, health and death
+    /// (the fast board keeps the dead in place, so that is checked too).
     #[test]
-    #[ignore = "diagnostic: only prints; run with --ignored --nocapture"]
-    fn evals_disagree_often_enough() {
-        let cfg = arena_config();
-        let a: PlayerId = "a".into();
-        let b: PlayerId = "b".into();
-        let mut engine = Engine::new(cfg.clone(), vec![a.clone(), b.clone()], 7);
-        let mut turn = engine.first_turn();
-        let (mut same, mut diff) = (0, 0);
-        for _ in 0..60 {
-            if turn.game_over() {
-                break;
-            }
-            let m1 = think_with(&cfg, &turn, &a, 1_200, evaluate_pre_gradient);
-            let m2 = think_with(&cfg, &turn, &a, 1_200, evaluate);
-            if m1 == m2 {
-                same += 1;
-            } else {
-                diff += 1;
-            }
-            let mut moves = BTreeMap::new();
-            moves.insert(a.clone(), m1);
-            if turn.alive.contains(&b) {
-                moves.insert(b.clone(), think_with(&cfg, &turn, &b, 1_200, evaluate));
-            }
-            turn = engine.next_turn(&turn, &moves);
-        }
-        println!("EVAL DISAGREEMENT: {diff} differ, {same} same");
-    }
-
-    #[test]
-    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
-    fn arena_ablation() {
-        run_arena(
-            "growth-urgency only",
-            evaluate_growth_only,
-            evaluate_legacy,
-            30,
-            1_200,
-        );
-        run_arena(
-            "length-heavy only  ",
-            evaluate_length_heavy,
-            evaluate_legacy,
-            30,
-            1_200,
-        );
-    }
-
-    /// Bully candidates: each isolated against the shipped tuning.
-    #[test]
-    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
-    fn arena_bully_candidates() {
-        run_arena_on(
-            "bully-target",
-            evaluate_bully,
-            evaluate_pre_gradient,
-            30,
-            1_200,
-            13,
-        );
-    }
-
-    /// Does a continuous appetite + proximity gradient beat the shipped
-    /// threshold-based tuning? (And how hungry should a healthy snake be?)
-    #[test]
-    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
-    fn arena_gradient_food() {
-        // The shipped model against the tuning it replaced.
-        run_arena_on(
-            "shipped (gradient)  ",
-            evaluate,
-            evaluate_pre_gradient,
-            40,
-            1_200,
-            13,
-        );
-        run_arena_on(
-            "contested food blind",
-            evaluate_blind_contested,
-            evaluate_pre_gradient,
-            30,
-            1_200,
-            13,
-        );
-        run_arena_on(
-            "appetite 0.22       ",
-            evaluate_appetite_022,
-            evaluate_pre_gradient,
-            30,
-            1_200,
-            13,
-        );
-        run_arena_on(
-            "appetite 0.60       ",
-            evaluate_appetite_060,
-            evaluate_pre_gradient,
-            30,
-            1_200,
-            13,
-        );
-    }
-
-    /// Where does appetite peak now that contested food is visible?
-    #[test]
-    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
-    fn arena_appetite_sweep() {
-        run_arena_on(
-            "shipped @11x11",
-            evaluate,
-            evaluate_pre_gradient,
-            30,
-            1_200,
-            11,
-        );
-    }
-
-    /// How long should "early" last, and does the boost hold up?
-    #[test]
-    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
-    fn arena_early_sweep() {
-        run_arena_on(
-            "pre-gradient vs legacy",
-            evaluate_pre_gradient,
-            evaluate_legacy,
-            30,
-            1_200,
-            13,
-        );
-    }
-
-    /// Confirmation: does growth-urgency hold up at higher power, on the
-    /// default board, and across strengths?
-    #[test]
-    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
-    fn arena_confirm_growth() {
-        run_arena_on(
-            "shipped 0.7 @13x13",
-            evaluate,
-            evaluate_legacy,
-            40,
-            1_200,
-            13,
-        );
-    }
-
-    /// Positions from real playthroughs: 2-, 3- and 4-snake games on three
-    /// board sizes, sampled every few turns.
-    fn fingerprint_positions() -> Vec<(GameConfig, Turn, PlayerId)> {
-        let mut out = Vec::new();
-        for (size, players, seed) in [(11u8, 2usize, 1u64), (13, 3, 2), (17, 4, 3), (13, 2, 4)] {
-            let cfg = board_config(size);
-            let ids: Vec<PlayerId> = (0..players).map(|i| format!("p{i}")).collect();
-            let mut engine = Engine::new(cfg.clone(), ids.clone(), seed);
+    fn fast_board_agrees_with_the_engine() {
+        let cfg = sized(11, 11);
+        let order: Vec<PlayerId> = ["a", "b", "c"].map(str::to_owned).to_vec();
+        let mut deaths = 0;
+        for seed in 0..8u64 {
+            let mut engine = Engine::new(cfg.clone(), order.clone(), seed);
+            let mut rng = Rng::new(seed);
             let mut turn = engine.first_turn();
-            for t in 0..60 {
-                if turn.game_over() {
-                    break;
-                }
-                if t % 5 == 0 {
-                    out.push((cfg.clone(), turn.clone(), turn.alive[0].clone()));
-                }
-                let moves = turn
+            let mut board = board_of(&cfg, &turn);
+            while !turn.game_over() {
+                // Random legal-looking moves, so games last a while.
+                let moves: BTreeMap<PlayerId, Dir> = turn
                     .alive
                     .iter()
-                    .map(|p| (p.clone(), think(&cfg, &turn, p, 400, 1).0))
+                    .map(|p| {
+                        let k = order.iter().position(|o| o == p).unwrap();
+                        let cands = candidates(&board, k);
+                        (p.clone(), cands[rng.below(cands.len())])
+                    })
                     .collect();
-                turn = engine.next_turn(&turn, &moves);
-            }
-        }
-        out
-    }
-
-    /// One hash over the bot's answers (move + root-visit proof) on the
-    /// fingerprint positions. Pure performance work must not move it.
-    fn search_fingerprint() -> u64 {
-        let words: Vec<u64> = fingerprint_positions()
-            .iter()
-            .map(|(cfg, turn, me)| think(cfg, turn, me, 3_000, 99).1)
-            .collect();
-        fnv1a(&words)
-    }
-
-    #[test]
-    #[ignore = "diagnostic: only prints; run with --ignored --nocapture"]
-    fn print_search_fingerprint() {
-        let t0 = std::time::Instant::now();
-        let fp = search_fingerprint();
-        println!(
-            "FINGERPRINT {fp:#x} over {} positions in {:?}",
-            fingerprint_positions().len(),
-            t0.elapsed()
-        );
-    }
-
-    /// Where a simulation's time goes: evaluation, board copy + step, and
-    /// node setup, each timed alone over the fingerprint positions.
-    #[test]
-    #[ignore = "diagnostic: only prints; run with --ignored --nocapture"]
-    fn profile_parts() {
-        let boards: Vec<FastBoard> = fingerprint_positions()
-            .iter()
-            .map(|(cfg, turn, _)| {
-                let order: Vec<&PlayerId> = turn.alive.iter().collect();
-                FastBoard::from_turn(cfg, turn, &order)
-            })
-            .collect();
-        let reps = 4_000u32;
-        let time = |name: &str, f: &mut dyn FnMut(&FastBoard)| {
-            let t0 = std::time::Instant::now();
-            for _ in 0..reps {
-                for b in &boards {
-                    f(b);
-                }
-            }
-            let calls = f64::from(reps) * f64::from(u32::try_from(boards.len()).unwrap());
-            let per = t0.elapsed().as_secs_f64() * 1e9 / calls;
-            println!("PART {name:<12} {per:>8.0} ns");
-        };
-        time("evaluate", &mut |b| {
-            black_box(evaluate(b));
-        });
-        time("clone+step", &mut |b| {
-            let mut c = b.clone();
-            let moves: Vec<Dir> = (0..c.snakes.len()).map(|i| candidates(b, i)[0]).collect();
-            c.step(&moves);
-            black_box(c);
-        });
-        time("node", &mut |b| {
-            black_box(Node::new(b.clone()));
-        });
-    }
-
-    /// A bot as it plays a whole game: a search budget per move, and
-    /// whether it carries its tree from one turn to the next.
-    #[derive(Clone, Copy)]
-    struct Spec {
-        sims: u32,
-        reuse: bool,
-        eval: EvalFn,
-        c_uct: f32,
-    }
-
-    struct Agent {
-        spec: Spec,
-        prev: Option<Search>,
-    }
-
-    impl Agent {
-        const fn new(spec: Spec) -> Self {
-            Self { spec, prev: None }
-        }
-        fn act(&mut self, cfg: &GameConfig, turn: &Turn, me: &PlayerId) -> Dir {
-            let prev = if self.spec.reuse {
-                self.prev.take()
-            } else {
-                None
-            };
-            let mut s = begin_from(prev, cfg, turn, me, self.spec.sims, 0);
-            s.eval = self.spec.eval;
-            s.c_uct = self.spec.c_uct;
-            while !s.step(usize::MAX) {}
-            let dir = s.result().0;
-            self.prev = Some(s);
-            dir
-        }
-    }
-
-    /// One game between two specs; (challenger, incumbent) scores as
-    /// (survival turns, final length).
-    fn agent_duel(
-        challenger: Spec,
-        incumbent: Spec,
-        seed: u64,
-        swap: bool,
-        board: u8,
-    ) -> ((u32, u32), (u32, u32)) {
-        let cfg = board_config(board);
-        let a: PlayerId = "a".into();
-        let b: PlayerId = "b".into();
-        let (spec_a, spec_b) = if swap {
-            (incumbent, challenger)
-        } else {
-            (challenger, incumbent)
-        };
-        let mut agents = [Agent::new(spec_a), Agent::new(spec_b)];
-        let mut engine = Engine::new(cfg.clone(), vec![a.clone(), b.clone()], seed);
-        let mut turn = engine.first_turn();
-        for _ in 0..300 {
-            if turn.game_over() {
-                break;
-            }
-            let mut moves = BTreeMap::new();
-            for (p, agent) in [&a, &b].into_iter().zip(agents.iter_mut()) {
-                if turn.alive.contains(p) {
-                    moves.insert(p.clone(), agent.act(&cfg, &turn, p));
-                }
-            }
-            turn = engine.next_turn(&turn, &moves);
-        }
-        let score = |p: &PlayerId| {
-            let survived = turn
-                .winners
-                .iter()
-                .find(|w| &w.player == p)
-                .map_or(turn.turn_number, |w| w.survival_turns);
-            (survived, final_length(&turn, p))
-        };
-        if swap {
-            (score(&b), score(&a))
-        } else {
-            (score(&a), score(&b))
-        }
-    }
-
-    /// Challenger vs incumbent over `seeds` positions, each played from
-    /// both seats, across all cores. Prints wins/losses/draws and the
-    /// challenger's score (draws half) with a ±2σ band.
-    fn agent_arena(name: &str, challenger: Spec, incumbent: Spec, seeds: u64, board: u8) -> f64 {
-        let jobs: Vec<(u64, bool)> = (0..seeds)
-            .flat_map(|s| [(1_000 + s, false), (1_000 + s, true)])
-            .collect();
-        let threads = std::thread::available_parallelism().map_or(8, std::num::NonZero::get);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let results = std::sync::Mutex::new(Vec::new());
-        std::thread::scope(|scope| {
-            for _ in 0..threads {
-                scope.spawn(|| {
-                    loop {
-                        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(&(seed, swap)) = jobs.get(k) else {
-                            break;
-                        };
-                        let r = agent_duel(challenger, incumbent, seed, swap, board);
-                        results.lock().unwrap().push(r);
+                let next = engine.next_turn(&turn, &moves);
+                // The fast board takes the moves the engine actually
+                // applied (it ignores a reversal; the fast board never
+                // sees one). The dead get a dummy.
+                let applied: Vec<Dir> = order
+                    .iter()
+                    .map(|p| next.moves.get(p).copied().unwrap_or(Dir::Up))
+                    .collect();
+                board.step(&applied);
+                for (k, p) in order.iter().enumerate() {
+                    let s = &board.snakes[k];
+                    assert_eq!(
+                        s.alive,
+                        next.alive.contains(p),
+                        "seed {seed} turn {}: {p}",
+                        next.turn_number
+                    );
+                    if s.alive {
+                        assert_eq!(s.body.iter().copied().collect::<Vec<_>>(), next.snakes[p]);
+                        assert_eq!(s.health, next.health[p]);
                     }
-                });
-            }
-        });
-        let results = results.into_inner().unwrap();
-        let (mut w, mut l, mut d) = (0u32, 0u32, 0u32);
-        let (mut ch_len, mut in_len) = (0u32, 0u32);
-        for (ch, inc) in &results {
-            ch_len += ch.1;
-            in_len += inc.1;
-            match ch.cmp(inc) {
-                Ordering::Greater => w += 1,
-                Ordering::Less => l += 1,
-                Ordering::Equal => d += 1,
+                }
+                assert_eq!(board.alive_count, next.alive.len());
+                assert_eq!(board.is_terminal(), next.game_over());
+                deaths += turn.alive.len() - next.alive.len();
+                // Only the engine spawns food.
+                board.food.clone_from(&next.food);
+                turn = next;
             }
         }
-        let games = results.len();
-        let n = f64::from(u32::try_from(games).unwrap());
-        // Draws count half.
-        let score = mean(2 * w + d, games) / 2.0;
-        let band = 2.0 * (score * (1.0 - score) / n).sqrt();
-        println!(
-            "ARENA {name:<28} {w:>3}W {l:>3}L {d:>2}D  score {:.1}% ±{:.1}  len {:.1} vs {:.1}  ({board}x{board})",
-            100.0 * score,
-            100.0 * band,
-            mean(ch_len, games),
-            mean(in_len, games),
-        );
-        score
-    }
-
-    const BASE: Spec = Spec {
-        sims: 20_000,
-        reuse: false,
-        eval: evaluate,
-        c_uct: C_UCT,
-    };
-    const REUSE: Spec = Spec {
-        reuse: true,
-        ..BASE
-    };
-
-    /// The shipped bot against the one it replaced, at equal thinking time:
-    /// the browser measured 2.8x the simulations per ms (~93k vs ~30k a
-    /// move at the hard budget) plus tree reuse. The old bot's play is the
-    /// fresh search here — `print_search_fingerprint` shows the speedups
-    /// left its moves identical.
-    #[test]
-    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
-    fn arena_new_vs_old() {
-        let old = Spec {
-            sims: 30_000,
-            ..BASE
-        };
-        let new = Spec {
-            sims: 84_000,
-            ..REUSE
-        };
-        agent_arena("new vs old, equal time", new, old, 40, 11);
-    }
-
-    /// Exploration constant, both sides reusing trees.
-    #[test]
-    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
-    fn arena_c_uct() {
-        for c in [0.5, 0.8, 1.7] {
-            agent_arena(
-                &format!("c_uct {c} vs 1.2"),
-                Spec { c_uct: c, ..REUSE },
-                REUSE,
-                40,
-                11,
-            );
-        }
-    }
-
-    /// Does carrying the tree between turns win, at equal fresh work?
-    #[test]
-    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
-    fn arena_tree_reuse() {
-        agent_arena(
-            "reuse vs fresh @11",
-            Spec {
-                reuse: true,
-                ..BASE
-            },
-            BASE,
-            40,
-            11,
-        );
-        agent_arena(
-            "reuse vs fresh @13",
-            Spec {
-                reuse: true,
-                ..BASE
-            },
-            BASE,
-            40,
-            13,
+        assert!(
+            deaths >= 16,
+            "the games must actually kill sneks ({deaths})"
         );
     }
 
+    /// Eating and starving on the fast board, side by side with the engine:
+    /// the hungry snake dies on the tick its health runs out, the one on
+    /// food grows by one and heals fully, and the food is gone.
     #[test]
-    #[ignore = "diagnostic: only prints; run with --ignored --nocapture"]
-    fn print_node_size() {
-        let (cfg, turn, me) = fingerprint_positions().remove(8);
-        let mut s = begin(&cfg, &turn, &me, 50_000, 0);
-        while !s.step(usize::MAX) {}
-        let heap: usize = s
-            .nodes
-            .iter()
-            .map(|n| {
-                n.children.capacity() * 8
-                    + n.board.snakes.capacity() * size_of::<Snake>()
-                    + n.board
-                        .snakes
+    fn fast_board_eats_and_starves_like_the_engine() {
+        let mut turn = turn_with(&[("a", vec![70, 69, 68], 1), ("b", vec![112, 111, 110], 50)]);
+        turn.food = vec![113];
+        let mut board = board_of(&config(), &turn);
+        board.step(&[Dir::Down, Dir::Right]);
+        assert!(!board.snakes[0].alive, "a starved");
+        assert!(board.snakes[1].alive);
+        assert_eq!(board.snakes[1].len(), 4, "b grew");
+        assert_eq!(board.snakes[1].health, 100, "b healed");
+        assert!(board.food.is_empty(), "b ate it");
+        assert_eq!(board.winner(), Some(1));
+
+        let mut engine = Engine::new(config(), vec!["a".into(), "b".into()], 1);
+        let moves = [("a".to_owned(), Dir::Down), ("b".to_owned(), Dir::Right)].into();
+        let next = engine.next_turn(&turn, &moves);
+        assert_eq!(next.alive, vec!["b".to_owned()]);
+        assert_eq!(
+            next.snakes["b"],
+            board.snakes[1].body.iter().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(next.health["b"], 100);
+    }
+
+    /// Two boards are the same position when everything the search can see
+    /// matches. Food order doesn't count (eating reorders the list);
+    /// anything else does.
+    #[test]
+    fn same_position_ignores_only_food_order() {
+        let mut turn = turn_with(&[("a", vec![70, 69, 68], 90), ("b", vec![112, 111, 110], 50)]);
+        turn.food = vec![20, 30];
+        let board = board_of(&config(), &turn);
+        assert!(board.same_position(&board.clone()));
+
+        let mut reordered = board.clone();
+        reordered.food.reverse();
+        assert!(
+            board.same_position(&reordered),
+            "food order is not position"
+        );
+
+        let mut eaten = board.clone();
+        eaten.food.pop();
+        assert!(!board.same_position(&eaten), "less food");
+
+        let mut moved = board.clone();
+        moved.food[0] = 21;
+        assert!(!board.same_position(&moved), "food elsewhere");
+
+        let mut hungrier = board.clone();
+        hungrier.snakes[1].health -= 1;
+        assert!(!board.same_position(&hungrier), "health differs");
+    }
+
+    /// A tree carries over only into the world it searched: never across a
+    /// food spawn (the search never imagines one) or a death (the players
+    /// changed). When it does carry over, its root is exactly this turn,
+    /// already searched, and the moved arena is consistent.
+    #[test]
+    fn tree_carries_over_only_into_the_world_it_searched() {
+        let cfg = sized(11, 11);
+        let ids: Vec<PlayerId> = ["a", "b", "c"].map(str::to_owned).to_vec();
+        let me = &ids[0];
+        let mut engine = Engine::new(cfg.clone(), ids.clone(), 8);
+        let mut turn = engine.first_turn();
+        let mut prev: Option<(Search, Turn)> = None;
+        let (mut carried, mut fresh_after_spawn) = (0, 0);
+        while !turn.game_over() && turn.alive.contains(me) {
+            let (last_search, last_turn) = prev.take().unzip();
+            let mut s = begin_from(last_search, &cfg, &turn, me, 300, 0);
+            let reused = s.nodes.first().is_some_and(|root| root.total > 0.0);
+            if let Some(last) = last_turn {
+                let spawned = turn.food.iter().any(|f| !last.food.contains(f));
+                if reused {
+                    carried += 1;
+                    assert!(!spawned, "carried a tree across a food spawn");
+                    assert_eq!(turn.alive, last.alive, "carried a tree across a death");
+                    assert!(s.nodes[0].board.same_position(&board_of(&cfg, &turn)));
+                    let ids_ok = s
+                        .nodes
                         .iter()
-                        .map(|x| x.body.capacity() * 2)
-                        .sum::<usize>()
-                    + n.board.food.capacity() * 2
-            })
-            .sum();
-        println!(
-            "NODE inline {} B, heap ~{} B/node over {} nodes",
-            size_of::<Node>(),
-            heap / s.nodes.len(),
-            s.nodes.len()
+                        .flat_map(|n| &n.children)
+                        .all(|&(_, id)| (id as usize) < s.tree_size());
+                    assert!(ids_ok, "a child points outside the moved arena");
+                } else if spawned {
+                    fresh_after_spawn += 1;
+                }
+            }
+            while !s.step(usize::MAX) {}
+            let mut moves = BTreeMap::new();
+            moves.insert(me.clone(), s.result().0);
+            for p in turn.alive.iter().filter(|p| *p != me) {
+                moves.insert(p.clone(), think(&cfg, &turn, p, 300, 0).0);
+            }
+            let next = engine.next_turn(&turn, &moves);
+            prev = Some((s, std::mem::replace(&mut turn, next)));
+        }
+        assert!(carried > 0, "no turn ever reused its tree");
+        assert!(fresh_after_spawn > 0, "no food ever spawned mid-game");
+    }
+
+    /// The compute host's checksum binds every input: each of the nonce,
+    /// the request and the move changes it.
+    #[test]
+    fn proof_binds_nonce_request_and_move() {
+        let base = bind_proof(7, 11, Dir::Up);
+        assert_eq!(base, bind_proof(7, 11, Dir::Up));
+        assert_ne!(base, bind_proof(8, 11, Dir::Up));
+        assert_ne!(base, bind_proof(7, 12, Dir::Up));
+        let mut all: Vec<u64> = DIRS.iter().map(|&d| bind_proof(7, 11, d)).collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 4, "every move binds differently");
+    }
+
+    /// Scores every snake the same, whatever happens: a search with no
+    /// opinion.
+    fn indifferent(_board: &FastBoard) -> [f32; MAX_SNAKES] {
+        [0.0; MAX_SNAKES]
+    }
+
+    /// The settings the arenas vary are honoured, and they are the only
+    /// thing that differs: the shipped ones reproduce `think` exactly.
+    #[test]
+    fn search_settings_steer_the_search() {
+        let me: PlayerId = "a".into();
+        let mut engine = Engine::new(config(), vec![me.clone(), "b".into()], 2);
+        let turn = engine.first_turn();
+        let run = |mut s: Search| {
+            while !s.step(usize::MAX) {}
+            s.result()
+        };
+        let fresh = || begin(&config(), &turn, &me, 800, 1);
+        let shipped = think(&config(), &turn, &me, 800, 1);
+        assert_eq!(run(fresh().with_eval(evaluate).with_c_uct(C_UCT)), shipped);
+        assert_ne!(
+            run(fresh().with_eval(indifferent)).1,
+            shipped.1,
+            "another evaluation visits differently"
         );
+        assert_ne!(
+            run(fresh().with_c_uct(0.3)).1,
+            shipped.1,
+            "less exploration visits differently"
+        );
+    }
+
+    /// A node must stay small: a tree holds up to `MAX_NODES` of them, in
+    /// a phone's browser tab.
+    #[test]
+    fn tree_memory_is_accounted_and_small() {
+        let me: PlayerId = "a".into();
+        let mut engine = Engine::new(config(), vec![me.clone(), "b".into()], 4);
+        let turn = engine.first_turn();
+        let mut s = begin(&config(), &turn, &me, 2_000, 0);
+        let root_only = s.heap_bytes();
+        assert_eq!(s.tree_size(), 1);
+        assert!(root_only > 0);
+        while !s.step(usize::MAX) {}
+        assert!(s.tree_size() > 100);
+        assert!(s.heap_bytes() > root_only);
+        let per_node = size_of::<Node>() + s.heap_bytes() / s.tree_size();
+        assert!(per_node < 1024, "{per_node} bytes a node");
+    }
+
+    // The evaluation's retired knobs, as the arenas still use them.
+
+    /// The original evaluation, before any length awareness.
+    const LEGACY: Tuning = Tuning {
+        growth: 0.0,
+        length_heavy: false,
+        bully_target: false,
+        early_boost: 1.0,
+        dominance: 0.0,
+        early_until: 9.0,
+        gradient_food: false,
+        appetite_base: 0.0,
+        food_scale: 5.0,
+        contested_food: 0.0,
+    };
+
+    /// The threshold-based tuning the shipped one replaced.
+    const PRE_GRADIENT: Tuning = Tuning {
+        growth: 0.7,
+        early_boost: 1.6,
+        gradient_food: false,
+        appetite_base: 0.0,
+        contested_food: 0.0,
+        ..TUNING
+    };
+
+    /// A two-snake position for `snake_value`: half the free board owned,
+    /// room for the body, food owned outright at `food_dist`.
+    const fn outlook(len: u16, longest_other: u16, health: u8, food_dist: u16) -> Outlook {
+        Outlook {
+            len,
+            longest_other,
+            health,
+            area: 40,
+            free: 80,
+            n_alive: 2,
+            food_dist,
+            food_any: food_dist,
+            reach: len,
+        }
+    }
+
+    /// How much more `tuning` values food 2 cells away than 60 away.
+    fn pull(tuning: Tuning, len: u16, longest_other: u16, health: u8) -> f32 {
+        snake_value(&outlook(len, longest_other, health, 2), tuning)
+            - snake_value(&outlook(len, longest_other, health, 60), tuning)
+    }
+
+    /// The legacy food term only cares how hungry the snake is; growth
+    /// urgency adds a pull toward food while shorter than a rival, and none
+    /// once it is well ahead.
+    #[test]
+    fn growth_urgency_pulls_a_short_snake_toward_food() {
+        let growth = Tuning {
+            growth: 0.7,
+            ..LEGACY
+        };
+        assert!(
+            pull(LEGACY, 5, 8, 100).abs() < 1e-6,
+            "a full snake has no hunger"
+        );
+        assert!(pull(LEGACY, 5, 8, 70) > 0.0, "a hungry one does");
+        assert!(
+            pull(growth, 5, 8, 70) > pull(LEGACY, 5, 8, 70),
+            "being shorter adds urgency"
+        );
+        assert!(
+            (pull(growth, 12, 5, 70) - pull(LEGACY, 12, 5, 70)).abs() < 1e-6,
+            "well ahead: hunger only"
+        );
+    }
+
+    /// Bully targeting treats parity as no better than being behind (equal
+    /// heads both die), and eases off once strictly longer.
+    #[test]
+    fn bully_target_wants_to_be_strictly_longer() {
+        let bully = Tuning {
+            bully_target: true,
+            ..PRE_GRADIENT
+        };
+        let at_parity = pull(bully, 6, 6, 70);
+        let one_ahead = pull(bully, 7, 6, 70);
+        assert!(
+            at_parity > one_ahead && one_ahead > 0.0,
+            "{at_parity} {one_ahead}"
+        );
+        assert!(
+            at_parity > pull(PRE_GRADIENT, 6, 6, 70),
+            "parity is urgent only to the bully"
+        );
+    }
+
+    /// Dominance scores the head-on standing directly: strictly longer is
+    /// rewarded, parity (mutual death) punished hardest, shorter less.
+    #[test]
+    fn dominance_scores_the_head_on_standing() {
+        let dominant = Tuning {
+            dominance: 0.1,
+            ..LEGACY
+        };
+        let gain = |len| {
+            snake_value(&outlook(len, 6, 100, 2), dominant)
+                - snake_value(&outlook(len, 6, 100, 2), LEGACY)
+        };
+        assert!((gain(7) - 0.1).abs() < 1e-6, "longer: {}", gain(7));
+        assert!((gain(6) + 0.1).abs() < 1e-6, "parity: {}", gain(6));
+        assert!((gain(5) + 0.05).abs() < 1e-6, "shorter: {}", gain(5));
+    }
+
+    /// Length-heavy weighting moves value from health onto relative
+    /// length: a long, hungry snake gains by it, a short, healthy one
+    /// loses.
+    #[test]
+    fn length_heavy_trades_health_for_length() {
+        let heavy = Tuning {
+            length_heavy: true,
+            ..LEGACY
+        };
+        let shift = |o: &Outlook| snake_value(o, heavy) - snake_value(o, LEGACY);
+        assert!(shift(&outlook(10, 6, 20, 2)) > 0.0);
+        assert!(shift(&outlook(4, 8, 100, 2)) < 0.0);
     }
 
     /// `fast_ln` tracks real ln closely enough for UCB.

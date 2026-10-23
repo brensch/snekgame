@@ -163,31 +163,31 @@ impl Client {
 }
 
 /// A fresh server over its own empty database (`snek-<name>-<pid>` in the
-/// temp dir), with WebTransport already listening on an ephemeral UDP port
-/// under a self-signed identity. Returns the HTTP app, for the tests that
-/// serve it, and the WebTransport port.
-fn start_server(name: &str) -> (axum::Router, u16) {
+/// temp dir), serving HTTP and WebTransport on ephemeral ports under a
+/// self-signed identity. Returns the HTTP and WebTransport ports.
+async fn start_server(name: &str) -> (u16, u16) {
+    let server = snek_server::Server::bind(&test_config(name)).await.unwrap();
+    let ports = (server.http_addr().port(), server.wt_port());
+    tokio::spawn(server.serve(std::future::pending()));
+    ports
+}
+
+fn test_config(name: &str) -> snek_server::Config {
     let dir = std::env::temp_dir().join(format!("snek-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join(format!("{name}.db"));
-    let _ = std::fs::remove_file(&db_path);
-
-    let (app, registry) = snek_server::build(&db_path).unwrap();
-    let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
-    (app, wt_port)
+    let db = dir.join(format!("{name}.db"));
+    let _ = std::fs::remove_file(&db);
+    snek_server::Config {
+        http_port: 0,
+        wt_port: 0,
+        db,
+        tls: None,
+    }
 }
 
 #[tokio::test]
 async fn two_players_play_a_full_game() {
-    let (app, wt_port) = start_server("e2e");
-
-    // HTTP on an ephemeral port.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http_port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (http_port, wt_port) = start_server("e2e").await;
 
     let mut alice = Client::connect(wt_port, "e2e-test", "alice-secret-0000", info("alice")).await;
     let mut bob = Client::connect(wt_port, "e2e-test", "bob-secret-000000", info("bob")).await;
@@ -308,7 +308,7 @@ async fn two_players_play_a_full_game() {
 
 #[tokio::test]
 async fn watch_games_pushes_list() {
-    let (_, wt_port) = start_server("watch");
+    let (_, wt_port) = start_server("watch").await;
 
     // Watcher connects first and gets an (empty) list.
     let config = ClientConfig::builder()
@@ -340,7 +340,7 @@ async fn watch_games_pushes_list() {
         ServerMsg::Sessions(list) => {
             assert_eq!(list.len(), 1);
             assert_eq!(list[0].id, "watch-me");
-            assert_eq!(list[0].host_name, "carol", "host is the first human");
+            assert_eq!(list[0].players, 1, "carol isn't counted in it");
         }
         other => panic!("expected sessions push, got {other:?}"),
     }
@@ -372,7 +372,7 @@ async fn http_get_bytes(port: u16, path: &str) -> Vec<u8> {
 
 #[tokio::test]
 async fn distributed_compute_round_trip() {
-    let (_, wt_port) = start_server("dist");
+    let (_, wt_port) = start_server("dist").await;
 
     let mut alice = Client::connect(wt_port, "dist-test", "alice-secret-0000", info("alice")).await;
     // Fast board so the game resolves quickly.
@@ -471,7 +471,7 @@ async fn distributed_compute_round_trip() {
 #[tokio::test]
 #[ignore = "timing measurement, too sensitive to machine load to gate on; run with --ignored"]
 async fn tick_cadence_is_steady() {
-    let (_, wt_port) = start_server("cadence");
+    let (_, wt_port) = start_server("cadence").await;
 
     let mut alice = Client::connect(wt_port, "cad-test", "alice-secret-0000", info("alice")).await;
     alice
@@ -533,7 +533,7 @@ async fn tick_cadence_is_steady() {
 /// the device wakes.
 #[tokio::test]
 async fn sleeping_host_pauses_the_game() {
-    let (_, wt_port) = start_server("sleep");
+    let (_, wt_port) = start_server("sleep").await;
 
     let mut alice =
         Client::connect(wt_port, "sleep-test", "alice-secret-0000", info("alice")).await;
@@ -640,7 +640,7 @@ async fn sleeping_host_pauses_the_game() {
 /// requests, produces no other traffic, and the game stays paused forever.
 #[tokio::test]
 async fn a_silent_host_recovers_on_keepalives_alone() {
-    let (_, wt_port) = start_server("revive");
+    let (_, wt_port) = start_server("revive").await;
 
     let mut alice =
         Client::connect(wt_port, "revive-test", "alice-secret-0000", info("alice")).await;
@@ -712,7 +712,7 @@ async fn a_silent_host_recovers_on_keepalives_alone() {
 /// never shrank, and the device kept being overcommitted every single turn.
 #[tokio::test]
 async fn answering_late_shrinks_the_thinking_window() {
-    let (_, wt_port) = start_server("late");
+    let (_, wt_port) = start_server("late").await;
 
     let mut alice = Client::connect(wt_port, "late-test", "alice-secret-0000", info("alice")).await;
     alice
@@ -805,7 +805,7 @@ async fn answering_late_shrinks_the_thinking_window() {
 /// flight.
 #[tokio::test]
 async fn the_thinking_window_is_at_most_half_the_tick() {
-    let (_, wt_port) = start_server("window");
+    let (_, wt_port) = start_server("window").await;
 
     let mut alice =
         Client::connect(wt_port, "window-test", "alice-secret-0000", info("alice")).await;
@@ -854,7 +854,7 @@ async fn the_thinking_window_is_at_most_half_the_tick() {
 /// is what the game is played and recorded with.
 #[tokio::test]
 async fn pausing_holds_the_game_and_food_is_recorded() {
-    let (_, wt_port) = start_server("pause");
+    let (_, wt_port) = start_server("pause").await;
 
     let mut alice =
         Client::connect(wt_port, "pause-test", "alice-secret-0000", info("alice")).await;
@@ -984,7 +984,7 @@ fn a_compute_request_fits_in_one_datagram() {
 /// went with it, and you rejoined as somebody new.
 #[tokio::test]
 async fn a_dropped_connection_keeps_its_seat() {
-    let (_, wt_port) = start_server("seat");
+    let (_, wt_port) = start_server("seat").await;
 
     let alice_secret = "alice-secret-0000";
     let mut alice = Client::connect(wt_port, "seat-test", alice_secret, info("alice")).await;
@@ -1055,7 +1055,7 @@ async fn a_dropped_connection_keeps_its_seat() {
 /// session…" is what a stale page did instead.
 #[tokio::test]
 async fn a_stale_client_is_told_to_refresh() {
-    let (_, wt_port) = start_server("stale");
+    let (_, wt_port) = start_server("stale").await;
 
     let conn = Endpoint::client(
         ClientConfig::builder()
@@ -1110,7 +1110,7 @@ async fn started(c: &mut Client) -> bool {
 /// same way.
 #[tokio::test]
 async fn readying_up_after_a_game_starts_another() {
-    let (_, wt_port) = start_server("again");
+    let (_, wt_port) = start_server("again").await;
 
     let mut alice =
         Client::connect(wt_port, "again-test", "alice-secret-0000", info("alice")).await;
@@ -1169,12 +1169,12 @@ async fn lobby_where(c: &mut Client, want: impl Fn(&LobbyState) -> bool) -> Lobb
     panic!("no such lobby arrived");
 }
 
-/// The lobby says who last changed the settings, so a ready that silently
-/// flips back to "no" has a name attached. Picking what is already picked
-/// is not a change: it claims nothing and un-readies nobody.
+/// The lobby says who last changed the settings, so every phone can say who
+/// did it. Picking what is already picked is not a change and claims
+/// nothing, and a real change leaves everyone's ready standing.
 #[tokio::test]
 async fn the_lobby_says_who_changed_the_settings() {
-    let (_, wt_port) = start_server("cfg");
+    let (_, wt_port) = start_server("cfg").await;
 
     let mut alice = Client::connect(wt_port, "cfg-test", "alice-secret-0000", info("alice")).await;
     let mut bob = Client::connect(wt_port, "cfg-test", "bob-secret-000000", info("bob")).await;
@@ -1192,7 +1192,7 @@ async fn the_lobby_says_who_changed_the_settings() {
 
     // Bob re-picks what is already picked: nothing happens.
     bob.control(&ClientMsg::Configure(config.clone())).await;
-    // Bob changes the food: his name goes on it and alice is un-readied.
+    // Bob changes the food: his name goes on it, and alice stays ready.
     let changed = GameConfig {
         food_emoji: "🍕".to_owned(),
         ..config
@@ -1201,5 +1201,271 @@ async fn the_lobby_says_who_changed_the_settings() {
     let after = lobby_where(&mut alice, |l| l.config == changed).await;
     assert_eq!(after.config_changed_by.as_ref(), Some(&bob_id));
     assert_eq!(after.config_rev, fresh.config_rev + 1, "the no-op counted");
-    assert!(after.ready.is_empty(), "a real change keeps everyone ready");
+    assert_eq!(after.ready.len(), 1, "a settings change un-readied someone");
+}
+
+/// A raw WebTransport connection with its control stream open and nothing
+/// said yet. `hashes` are the certificate hashes to accept, as a browser
+/// is told them; with none, the certificate isn't checked at all.
+async fn raw_connect(
+    wt_port: u16,
+    hashes: &[wtransport::tls::Sha256Digest],
+) -> (Connection, SendStream, RecvStream) {
+    let builder = ClientConfig::builder().with_bind_default();
+    let config = if hashes.is_empty() {
+        builder.with_no_cert_validation().build()
+    } else {
+        builder
+            .with_server_certificate_hashes(hashes.iter().cloned())
+            .build()
+    };
+    let conn = Endpoint::client(config)
+        .unwrap()
+        .connect(format!("https://127.0.0.1:{wt_port}"))
+        .await
+        .expect("wt connect");
+    let (send, recv) = conn.open_bi().await.unwrap().await.unwrap();
+    (conn, send, recv)
+}
+
+fn join_msg(session: &str, secret: &str, name: &str) -> ClientMsg {
+    ClientMsg::Join {
+        version: PROTOCOL_VERSION,
+        session: session.to_owned(),
+        secret: secret.to_owned(),
+        profile: info(name),
+    }
+}
+
+/// Whether the server ends the connection within a few seconds.
+async fn closed_by_server(conn: &Connection) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), conn.closed())
+        .await
+        .is_ok()
+}
+
+/// Status line and body of a GET.
+async fn http_get_any(port: u16, path: &str) -> (String, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let split = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+    let status = head.lines().next().unwrap().to_owned();
+    (status, buf[split + 4..].to_vec())
+}
+
+/// With no real certificate, a page served from localhost asks for the
+/// self-signed one's hash, and with it the browser's own check passes.
+#[tokio::test]
+async fn a_local_browser_is_told_the_dev_certificate() {
+    let (http_port, wt_port) = start_server("devcert").await;
+    let body = http_get(http_port, "/api/dev/wt").await;
+    let dev: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(dev["port"], wt_port);
+    let hash: Vec<u8> = serde_json::from_value(dev["certHash"].clone()).unwrap();
+    let hash = wtransport::tls::Sha256Digest::new(hash.try_into().unwrap());
+
+    let (_conn, mut send, mut recv) = raw_connect(wt_port, &[hash]).await;
+    write_frame(&mut send, &join_msg("dev", "dev-secret-0000", "dev")).await;
+    let msg = tokio::time::timeout(Duration::from_secs(5), read_stream_msg(&mut recv))
+        .await
+        .unwrap();
+    assert!(matches!(msg, ServerMsg::Welcome { .. }), "{msg:?}");
+}
+
+/// Real certificates come from the PEM files the config names, and a
+/// server with them never offers the dev route.
+#[tokio::test]
+async fn certificates_are_loaded_from_their_files() {
+    let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let mut config = test_config("certs");
+    let dir = config.db.parent().unwrap().to_owned();
+    let tls = snek_server::TlsFiles {
+        cert: dir.join("cert.pem"),
+        key: dir.join("key.pem"),
+    };
+    identity
+        .certificate_chain()
+        .store_pemfile(&tls.cert)
+        .await
+        .unwrap();
+    identity
+        .private_key()
+        .store_secret_pemfile(&tls.key)
+        .await
+        .unwrap();
+    config.tls = Some(tls);
+
+    let server = snek_server::Server::bind(&config).await.unwrap();
+    let (http_port, wt_port) = (server.http_addr().port(), server.wt_port());
+    tokio::spawn(server.serve(std::future::pending()));
+
+    let (_, body) = http_get_any(http_port, "/api/dev/wt").await;
+    assert!(
+        !String::from_utf8_lossy(&body).contains("certHash"),
+        "a server with real certificates handed out a dev hash"
+    );
+    // The browser check passes against exactly the certificate in the file.
+    let hash = identity.certificate_chain().as_slice()[0].hash();
+    let (_conn, mut send, mut recv) = raw_connect(wt_port, &[hash]).await;
+    write_frame(&mut send, &join_msg("certs", "cert-secret-0000", "c")).await;
+    let msg = tokio::time::timeout(Duration::from_secs(5), read_stream_msg(&mut recv))
+        .await
+        .unwrap();
+    assert!(matches!(msg, ServerMsg::Welcome { .. }), "{msg:?}");
+}
+
+/// A server that can't start says which part of its setup is wrong.
+#[tokio::test]
+async fn startup_failures_say_what_went_wrong() {
+    async fn failure(config: &snek_server::Config) -> String {
+        match snek_server::Server::bind(config).await {
+            Ok(_) => panic!("started with a bad config: {config:?}"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    let mut config = test_config("nodb");
+    config.db = config.db.with_file_name("missing-dir").join("snek.db");
+    assert!(
+        failure(&config)
+            .await
+            .contains("failed to open the database")
+    );
+
+    let mut config = test_config("nocert");
+    config.tls = Some(snek_server::TlsFiles {
+        cert: "/nonexistent/cert.pem".into(),
+        key: "/nonexistent/key.pem".into(),
+    });
+    assert!(
+        failure(&config)
+            .await
+            .contains("failed to load TLS identity")
+    );
+
+    let taken = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let mut config = test_config("busy");
+    config.http_port = taken.local_addr().unwrap().port();
+    assert!(failure(&config).await.contains("failed to bind http"));
+}
+
+/// Stopping the server tells every connected client so, rather than
+/// leaving them to time out, and stops serving HTTP.
+#[tokio::test]
+async fn shutting_down_tells_clients_and_stops_serving() {
+    let server = snek_server::Server::bind(&test_config("shutdown"))
+        .await
+        .unwrap();
+    let (http_port, wt_port) = (server.http_addr().port(), server.wt_port());
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(server.serve(async {
+        let _ = stopped.await;
+    }));
+
+    let mut alice = Client::connect(wt_port, "bye", "alice-secret-0000", info("alice")).await;
+    assert!(matches!(alice.next_msg().await, ServerMsg::Welcome { .. }));
+    stop.send(()).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), serving)
+        .await
+        .expect("the server never finished stopping")
+        .unwrap()
+        .unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), alice.conn.closed()).await {
+        Ok(wtransport::error::ConnectionError::ApplicationClosed(close)) => {
+            assert_eq!(close.reason(), b"server shutting down");
+        }
+        other => panic!("the client wasn't told the server was going: {other:?}"),
+    }
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", http_port))
+            .await
+            .is_err(),
+        "still taking HTTP connections"
+    );
+}
+
+/// A connection must open with a usable join (or a watch); anything else
+/// is turned away before a session hears of it.
+#[tokio::test]
+async fn unusable_joins_are_turned_away() {
+    let (http_port, wt_port) = start_server("refuse").await;
+
+    // A profile with no name. (The server writes "set up your player
+    // first" and then drops the connection at once, so unlike the version
+    // refusal the message doesn't reliably arrive; only the close is
+    // checked here.)
+    let (conn, mut send, _recv) = raw_connect(wt_port, &[]).await;
+    write_frame(&mut send, &join_msg("refuse", "good-secret-0000", " ")).await;
+    assert!(closed_by_server(&conn).await);
+
+    // A secret too short to be one, a session name with nothing usable in
+    // it, and a first frame that is neither join nor watch.
+    for first in [
+        join_msg("refuse", "short", "x"),
+        join_msg("!!!", "good-secret-0000", "x"),
+        ClientMsg::Ping(1),
+    ] {
+        let (conn, mut send, _recv) = raw_connect(wt_port, &[]).await;
+        write_frame(&mut send, &first).await;
+        assert!(closed_by_server(&conn).await, "kept {first:?}");
+    }
+
+    // A frame claiming to be bigger than any frame may be.
+    let (conn, mut send, _recv) = raw_connect(wt_port, &[]).await;
+    send.write_all(&(2u32 << 20).to_le_bytes()).await.unwrap();
+    assert!(closed_by_server(&conn).await);
+
+    // A length with the stream ending before the frame does.
+    let (conn, mut send, _recv) = raw_connect(wt_port, &[]).await;
+    send.write_all(&100u32.to_le_bytes()).await.unwrap();
+    send.finish().await.unwrap();
+    assert!(closed_by_server(&conn).await);
+
+    // None of them made it into a session.
+    assert_eq!(http_get(http_port, "/api/sessions").await, "[]");
+}
+
+/// The home screen measures liveness with datagram pings, and leaving is
+/// just closing its stream.
+#[tokio::test]
+async fn a_watcher_is_answered_and_can_leave() {
+    let (_, wt_port) = start_server("watcher").await;
+    let (conn, mut send, mut recv) = raw_connect(wt_port, &[]).await;
+    write_frame(&mut send, &ClientMsg::WatchGames).await;
+    let first = tokio::time::timeout(Duration::from_secs(5), read_stream_msg(&mut recv))
+        .await
+        .unwrap();
+    assert!(matches!(first, ServerMsg::Sessions(_)));
+
+    let mut ponged = false;
+    for n in 0..20 {
+        conn.send_datagram(encode(&ClientMsg::Ping(n))).unwrap();
+        if let Ok(Ok(dgram)) =
+            tokio::time::timeout(Duration::from_millis(250), conn.receive_datagram()).await
+        {
+            assert!(matches!(decode(&dgram), Some(ServerMsg::Pong(_))));
+            ponged = true;
+            break;
+        }
+    }
+    assert!(ponged, "a watcher's ping was never answered");
+
+    send.finish().await.unwrap();
+    assert!(
+        closed_by_server(&conn).await,
+        "the watch outlived its stream"
+    );
 }

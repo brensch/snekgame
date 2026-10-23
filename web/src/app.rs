@@ -7,12 +7,12 @@ use crate::history_page::{history_page, replay_page};
 use crate::net;
 use crate::palette;
 use crate::session_page::session_page;
-use crate::store::{Route, Store, save_profile};
+use crate::store::{Popup, Route, Store, save_profile};
 use gloo_timers::callback::Interval;
 use leptos::ev;
 use leptos::prelude::*;
 use snek_shared::Dir;
-use snek_shared::protocol::ClientMsg;
+use snek_shared::protocol::{ClientMsg, ProfileInfo};
 use std::cell::Cell;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
@@ -79,9 +79,8 @@ pub(crate) fn app() -> impl IntoView {
                 // renders (and the server refuses nameless joins anyway).
                 if store.profile.get().name.trim().is_empty() {
                     return view! {
-                        <div>
+                        <div class="setup-page">
                             <h1 style="padding-top: 28px;">"snek 🐍"</h1>
-                            <p>"introduce yourself"</p>
                             {profile_form()}
                         </div>
                     }
@@ -121,15 +120,35 @@ pub(crate) fn app() -> impl IntoView {
                     .into_any()
             }}
         </div>
+        {crate::notices::toaster(store)}
     }
 }
 
 /// The route is whatever the URL hash says.
+///
+/// Leaving a game you're in, by any route (the home link, the back button,
+/// a typed address), is asked about first: the game's address is put back
+/// while the question is up, and only a "leave" (see `net::leave_to`) lets
+/// the move through.
 fn read_route(store: Store) {
-    let hash = web_sys::window()
-        .and_then(|w| w.location().hash().ok())
-        .unwrap_or_default();
-    store.route.set(parse_hash(&hash));
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let hash = window.location().hash().unwrap_or_default();
+    let next = parse_hash(&hash);
+    if let Route::Session(current) = store.route.get_untracked()
+        && next != Route::Session(current.clone())
+        && net::in_a_game(store)
+        && !net::take_leave_allowed()
+    {
+        if let Ok(history) = window.history() {
+            let _ =
+                history.replace_state_with_url(&JsValue::NULL, "", Some(&format!("#/s/{current}")));
+        }
+        store.popup.set(Some(Popup::Leave(hash)));
+        return;
+    }
+    store.route.set(next);
 }
 
 /// Whether the page is on screen. Without a document to ask, assume so.
@@ -339,7 +358,7 @@ fn topbar(store: Store, share_copied: RwSignal<bool>) -> impl IntoView {
 /// Built-in browser share sheet where it exists (mobile / secure contexts);
 /// clipboard where that exists; a plain prompt as the everywhere-fallback.
 /// Feature-checked with Reflect so nothing here can throw on plain http.
-fn share_session(word: &str, copied: RwSignal<bool>) {
+pub(crate) fn share_session(word: &str, copied: RwSignal<bool>) {
     let Some(window) = web_sys::window() else {
         return;
     };
@@ -364,7 +383,13 @@ fn share_session(word: &str, copied: RwSignal<bool>) {
     {
         let _ = nav.clipboard().write_text(&url);
         copied.set(true);
-        gloo_timers::callback::Timeout::new(1500, move || copied.set(false)).forget();
+        // try_set: the button that showed "copied" may be gone by now (the
+        // lobby redraws whenever anything in it changes), and setting a
+        // signal that went with it would panic.
+        gloo_timers::callback::Timeout::new(1500, move || {
+            copied.try_set(false);
+        })
+        .forget();
     } else {
         let _ = window.prompt_with_message_and_default("Copy this link:", &url);
     }
@@ -395,7 +420,7 @@ fn normalize_word(raw: &str) -> String {
     raw.to_lowercase()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .take(24)
+        .take(48)
         .collect()
 }
 
@@ -430,58 +455,24 @@ fn profile_form() -> impl IntoView {
     };
 
     view! {
+        // Three questions, each its own section with room around it, and the
+        // button that settles them at the bottom of the screen.
         <div class="profile-form">
-            <input
-                type="text"
-                placeholder="your name"
-                maxlength="20"
-                prop:value=move || draft.get().name
-                on:input=move |ev| {
-                    draft.update(|p| p.name = event_target_value(&ev));
-                }
-            />
-                <div class="row" style="margin-top: 10px; margin-bottom: 6px;">
-                    <h3 style="margin: 0; align-self: center;">"Emoji"</h3>
-                    <button
-                        class="mini"
-                        style="flex: 0 0 auto;"
-                        on:click=move |_| {
-                            shown
-                                .set(
-                                    palette::random_emoji_set(
-                                        palette::EMOJI_HAND,
-                                        &draft.get_untracked().emoji,
-                                    ),
-                                );
-                        }
-                    >
-                        "🎲 shuffle"
-                    </button>
-                </div>
-                <div class="emoji-grid">
-                    {move || {
-                        let current = draft.get().emoji;
-                        palette::hand_showing(shown.get(), &current, palette::EMOJI_HAND)
-                            .into_iter()
-                            .map(|e| {
-                                let sel = e.clone();
-                                let pick = e.clone();
-                                view! {
-                                    <div
-                                        class="pick"
-                                        class:selected=move || draft.get().emoji == sel
-                                        on:click=move |_| {
-                                            draft.update(|p| p.emoji.clone_from(&pick));
-                                        }
-                                    >
-                                        {e}
-                                    </div>
-                                }
-                            })
-                            .collect_view()
-                    }}
-                </div>
-                <h3>"Colour"</h3>
+            <section>
+                <h3>"what's your name"</h3>
+                <input
+                    type="text"
+                    placeholder="your name"
+                    maxlength="20"
+                    prop:value=move || draft.get().name
+                    on:input=move |ev| {
+                        draft.update(|p| p.name = event_target_value(&ev));
+                    }
+                />
+            </section>
+            {emoji_picker(draft, shown)}
+            <section>
+                <h3>"what colour are you"</h3>
                 <div class="swatches">
                     {palette::swatches()
                         .into_iter()
@@ -501,15 +492,64 @@ fn profile_form() -> impl IntoView {
                         })
                         .collect_view()}
                 </div>
-                <button
-                    class="big"
-                    style=move || format!("margin-top: 14px; background: {};", draft.get().colour)
-                    disabled=move || draft.get().name.trim().is_empty()
-                    on:click=move |_| save()
-                >
-                    "That's me"
-                </button>
+            </section>
+            <button
+                class="big lets-snek"
+                style=move || format!("background: {};", draft.get().colour)
+                disabled=move || draft.get().name.trim().is_empty()
+                on:click=move |_| save()
+            >
+                "let's snek"
+            </button>
         </div>
+    }
+}
+
+/// The emoji question: a shufflable hand of the (large) emoji list, which
+/// only changes when shuffle is pressed — picking from it must leave it
+/// alone, or the cell you were aiming at moves as you tap.
+fn emoji_picker(draft: RwSignal<ProfileInfo>, shown: RwSignal<Vec<String>>) -> impl IntoView {
+    view! {
+        <section>
+            <h3>"how do you identify emojily"</h3>
+            <div class="emoji-grid">
+                {move || {
+                    let current = draft.get().emoji;
+                    palette::hand_showing(shown.get(), &current, palette::EMOJI_HAND)
+                        .into_iter()
+                        .map(|e| {
+                            let sel = e.clone();
+                            let pick = e.clone();
+                            view! {
+                                <div
+                                    class="pick"
+                                    class:selected=move || draft.get().emoji == sel
+                                    on:click=move |_| {
+                                        draft.update(|p| p.emoji.clone_from(&pick));
+                                    }
+                                >
+                                    {e}
+                                </div>
+                            }
+                        })
+                        .collect_view()
+                }}
+            </div>
+            <button
+                class="mini shuffle"
+                on:click=move |_| {
+                    shown
+                        .set(
+                            palette::random_emoji_set(
+                                palette::EMOJI_HAND,
+                                &draft.get_untracked().emoji,
+                            ),
+                        );
+                }
+            >
+                "🎲 shuffle"
+            </button>
+        </section>
     }
 }
 
@@ -520,7 +560,6 @@ fn profile_editor() -> impl IntoView {
     view! {
         <div class="modal-back" on:click=move |_| close_profile_editor(store)>
             <div class="modal" on:click=move |ev| ev.stop_propagation()>
-                <h3 style="margin-top: 0;">"Who are you?"</h3>
                 {profile_form()}
             </div>
         </div>

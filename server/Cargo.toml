@@ -27,8 +27,13 @@ sha2 = "0.11"
 
 [dev-dependencies]
 # dangerous-configuration only exists so tests can skip cert validation
-# against the self-signed test identity.
-wtransport = { version = "0.7", features = ["self-signed", "dangerous-configuration"] }
+# against the self-signed test identity; quinn lets a test client set its
+# own transport limits (no datagrams, a tiny receive window).
+wtransport = { version = "0.7", features = ["self-signed", "dangerous-configuration", "quinn"] }
+# Paused time, so the session's minute-long grace periods pass instantly.
+tokio = { version = "1", features = ["full", "test-util"] }
+# Requests straight into the router, no socket.
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

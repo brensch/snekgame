@@ -8,6 +8,35 @@
     <link data-trunk rel="copy-dir" href="fonts" />
     <link rel="preload" href="/fonts/cutive-mono-v23-400.woff2" as="font" type="font/woff2" crossorigin />
     <link data-trunk rel="rust" data-bin="snek-web" data-wasm-opt="z" />
+    <script>
+      // Watchdog, outside the app on purpose: it still works if the app's
+      // own code has crashed or wedged. If the page has been in view for a
+      // while, wants a connection (window.__snek, kept by trail.rs), and
+      // hasn't heard from the server in that time, it checks the server is
+      // reachable over plain HTTP and reloads: what a person would do with
+      // the refresh button. At most once a minute, so it can't loop.
+      (function () {
+        var STUCK_MS = 20000, COOLDOWN_MS = 60000, KEY = "snek-watchdog-at";
+        var visibleSince = Date.now();
+        document.addEventListener("visibilitychange", function () {
+          if (!document.hidden) visibleSince = Date.now();
+        });
+        setInterval(function () {
+          var beat = window.__snek, now = Date.now();
+          if (!beat || !beat.want || document.hidden) return;
+          if (now - visibleSince < STUCK_MS || now - (beat.lastRx || 0) < STUCK_MS) return;
+          var last = Number(sessionStorage.getItem(KEY) || 0);
+          if (now - last < COOLDOWN_MS) return;
+          fetch("/api/sessions", { cache: "no-store" }).then(function (r) {
+            if (!r.ok) return;
+            sessionStorage.setItem(KEY, String(now));
+            var trail = sessionStorage.getItem("snek-trail");
+            sessionStorage.setItem("snek-trail", (trail ? trail + "\n" : "") + "watchdog reloaded the page");
+            location.reload();
+          }, function () {});
+        }, 2000);
+      })();
+    </script>
   </head>
   <body></body>
 </html>

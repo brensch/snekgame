@@ -2,7 +2,7 @@
 //! scrubber. The replay blob is the same postcard `GameRecord` the engine
 //! produced — decoded with the shared types.
 
-use crate::board::board_view;
+use crate::board::{Extras, board_view};
 use crate::num;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -193,8 +193,16 @@ fn advance_frames(
                 last_step.set_value(now);
                 return;
             }
+            // The game's own pace at this point in it: games speed up as
+            // they go, and so does the replay.
+            let shown = frame.get_untracked();
             let tick_ms = record
-                .with_untracked(|r| r.as_ref().map(|r| r.config.tick_ms))
+                .with_untracked(|r| {
+                    r.as_ref().map(|r| {
+                        r.config
+                            .tick_ms_at(u32::try_from(shown).unwrap_or(u32::MAX))
+                    })
+                })
                 .unwrap_or(1000);
             let step_ms =
                 (f64::from(tick_ms) / f64::from(speed.get_untracked() * SPEED_SCALE)).max(15.0);
@@ -336,7 +344,7 @@ pub(crate) fn replay_page(id: i64) -> impl IntoView {
                 let turn = r.turns[i].clone();
                 view! {
                     <div>
-                        {board_view(&r.config, &r.players, &turn, "", false, |_| {})}
+                        {board_view(&r.config, &r.players, &turn, "", Extras::none(), |_| {})}
                         {replay_controls(i, r.turns.len(), turn.turn_number, frame, playing, speed)}
                         {move || meta.get().map(|m| replay_footer(id, &m))}
                     </div>
