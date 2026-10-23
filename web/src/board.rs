@@ -224,17 +224,28 @@ fn clashes_svg(grid: Grid, turn: &Turn) -> String {
 /// The spotlight, as its own layer (`.spot`, shown only while the board
 /// is `.spotlit`): a white veil over everything drawn so far, my snek
 /// (`mine`) on top of it, a red box around my head and "you!" over it
-/// (under it if the head is on the top row and there's no room above).
+/// (under it if the head is near the top and there's no room above).
+/// The view stops at the walls, so on an edge cell the box is pulled in
+/// on that side and the label slides along to stay whole.
 fn spotlight_svg(grid: Grid, head: Pos, mine: &str) -> String {
+    // The box stands this far out from the cell, its stroke this thick.
+    const OUT: f64 = 0.18;
+    const STROKE: f64 = 0.14;
+    // Half the label's width (four letters of the mono font at 0.8).
+    const HALF_LABEL: f64 = 1.1;
     let (x, y) = (f64::from(grid.x(head)), f64::from(grid.y(head)));
-    let label_y = if y <= 1.0 { y + 1.75 } else { y - 0.55 };
+    // The view: from 1 to the far wall, either way.
+    let (right, bottom) = (f64::from(grid.w - 1), f64::from(grid.h - 1));
+    let inside = 1.0 + STROKE / 2.0;
+    let (bx, by) = ((x - OUT).max(inside), (y - OUT).max(inside));
+    let bw = (x + 1.0 + OUT).min(right - STROKE / 2.0) - bx;
+    let bh = (y + 1.0 + OUT).min(bottom - STROKE / 2.0) - by;
+    let label_y = if y <= 2.0 { y + 1.75 } else { y - 0.55 };
+    let tx = (x + 0.5).clamp(1.0 + HALF_LABEL, right - HALF_LABEL);
     format!(
-        r##"<g class="spot"><rect x="0" y="0" width="{w}" height="{h}" fill="#fff" opacity="0.72"/>{mine}<rect x="{bx}" y="{by}" width="1.36" height="1.36" fill="none" stroke="#e00" stroke-width="0.14"/><text x="{tx}" y="{label_y}" font-size="0.8" font-weight="bold" font-family="snek mono, monospace" fill="#e00" stroke="#fff" stroke-width="0.12" paint-order="stroke" text-anchor="middle">you!</text></g>"##,
+        r##"<g class="spot"><rect x="0" y="0" width="{w}" height="{h}" fill="#fff" opacity="0.72"/>{mine}<rect x="{bx}" y="{by}" width="{bw}" height="{bh}" fill="none" stroke="#e00" stroke-width="{STROKE}"/><text x="{tx}" y="{label_y}" font-size="0.8" font-weight="bold" font-family="snek mono, monospace" fill="#e00" stroke="#fff" stroke-width="0.12" paint-order="stroke" text-anchor="middle">you!</text></g>"##,
         w = grid.w,
         h = grid.h,
-        bx = x - 0.18,
-        by = y - 0.18,
-        tx = x + 0.5,
     )
 }
 
