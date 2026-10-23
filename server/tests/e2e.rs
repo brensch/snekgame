@@ -220,9 +220,19 @@ async fn two_players_play_a_full_game() {
             _ => {}
         }
     }
-    // The final snapshot is a datagram and the save notice rides the
-    // stream, so the notice can overtake it; the saved record (below) is
-    // the reliable word on how the game ended.
+    // Datagrams and the stream are read by separate tasks, so the save
+    // notice can be handed over before the snapshot that preceded it (the
+    // game can end on its first tick, leaving just that one). Give any
+    // stragglers a moment.
+    while let Ok(Some(msg)) =
+        tokio::time::timeout(Duration::from_millis(500), alice.rx.recv()).await
+    {
+        if let ServerMsg::Turn(_) = msg {
+            turn_count += 1;
+        }
+    }
+    // How it ended is checked on the saved record (below): it is the
+    // reliable copy, where any one snapshot datagram may be lost.
     assert!(got_pong, "datagram ping never answered");
     assert!(turn_count > 0, "no turn snapshots arrived");
     let saved_id = saved_id.expect("game was not saved");
