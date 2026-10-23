@@ -5,11 +5,11 @@
 ![rust](https://img.shields.io/badge/rust-2021-000?logo=rust)
 ![wasm](https://img.shields.io/badge/frontend-wasm-654ff0?logo=webassembly&logoColor=white)
 ![transport](https://img.shields.io/badge/transport-WebTransport%20%2F%20QUIC-1f6feb)
-![play](https://img.shields.io/badge/play-snek.brensch.com-ff5fbf)
 
 **Real-time multiplayer snake for phones, with a Monte Carlo tree search bot
-that runs on the players' own devices.** Play it at
-[snek.brensch.com](https://snek.brensch.com).
+that runs on the players' own devices.**
+
+### ▶ Play it: [snek.brensch.com](https://snek.brensch.com)
 
 <p align="center">
   <img src="docs/snek.gif" alt="A game of snek on a phone: two sneks race for pumpkins on a green checkerboard, steered with an on-screen d-pad" width="320">
