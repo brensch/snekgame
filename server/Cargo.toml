@@ -1,7 +1,7 @@
 [package]
 name = "snek-server"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 snek-shared = { path = "../shared" }
@@ -12,18 +12,23 @@ tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 wtransport = { version = "0.7", features = ["self-signed"] }
 anyhow = "1"
-axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.6", features = ["fs"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
-rand = "0.8"
+axum = "0.8"
+tower-http = { version = "0.7", features = ["fs"] }
+# fallible_uint: u64 counters read and written as checked conversions,
+# an error rather than a silent wrap, instead of casting through i64.
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+rand = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rust-embed = "8"
-brotli = "8"
+brotli = "9"
 mime_guess = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dev-dependencies]
 # dangerous-configuration only exists so tests can skip cert validation
 # against the self-signed test identity.
 wtransport = { version = "0.7", features = ["self-signed", "dangerous-configuration"] }
+
+[lints]
+workspace = true

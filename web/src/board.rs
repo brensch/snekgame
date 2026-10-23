@@ -6,9 +6,11 @@
 //!   health on the neck, stacked count on the tail (tac logic)
 //! - food is whatever the lobby picked; deaths leave 💀 trails but keep the
 //!   dead player's emoji head
+use crate::num;
 use leptos::prelude::*;
-use snek_shared::{GameConfig, PlayerId, PlayerProfile, Pos, Turn};
+use snek_shared::{GameConfig, PlayerProfile, Pos, Turn};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use wasm_bindgen::JsCast;
 
 const CHECKER_A: &str = "#dcedc8";
@@ -18,7 +20,7 @@ const CHECKER_B: &str = "#cfe6b8";
 // WebKit ignores on SVG <text> — dy is honoured identically everywhere.
 fn emoji_text(x: f64, y: f64, size: f64, glyph: &str) -> String {
     format!(
-        r##"<text x="{x}" y="{y}" dy="0.36em" font-size="{size}" text-anchor="middle">{glyph}</text>"##
+        r#"<text x="{x}" y="{y}" dy="0.36em" font-size="{size}" text-anchor="middle">{glyph}</text>"#
     )
 }
 
@@ -28,19 +30,234 @@ fn number_text(x: f64, y: f64, value: &str) -> String {
     )
 }
 
-pub fn board_view(
-    config: GameConfig,
-    players: Vec<PlayerProfile>,
+/// The board's size in cells, walls included, and the arithmetic that turns
+/// a cell index into somewhere to draw.
+#[derive(Clone, Copy)]
+struct Grid {
+    w: u16,
+    h: u16,
+}
+
+impl Grid {
+    /// Column of a cell's top-left corner.
+    const fn x(self, pos: Pos) -> u16 {
+        pos % self.w
+    }
+
+    /// Row of a cell's top-left corner.
+    const fn y(self, pos: Pos) -> u16 {
+        pos / self.w
+    }
+
+    /// Centre of a cell, horizontally.
+    fn cx(self, pos: Pos) -> f64 {
+        f64::from(self.x(pos)) + 0.5
+    }
+
+    /// Centre of a cell, vertically.
+    fn cy(self, pos: Pos) -> f64 {
+        f64::from(self.y(pos)) + 0.5
+    }
+
+    /// The checkerboard interior.
+    fn field(self) -> String {
+        let mut field = String::new();
+        for y in 1..self.h - 1 {
+            for x in 1..self.w - 1 {
+                let fill = if (x + y) % 2 == 0 {
+                    CHECKER_A
+                } else {
+                    CHECKER_B
+                };
+                let _ = write!(
+                    field,
+                    r#"<rect x="{x}" y="{y}" width="1" height="1" fill="{fill}"/>"#
+                );
+            }
+        }
+        field
+    }
+
+    /// The cell under a click, if it landed on the board at all.
+    fn cell_at(self, ev: &web_sys::MouseEvent) -> Option<Pos> {
+        let el = ev
+            .current_target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())?;
+        let rect = el.get_bounding_client_rect();
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return None;
+        }
+        let vis_w = f64::from(self.w - 2);
+        let vis_h = f64::from(self.h - 2);
+        // The svg keeps the board square inside whatever box it is given,
+        // centring it and leaving a margin on one axis. Taps have to be
+        // measured against the board, not the box, or every column is off by
+        // half the margin — and a tap in the margin is not a tap on the board
+        // at all.
+        let board_aspect = vis_w / vis_h;
+        let (bw, bh) = if rect.width() / rect.height() > board_aspect {
+            (rect.height() * board_aspect, rect.height())
+        } else {
+            (rect.width(), rect.width() / board_aspect)
+        };
+        let left = rect.left() + (rect.width() - bw) / 2.0;
+        let top = rect.top() + (rect.height() - bh) / 2.0;
+        let fx = (ev.client_x() - left) / bw;
+        let fy = (ev.client_y() - top) / bh;
+        if !(0.0..1.0).contains(&fx) || !(0.0..1.0).contains(&fy) {
+            return None; // in the margin beside the board
+        }
+        let x = 1 + num::to_u32(fx * vis_w);
+        let y = 1 + num::to_u32(fy * vis_h);
+        let (w, h) = (u32::from(self.w), u32::from(self.h));
+        if x < w - 1 && y < h - 1 {
+            Pos::try_from(y * w + x).ok()
+        } else {
+            None
+        }
+    }
+}
+
+/// One snek: a rounded body through the cell centres, the head square with
+/// the player's emoji, and its numbers.
+fn snek_svg(grid: Grid, snake: &[Pos], hp: u8, colour: &str, emoji: &str) -> String {
+    let mut out = String::new();
+    let (Some(&head), Some(&tail_cell)) = (snake.first(), snake.last()) else {
+        return out;
+    };
+
+    // Collapse consecutive duplicates (stacked start / fresh growth).
+    let mut path_cells: Vec<Pos> = Vec::with_capacity(snake.len());
+    for &p in snake {
+        if path_cells.last() != Some(&p) {
+            path_cells.push(p);
+        }
+    }
+
+    // Body: one rounded polyline through the centres, drawn through the
+    // head cell too so it blends seamlessly into the head square.
+    if let [_, .., t] = path_cells.as_slice() {
+        let points: String = path_cells
+            .iter()
+            .map(|&p| format!("{},{}", grid.cx(p), grid.cy(p)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let _ = write!(
+            out,
+            r#"<polyline points="{points}" fill="none" stroke="{colour}" stroke-width="0.72" stroke-linecap="round" stroke-linejoin="round"/>"#
+        );
+        // Tail taper: a slightly smaller round cap on the last cell.
+        let _ = write!(
+            out,
+            r#"<circle cx="{}" cy="{}" r="0.30" fill="{colour}"/>"#,
+            grid.cx(*t),
+            grid.cy(*t)
+        );
+    }
+
+    // The head: a full body-coloured square with the player's emoji.
+    let _ = write!(
+        out,
+        r#"<rect x="{x}" y="{y}" width="1" height="1" fill="{colour}"/>"#,
+        x = grid.x(head),
+        y = grid.y(head),
+    );
+    out.push_str(&emoji_text(grid.cx(head), grid.cy(head), 0.8, emoji));
+
+    // Numbers as the snek unfurls: length on the first body tile,
+    // health on the one after.
+    if let Some(&second) = path_cells.get(1) {
+        out.push_str(&number_text(
+            grid.cx(second),
+            grid.cy(second),
+            &snake.len().to_string(),
+        ));
+    }
+    if let Some(&third) = path_cells.get(2) {
+        out.push_str(&number_text(
+            grid.cx(third),
+            grid.cy(third),
+            &hp.to_string(),
+        ));
+    }
+    // Stacked-segment count on the butt (growth queued up).
+    let stacked = snake.iter().filter(|&&p| p == tail_cell).count();
+    if stacked > 1
+        && tail_cell != head
+        && path_cells.get(1) != Some(&tail_cell)
+        && path_cells.get(2) != Some(&tail_cell)
+    {
+        out.push_str(&number_text(
+            grid.cx(tail_cell),
+            grid.cy(tail_cell),
+            &stacked.to_string(),
+        ));
+    }
+    out
+}
+
+/// Clashes stay emoji, like tac. The dead snek's body becomes a 💀 trail,
+/// but its head cell keeps the player's emoji so you can see who died. The
+/// engine puts the dead player first in `players` and their head first in
+/// their clash trail.
+fn clashes_svg(grid: Grid, turn: &Turn, emoji_of: &HashMap<&str, &str>) -> String {
+    let mut clashes = String::new();
+    let mut seen_dead_heads: HashSet<&str> = HashSet::new();
+    for clash in &turn.clashes {
+        let owner = clash.players.first().map_or("", String::as_str);
+        let is_head = seen_dead_heads.insert(owner);
+        let _ = write!(
+            clashes,
+            r##"<rect x="{x}" y="{y}" width="1" height="1" fill="#d3d3d3" opacity="0.8"/>"##,
+            x = grid.x(clash.pos),
+            y = grid.y(clash.pos),
+        );
+        let glyph = if is_head {
+            emoji_of.get(owner).copied().unwrap_or("💀")
+        } else {
+            "💀"
+        };
+        clashes.push_str(&emoji_text(
+            grid.cx(clash.pos),
+            grid.cy(clash.pos),
+            0.8,
+            glyph,
+        ));
+    }
+    clashes
+}
+
+/// The spotlight: a white veil over everything drawn so far, my snek
+/// (`mine`) on top of it, a red box around my head and "you!" over it
+/// (under it if the head is on the top row and there's no room above).
+fn spotlight_svg(grid: Grid, head: Pos, mine: &str) -> String {
+    let (x, y) = (f64::from(grid.x(head)), f64::from(grid.y(head)));
+    let label_y = if y <= 1.0 { y + 1.75 } else { y - 0.55 };
+    format!(
+        r##"<rect x="0" y="0" width="{w}" height="{h}" fill="#fff" opacity="0.72"/>{mine}<rect x="{bx}" y="{by}" width="1.36" height="1.36" fill="none" stroke="#e00" stroke-width="0.14"/><text x="{tx}" y="{label_y}" font-size="0.8" font-weight="bold" font-family="snek mono, monospace" fill="#e00" stroke="#fff" stroke-width="0.12" paint-order="stroke" text-anchor="middle">you!</text>"##,
+        w = grid.w,
+        h = grid.h,
+        bx = x - 0.18,
+        by = y - 0.18,
+        tx = x + 0.5,
+    )
+}
+
+pub(crate) fn board_view<F: Fn(Pos) + Copy + 'static>(
+    config: &GameConfig,
+    players: &[PlayerProfile],
     turn: &Turn,
-    my_id: PlayerId,
+    my_id: &str,
     // Before the first tick: grey out everything but my snek and put a red
     // box and a "you!" over it, so nobody spends the start looking for
     // themselves.
     spotlight: bool,
-    on_cell: impl Fn(Pos) + Copy + 'static,
-) -> impl IntoView {
-    let w = config.board_width as usize;
-    let h = config.board_height as usize;
+    on_cell: F,
+) -> impl IntoView + use<F> {
+    let grid = Grid {
+        w: u16::from(config.board_width),
+        h: u16::from(config.board_height),
+    };
     let colour_of: HashMap<&str, &str> = players
         .iter()
         .map(|p| (p.id.as_str(), p.colour.as_str()))
@@ -50,190 +267,55 @@ pub fn board_view(
         .map(|p| (p.id.as_str(), p.emoji.as_str()))
         .collect();
 
-    let cx = |pos: Pos| (pos as usize % w) as f64 + 0.5;
-    let cy = |pos: Pos| (pos as usize / w) as f64 + 0.5;
-
-    // --- checkerboard interior -------------------------------------------
-    let mut field = String::new();
-    for y in 1..h - 1 {
-        for x in 1..w - 1 {
-            let fill = if (x + y) % 2 == 0 {
-                CHECKER_A
-            } else {
-                CHECKER_B
-            };
-            field.push_str(&format!(
-                r##"<rect x="{x}" y="{y}" width="1" height="1" fill="{fill}"/>"##
-            ));
-        }
-    }
+    let field = grid.field();
 
     // --- food stays emoji, like tac --------------------------------------
-    let mut food = String::new();
-    for &pos in &turn.food {
-        food.push_str(&emoji_text(cx(pos), cy(pos), 0.8, &config.food_emoji));
-    }
+    let food: String = turn
+        .food
+        .iter()
+        .map(|&pos| emoji_text(grid.cx(pos), grid.cy(pos), 0.8, &config.food_emoji))
+        .collect();
 
     // --- sneks ------------------------------------------------------------
+    // Spotlit, my snek is drawn apart from the rest, to go over the veil.
+    let my_head = turn
+        .snakes
+        .get(my_id)
+        .filter(|_| spotlight)
+        .and_then(|s| s.first().copied());
     let mut sneks = String::new();
     let mut mine = String::new();
     for (player_id, snake) in &turn.snakes {
-        let spotlit = spotlight && *player_id == my_id;
-        let sneks = if spotlit { &mut mine } else { &mut sneks };
-        let colour = colour_of.get(player_id.as_str()).copied().unwrap_or("#999");
-
-        // Collapse consecutive duplicates (stacked start / fresh growth).
-        let mut path_cells: Vec<Pos> = Vec::with_capacity(snake.len());
-        for &p in snake.iter() {
-            if path_cells.last() != Some(&p) {
-                path_cells.push(p);
-            }
-        }
-
-        // Body: one rounded polyline through the centres, drawn through the
-        // head cell too so it blends seamlessly into the head square.
-        let head = snake[0];
-        if path_cells.len() > 1 {
-            let points: String = path_cells
-                .iter()
-                .map(|&p| format!("{},{}", cx(p), cy(p)))
-                .collect::<Vec<_>>()
-                .join(" ");
-            sneks.push_str(&format!(
-                r##"<polyline points="{points}" fill="none" stroke="{colour}" stroke-width="0.72" stroke-linecap="round" stroke-linejoin="round"/>"##
-            ));
-            // Tail taper: a slightly smaller round cap on the last cell.
-            let t = *path_cells.last().unwrap();
-            sneks.push_str(&format!(
-                r##"<circle cx="{}" cy="{}" r="0.30" fill="{colour}"/>"##,
-                cx(t),
-                cy(t)
-            ));
-        }
-
-        // The head: a full body-coloured square with the player's emoji.
-        sneks.push_str(&format!(
-            r##"<rect x="{x}" y="{y}" width="1" height="1" fill="{colour}"/>"##,
-            x = head as usize % w,
-            y = head as usize / w,
+        let spotlit = my_head.is_some() && player_id == my_id;
+        let out = if spotlit { &mut mine } else { &mut sneks };
+        out.push_str(&snek_svg(
+            grid,
+            snake,
+            turn.health.get(player_id).copied().unwrap_or(0),
+            colour_of.get(player_id.as_str()).copied().unwrap_or("#999"),
+            emoji_of.get(player_id.as_str()).copied().unwrap_or("🐍"),
         ));
-        let emoji = emoji_of.get(player_id.as_str()).copied().unwrap_or("🐍");
-        sneks.push_str(&emoji_text(cx(head), cy(head), 0.8, emoji));
-
-        // Numbers as the snek unfurls: length on the first body tile,
-        // health on the one after.
-        if let Some(&second) = path_cells.get(1) {
-            sneks.push_str(&number_text(
-                cx(second),
-                cy(second),
-                &snake.len().to_string(),
-            ));
-        }
-        if let Some(&third) = path_cells.get(2) {
-            let hp = turn.health.get(player_id).copied().unwrap_or(0);
-            sneks.push_str(&number_text(cx(third), cy(third), &hp.to_string()));
-        }
-        // Stacked-segment count on the butt (growth queued up).
-        let tail_cell = *snake.last().unwrap();
-        let stacked = snake.iter().filter(|&&p| p == tail_cell).count();
-        if stacked > 1
-            && tail_cell != head
-            && path_cells.get(1) != Some(&tail_cell)
-            && path_cells.get(2) != Some(&tail_cell)
-        {
-            sneks.push_str(&number_text(
-                cx(tail_cell),
-                cy(tail_cell),
-                &stacked.to_string(),
-            ));
-        }
     }
 
-    // --- clashes stay emoji, like tac. The dead snek's body becomes a 💀
-    // trail, but its head cell keeps the player's emoji so you can see who
-    // died. The engine puts the dead player first in `players` and their
-    // head first in their clash trail.
-    let mut clashes = String::new();
-    let mut seen_dead_heads: HashSet<&str> = HashSet::new();
-    for clash in &turn.clashes {
-        let owner = clash.players.first().map(String::as_str).unwrap_or("");
-        let is_head = seen_dead_heads.insert(owner);
-        clashes.push_str(&format!(
-            r##"<rect x="{x}" y="{y}" width="1" height="1" fill="#d3d3d3" opacity="0.8"/>"##,
-            x = clash.pos as usize % w,
-            y = clash.pos as usize / w,
-        ));
-        let glyph = if is_head {
-            emoji_of.get(owner).copied().unwrap_or("💀")
-        } else {
-            "💀"
-        };
-        clashes.push_str(&emoji_text(cx(clash.pos), cy(clash.pos), 0.8, glyph));
-    }
+    let clashes = clashes_svg(grid, turn, &emoji_of);
 
-    // The spotlight: a white veil over everything drawn so far, my snek on
-    // top of it, a red box around my head and "you!" over it (under it if
-    // the head is on the top row and there's no room above).
-    let mut spot = String::new();
-    if let Some(head) = turn.snakes.get(&my_id).filter(|_| spotlight).map(|s| s[0]) {
-        let (x, y) = ((head as usize % w) as f64, (head as usize / w) as f64);
-        let label_y = if y <= 1.0 { y + 1.75 } else { y - 0.55 };
-        spot = format!(
-            r##"<rect x="0" y="0" width="{w}" height="{h}" fill="#fff" opacity="0.72"/>{mine}<rect x="{bx}" y="{by}" width="1.36" height="1.36" fill="none" stroke="#e00" stroke-width="0.14"/><text x="{tx}" y="{label_y}" font-size="0.8" font-weight="bold" font-family="snek mono, monospace" fill="#e00" stroke="#fff" stroke-width="0.12" paint-order="stroke" text-anchor="middle">you!</text>"##,
-            bx = x - 0.18,
-            by = y - 0.18,
-            tx = x + 0.5,
-        );
-    } else {
-        sneks.push_str(&mine);
-    }
+    let spot = my_head.map_or_else(String::new, |head| spotlight_svg(grid, head, &mine));
 
     // Crop the view to the playable interior — the walls sit just off-screen.
     let svg = format!(
-        r##"<svg viewBox="1 1 {vw} {vh}" xmlns="http://www.w3.org/2000/svg" style="display:block;width:100%;height:100%;">
+        r#"<svg viewBox="1 1 {vw} {vh}" xmlns="http://www.w3.org/2000/svg" style="display:block;width:100%;height:100%;">
             {field}{food}{sneks}{clashes}{spot}
-        </svg>"##,
-        vw = w - 2,
-        vh = h - 2,
+        </svg>"#,
+        vw = grid.w - 2,
+        vh = grid.h - 2,
     );
 
-    let vis_w = (w - 2) as f64;
-    let vis_h = (h - 2) as f64;
     view! {
         <div
             class="board-wrap"
             on:click=move |ev: web_sys::MouseEvent| {
-                let Some(el) = ev
-                    .current_target()
-                    .and_then(|t| t.dyn_into::<web_sys::Element>().ok()) else {
-                    return;
-                };
-                let rect = el.get_bounding_client_rect();
-                if rect.width() <= 0.0 || rect.height() <= 0.0 {
-                    return;
-                }
-                // The svg keeps the board square inside whatever box it is
-                // given, centring it and leaving a margin on one axis. Taps
-                // have to be measured against the board, not the box, or
-                // every column is off by half the margin — and a tap in the
-                // margin is not a tap on the board at all.
-                let board_aspect = vis_w / vis_h;
-                let (bw, bh) = if rect.width() / rect.height() > board_aspect {
-                    (rect.height() * board_aspect, rect.height())
-                } else {
-                    (rect.width(), rect.width() / board_aspect)
-                };
-                let left = rect.left() + (rect.width() - bw) / 2.0;
-                let top = rect.top() + (rect.height() - bh) / 2.0;
-                let fx = (ev.client_x() - left) / bw;
-                let fy = (ev.client_y() - top) / bh;
-                if !(0.0..1.0).contains(&fx) || !(0.0..1.0).contains(&fy) {
-                    return; // in the margin beside the board
-                }
-                let x = 1 + (fx * vis_w) as i32;
-                let y = 1 + (fy * vis_h) as i32;
-                if x >= 1 && y >= 1 && (x as usize) < w - 1 && (y as usize) < h - 1 {
-                    on_cell((y as usize * w + x as usize) as Pos);
+                if let Some(pos) = grid.cell_at(&ev) {
+                    on_cell(pos);
                 }
             }
             inner_html=svg

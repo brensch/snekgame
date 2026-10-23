@@ -12,13 +12,18 @@
 //! Automatic reconnect with backoff; on rejoin the server replays full
 //! state, so no incremental state is ever trusted across a gap.
 
+use crate::num;
 use crate::store::{ConnStatus, GameView, Store};
 use futures_util::StreamExt;
 use gloo_timers::callback::{Interval, Timeout};
 use js_sys::Uint8Array;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use snek_shared::protocol::*;
+use snek_shared::protocol::{
+    ClientMsg, ComputeTelemetry, LobbyState, PROTOCOL_VERSION, ReconnectReport, ServerMsg, decode,
+    encode,
+};
+use snek_shared::{Dir, GameConfig, PlayerId, PlayerProfile, Turn};
 use std::cell::{Cell, RefCell};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -52,19 +57,44 @@ struct Conn {
     transport: Option<WebTransport>,
     control: Option<WritableStreamDefaultWriter>,
     dgrams: Option<WritableStreamDefaultWriter>,
-    _ping: Option<Interval>,
-    _repeat: Option<Interval>,
+    /// Held only to keep the keepalive running; dropping it stops it.
+    ping: Option<Interval>,
+    /// Likewise the move repeater (session mode).
+    repeat: Option<Interval>,
     backoff_ms: u32,
+    /// When this connection attempt began, while it is still trying: from
+    /// `open` until the server first says something on it. None once it is
+    /// live, and while waiting out a backoff.
+    attempt_started: Option<f64>,
 }
 
 thread_local! {
     static ACTIVE: RefCell<Option<Conn>> = const { RefCell::new(None) };
     /// When the last server message arrived (any kind — pongs count).
-    static LAST_RX: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    static LAST_RX: Cell<f64> = const { Cell::new(0.0) };
     /// Newest turn we have seen. Compute requests older than this are
     /// already obsolete — the tick they were for has resolved — so running
     /// them would only push the queue further behind.
-    static LATEST_TURN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static LATEST_TURN: Cell<u32> = const { Cell::new(0) };
+    /// This device's measured search speed, once it has been measured.
+    static BENCHMARK: Cell<Option<u32>> = const { Cell::new(None) };
+    /// The connection we lost and are getting back, while we are.
+    static OUTAGE: Cell<Option<Outage>> = const { Cell::new(None) };
+    /// When the page last came back into view.
+    static VISIBLE_SINCE: Cell<f64> = const { Cell::new(0.0) };
+    /// Whether the page was last seen hidden.
+    static HIDDEN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A live connection lost, timed until it is back so the server can be
+/// told how the reconnect went (see [`ReconnectReport`]).
+#[derive(Clone, Copy)]
+struct Outage {
+    /// Last thing heard on the connection that went.
+    last_rx: f64,
+    /// When the first attempt to replace it began.
+    first_attempt: f64,
+    attempts: u32,
 }
 
 /// Marker for the one automatic reload we allow ourselves.
@@ -110,8 +140,7 @@ fn diagnose_after_failure(store: Store, generation: u64) {
         let tcp_works = gloo_net::http::Request::get("/api/sessions")
             .send()
             .await
-            .map(|r| r.ok())
-            .unwrap_or(false);
+            .is_ok_and(|r| r.ok());
         // Only claim it if the attempt is still the live one and TCP really
         // did answer — otherwise this is just an offline phone.
         if tcp_works
@@ -131,7 +160,7 @@ fn is_stale() -> bool {
     LAST_RX.with(|c| now() - c.get() > STALE_MS)
 }
 
-pub fn now() -> f64 {
+pub(crate) fn now() -> f64 {
     js_sys::Date::now()
 }
 
@@ -147,12 +176,12 @@ fn wt_url() -> String {
 // ---------------------------------------------------------------------------
 
 /// Connect to a session lobby (idempotent).
-pub fn ensure_session(store: Store, session: &str) {
-    ensure(store, Mode::Session(session.to_string()));
+pub(crate) fn ensure_session(store: Store, session: &str) {
+    ensure(store, Mode::Session(session.to_owned()));
 }
 
 /// Subscribe to the live games list (idempotent).
-pub fn ensure_watch(store: Store) {
+pub(crate) fn ensure_watch(store: Store) {
     ensure(store, Mode::Watch);
 }
 
@@ -176,7 +205,7 @@ fn ensure(store: Store, mode: Mode) {
         store.saved_id.set(None);
         store.view_turn.set(None);
         store.selected_dir.set(None);
-        store.want_ready.set(None);
+        OUTAGE.with(|o| o.set(None));
     }
     if need_new {
         open(store, mode, BACKOFF_START_MS);
@@ -187,19 +216,23 @@ fn ensure(store: Store, mode: Mode) {
 /// wait out a (possibly throttled) backoff timer — reconnect right now if
 /// the connection isn't healthy. `open` bumps the generation, so any
 /// pending backoff timers and the old transport's callbacks go stale.
-pub fn nudge(store: Store) {
+pub(crate) fn nudge(store: Store) {
     let reopen = ACTIVE.with(|a| {
         let mut a = a.borrow_mut();
         match &mut *a {
             Some(conn) => {
                 conn.backoff_ms = BACKOFF_START_MS;
-                // A transport that looks fine but has gone silent is a
-                // zombie (suspended tabs often never fire `closed`), and a
-                // connect/join that never completes is a hang.
-                let unhealthy = conn.transport.is_none()
-                    || store.conn.get_untracked() != ConnStatus::Connected
-                    || is_stale();
-                unhealthy.then(|| conn.mode.clone())
+                // Waiting out a backoff: skip the rest of it. A transport
+                // that looks fine but has gone silent is a zombie
+                // (suspended tabs often never fire `closed`). An attempt
+                // that has run past its deadline is a hang. An attempt
+                // still inside its deadline is none of these: restarting
+                // it only throws away a handshake already under way.
+                let waiting = conn.transport.is_none() && conn.attempt_started.is_none();
+                let hung = conn
+                    .attempt_started
+                    .is_some_and(|t| now() - t > f64::from(CONNECT_TIMEOUT_MS));
+                (waiting || hung || is_stale()).then(|| conn.mode.clone())
             }
             None => None,
         }
@@ -214,14 +247,14 @@ pub fn nudge(store: Store) {
 /// reopened — zombie "Connected" transports and stalled connect/join
 /// cycles alike. Every reopen resets the clock, so healthy attempts are
 /// never interrupted.
-pub fn check_liveness(store: Store) {
+pub(crate) fn check_liveness(store: Store) {
     if store.conn.get_untracked() != ConnStatus::Idle && is_stale() {
         nudge(store);
     }
 }
 
 /// Tear down (leaving for an unconnected page).
-pub fn disconnect(store: Store) {
+pub(crate) fn disconnect(store: Store) {
     ACTIVE.with(|a| {
         if let Some(mut conn) = a.borrow_mut().take() {
             conn.generation += 1;
@@ -231,24 +264,38 @@ pub fn disconnect(store: Store) {
         }
     });
     store.conn.set(ConnStatus::Idle);
-    store.want_ready.set(None);
+    OUTAGE.with(|o| o.set(None));
     store.lobby.set(None);
     store.game.set(None);
     store.saved_id.set(None);
     store.view_turn.set(None);
 }
 
-/// Control-class message over the reliable stream.
-pub fn send(msg: &ClientMsg) {
+/// A message as the control stream carries it: its length (u32, little
+/// endian), then the message.
+fn framed(msg: &ClientMsg) -> Option<Vec<u8>> {
     let bytes = encode(msg);
+    let len = u32::try_from(bytes.len()).ok()?;
+    let mut framed = Vec::with_capacity(bytes.len() + 4);
+    framed.extend_from_slice(&len.to_le_bytes());
+    framed.extend_from_slice(&bytes);
+    Some(framed)
+}
+
+/// Write one framed message to a control stream.
+fn write_framed(writer: &WritableStreamDefaultWriter, msg: &ClientMsg) {
+    if let Some(framed) = framed(msg) {
+        let _ = writer.write_with_chunk(&Uint8Array::from(framed.as_slice()).into());
+    }
+}
+
+/// Control-class message over the reliable stream.
+pub(crate) fn send(msg: &ClientMsg) {
     ACTIVE.with(|a| {
-        if let Some(conn) = &*a.borrow() {
-            if let Some(writer) = &conn.control {
-                let mut framed = Vec::with_capacity(bytes.len() + 4);
-                framed.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-                framed.extend_from_slice(&bytes);
-                let _ = writer.write_with_chunk(&Uint8Array::from(framed.as_slice()).into());
-            }
+        if let Some(conn) = &*a.borrow()
+            && let Some(writer) = &conn.control
+        {
+            write_framed(writer, msg);
         }
     });
 }
@@ -256,17 +303,24 @@ pub fn send(msg: &ClientMsg) {
 fn send_datagram(msg: &ClientMsg) {
     let bytes = encode(msg);
     ACTIVE.with(|a| {
-        if let Some(conn) = &*a.borrow() {
-            if let Some(writer) = &conn.dgrams {
-                let _ = writer.write_with_chunk(&Uint8Array::from(bytes.as_slice()).into());
-            }
+        if let Some(conn) = &*a.borrow()
+            && let Some(writer) = &conn.dgrams
+        {
+            let _ = writer.write_with_chunk(&Uint8Array::from(bytes.as_slice()).into());
         }
     });
 }
 
-/// Steer: optimistic d-pad highlight now, datagram up, server truth on the
-/// next snapshot. The repeat timer keeps re-sending until then.
-pub fn send_move(store: Store, dir: snek_shared::Dir) {
+/// Steer: light the key you pressed, send the move up, and keep re-sending
+/// it until the server has resolved the turn. The lit key is your own
+/// input, not game state: pending moves are private (nobody else ever sees
+/// them), and the next snapshot shows where your snek actually went. Not
+/// connected, nothing happens at all, so the pad never shows a move the
+/// server can't have.
+pub(crate) fn send_move(store: Store, dir: Dir) {
+    if store.conn.get_untracked() != ConnStatus::Connected {
+        return;
+    }
     store.selected_dir.set(Some(dir));
     send_datagram(&ClientMsg::Move(dir));
 }
@@ -279,19 +333,37 @@ fn is_current(generation: u64) -> bool {
     ACTIVE.with(|a| {
         a.borrow()
             .as_ref()
-            .map(|c| c.generation == generation)
-            .unwrap_or(false)
+            .is_some_and(|c| c.generation == generation)
     })
 }
 
 fn open(store: Store, mode: Mode, backoff_ms: u32) {
+    // A reconnect, as opposed to a first connect or a navigation: time it.
+    if matches!(
+        store.conn.get_untracked(),
+        ConnStatus::Connected | ConnStatus::Reconnecting
+    ) {
+        let started = now();
+        let last_rx = LAST_RX.with(Cell::get);
+        OUTAGE.with(|o| {
+            let outage = o.get().unwrap_or(Outage {
+                last_rx,
+                first_attempt: started,
+                attempts: 0,
+            });
+            o.set(Some(Outage {
+                attempts: outage.attempts + 1,
+                ..outage
+            }));
+        });
+    }
     let generation = ACTIVE.with(|a| {
         let mut a = a.borrow_mut();
-        let generation = a.as_ref().map(|c| c.generation + 1).unwrap_or(1);
-        if let Some(mut old) = a.take() {
-            if let Some(t) = old.transport.take() {
-                t.close();
-            }
+        let generation = a.as_ref().map_or(1, |c| c.generation + 1);
+        if let Some(mut old) = a.take()
+            && let Some(t) = old.transport.take()
+        {
+            t.close();
         }
         *a = Some(Conn {
             mode: mode.clone(),
@@ -299,9 +371,10 @@ fn open(store: Store, mode: Mode, backoff_ms: u32) {
             transport: None,
             control: None,
             dgrams: None,
-            _ping: None,
-            _repeat: None,
+            ping: None,
+            repeat: None,
             backoff_ms,
+            attempt_started: Some(now()),
         });
         generation
     });
@@ -324,17 +397,56 @@ fn open(store: Store, mode: Mode, backoff_ms: u32) {
         }
     });
 
-    // Hung-attempt guard: if this generation still isn't Connected after the
+    // Hung-attempt guard: if this attempt is still trying after the
     // deadline, abandon it (open bumps the generation, orphaning the hung
-    // future and closing its transport) and try again.
+    // future and closing its transport) and try again. It asks whether
+    // *this attempt* got through, not what the status is now: a phone that
+    // sleeps fires this timer late, long after the attempt connected, and
+    // the status it would see is the one the sleep itself caused.
     Timeout::new(CONNECT_TIMEOUT_MS, move || {
-        if is_current(generation) && store.conn.get_untracked() != ConnStatus::Connected {
+        if still_trying(generation) {
             diagnose_after_failure(store, generation);
             let next = (backoff_ms * 2).min(BACKOFF_MAX_MS);
             open(store, mode, next);
         }
     })
     .forget();
+}
+
+/// Whether this generation is the live one and still hasn't heard from the
+/// server.
+fn still_trying(generation: u64) -> bool {
+    ACTIVE.with(|a| {
+        a.borrow()
+            .as_ref()
+            .is_some_and(|c| c.generation == generation && c.attempt_started.is_some())
+    })
+}
+
+/// The server is talking to us again after an outage: tell it how getting
+/// back went. Sessions only; the home screen's list has no one to tell.
+fn report_reconnect() {
+    let Some(outage) = OUTAGE.with(Cell::take) else {
+        return;
+    };
+    let in_session = ACTIVE.with(|a| {
+        a.borrow()
+            .as_ref()
+            .is_some_and(|c| matches!(c.mode, Mode::Session(_)))
+    });
+    if !in_session {
+        return;
+    }
+    let at = now();
+    let visible_since = VISIBLE_SINCE.with(Cell::get);
+    send(&ClientMsg::Reconnected(ReconnectReport {
+        attempts: outage.attempts,
+        silent_ms: num::to_u32(at - outage.last_rx),
+        reconnect_ms: num::to_u32(at - outage.first_attempt),
+        // Only if the page was hidden after the old connection went quiet:
+        // otherwise it was in view throughout and there is no wake to time.
+        since_visible_ms: (visible_since > outage.last_rx).then(|| num::to_u32(at - visible_since)),
+    }));
 }
 
 fn tracing_debug(e: &JsValue) {
@@ -358,6 +470,14 @@ fn datagram_writer(
     stream.get_writer()
 }
 
+/// What a dev server publishes at /api/dev/wt (see [`dev_wt`]).
+#[derive(serde::Deserialize)]
+struct DevWt {
+    port: u16,
+    #[serde(rename = "certHash")]
+    cert_hash: Vec<u8>,
+}
+
 /// Local dev: a page served from localhost talks to a snek-server that has
 /// no real certificate, only a self-signed one. Browsers accept that over
 /// WebTransport only if handed the certificate's hash up front, which that
@@ -367,12 +487,6 @@ async fn dev_wt() -> Option<(u16, Vec<u8>)> {
     let host = web_sys::window()?.location().hostname().ok()?;
     if host != "localhost" && host != "127.0.0.1" {
         return None;
-    }
-    #[derive(serde::Deserialize)]
-    struct DevWt {
-        port: u16,
-        #[serde(rename = "certHash")]
-        cert_hash: Vec<u8>,
     }
     let resp = gloo_net::http::Request::get("/api/dev/wt")
         .send()
@@ -394,7 +508,7 @@ fn open_transport(dev: Option<(u16, Vec<u8>)>) -> Result<WebTransport, JsValue> 
         .unwrap_or_default();
     let hash = web_sys::WebTransportHash::new();
     hash.set_algorithm("sha-256");
-    hash.set_value_u8_array(&js_sys::Uint8Array::from(&cert_hash[..]));
+    hash.set_value_u8_array(&Uint8Array::from(&cert_hash[..]));
     let opts = web_sys::WebTransportOptions::new();
     opts.set_server_certificate_hashes(&[hash]);
     WebTransport::new_with_options(&format!("https://{host}:{port}"), &opts)
@@ -402,8 +516,7 @@ fn open_transport(dev: Option<(u16, Vec<u8>)>) -> Result<WebTransport, JsValue> 
 
 fn webtransport_missing() -> bool {
     web_sys::window()
-        .map(|w| !js_sys::Reflect::has(&w, &"WebTransport".into()).unwrap_or(false))
-        .unwrap_or(true)
+        .is_none_or(|w| !js_sys::Reflect::has(&w, &"WebTransport".into()).unwrap_or(false))
 }
 
 async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValue> {
@@ -422,10 +535,10 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
     // Register immediately so the attempt-timeout guard (and any newer
     // generation) can close a handshake that never resolves.
     ACTIVE.with(|a| {
-        if let Some(conn) = &mut *a.borrow_mut() {
-            if conn.generation == generation {
-                conn.transport = Some(transport.clone());
-            }
+        if let Some(conn) = &mut *a.borrow_mut()
+            && conn.generation == generation
+        {
+            conn.transport = Some(transport.clone());
         }
     });
     JsFuture::from(transport.ready()).await?;
@@ -457,40 +570,13 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
             profile: store.profile.get_untracked(),
         },
     };
-    {
-        let bytes = encode(&first);
-        let mut framed = Vec::with_capacity(bytes.len() + 4);
-        framed.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        framed.extend_from_slice(&bytes);
-        let _ = control_writer.write_with_chunk(&Uint8Array::from(framed.as_slice()).into());
-    }
+    write_framed(&control_writer, &first);
 
     // Keepalive ping (both modes — liveness needs traffic) + input
     // redundancy (session mode only).
-    let ping = {
-        let mut n = 0u32;
-        Interval::new(PING_INTERVAL_MS, move || {
-            n = n.wrapping_add(1);
-            send_datagram(&ClientMsg::Ping(n));
-        })
-    };
+    let ping = keepalive();
     let repeat = match mode {
-        Mode::Session(_) => {
-            let repeat = Interval::new(MOVE_REPEAT_MS, move || {
-                let live = store.game.with_untracked(|g| {
-                    g.as_ref()
-                        .and_then(|g| g.turns.last())
-                        .map(|t| !t.game_over() && t.alive.contains(&store.me.get_untracked()))
-                        .unwrap_or(false)
-                });
-                if live {
-                    if let Some(dir) = store.selected_dir.get_untracked() {
-                        send_datagram(&ClientMsg::Move(dir));
-                    }
-                }
-            });
-            Some(repeat)
-        }
+        Mode::Session(_) => Some(move_repeater(store)),
         Mode::Watch => None,
     };
 
@@ -500,84 +586,28 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
                 conn.transport = Some(transport.clone());
                 conn.control = Some(control_writer);
                 conn.dgrams = Some(dgram_writer);
-                conn._ping = Some(ping);
-                conn._repeat = repeat;
+                conn.ping = Some(ping);
+                conn.repeat = repeat;
                 conn.backoff_ms = BACKOFF_START_MS; // healthy again
             } else {
                 transport.close();
             }
         }
     });
-    store.conn.set(ConnStatus::Connected);
-    FAILED_ATTEMPTS.with(|c| c.set(0));
-    store.quic_blocked.set(false);
-
-    // Reader: control stream (length-prefixed frames).
-    {
-        let mut stream = wasm_streams::ReadableStream::from_raw(
-            control_readable.unchecked_into::<web_sys::ReadableStream>(),
-        )
-        .into_stream();
-        spawn_local(async move {
-            let mut buf: Vec<u8> = Vec::new();
-            while let Some(Ok(chunk)) = stream.next().await {
-                if !is_current(generation) {
-                    return;
-                }
-                buf.extend_from_slice(&Uint8Array::new(&chunk).to_vec());
-                loop {
-                    if buf.len() < 4 {
-                        break;
-                    }
-                    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-                    if buf.len() < 4 + len {
-                        break;
-                    }
-                    let frame: Vec<u8> = buf.drain(..4 + len).skip(4).collect();
-                    if let Some(msg) = decode::<ServerMsg>(&frame) {
-                        apply(store, msg);
-                    }
-                }
-            }
-        });
-    }
-
-    // Reader: datagrams (one message per datagram).
-    {
-        let mut stream = wasm_streams::ReadableStream::from_raw(
-            dgram_readable.unchecked_into::<web_sys::ReadableStream>(),
-        )
-        .into_stream();
-        spawn_local(async move {
-            while let Some(Ok(chunk)) = stream.next().await {
-                if !is_current(generation) {
-                    return;
-                }
-                if let Some(msg) = decode::<ServerMsg>(&Uint8Array::new(&chunk).to_vec()) {
-                    apply(store, msg);
-                }
-            }
-        });
-    }
+    // Not Connected yet: that is the server talking to us (see `apply`),
+    // not a handshake finishing.
+    read_control(
+        store,
+        generation,
+        control_readable.unchecked_into::<web_sys::ReadableStream>(),
+    );
+    read_datagrams(store, generation, dgram_readable);
 
     // Session hosts contribute compute: measure this device's real search
     // speed (~600ms of actual search, chunked so the UI stays alive) and
     // report it. The server assigns bots to the fastest phones.
     if matches!(mode, Mode::Session(_)) {
-        spawn_local(async move {
-            let rate = benchmark_sims_per_sec(generation).await;
-            if is_current(generation) {
-                if let Some(rate) = rate {
-                    send(&ClientMsg::Benchmark {
-                        sims_per_sec: rate,
-                        device: device_description(),
-                        cores: web_sys::window()
-                            .map(|w| w.navigator().hardware_concurrency() as u32)
-                            .unwrap_or(4),
-                    });
-                }
-            }
-        });
+        spawn_local(volunteer_compute(generation));
     }
 
     // Reconnect when the transport dies.
@@ -590,6 +620,96 @@ async fn connect(store: Store, mode: Mode, generation: u64) -> Result<(), JsValu
     });
 
     Ok(())
+}
+
+/// Ping every couple of seconds, so a live connection is never silent.
+fn keepalive() -> Interval {
+    let mut n = 0u32;
+    Interval::new(PING_INTERVAL_MS, move || {
+        n = n.wrapping_add(1);
+        send_datagram(&ClientMsg::Ping(n));
+    })
+}
+
+/// Re-send our heading while we are alive in a running game, so a lost
+/// input costs one repeat, not a turn.
+fn move_repeater(store: Store) -> Interval {
+    Interval::new(MOVE_REPEAT_MS, move || {
+        let live = store.game.with_untracked(|g| {
+            g.as_ref()
+                .and_then(|g| g.turns.last())
+                .is_some_and(|t| !t.game_over() && t.alive.contains(&store.me.get_untracked()))
+        });
+        if live && let Some(dir) = store.selected_dir.get_untracked() {
+            send_datagram(&ClientMsg::Move(dir));
+        }
+    })
+}
+
+/// Reader: control stream (length-prefixed frames).
+fn read_control(store: Store, generation: u64, readable: web_sys::ReadableStream) {
+    let mut stream = wasm_streams::ReadableStream::from_raw(readable).into_stream();
+    spawn_local(async move {
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(Ok(chunk)) = stream.next().await {
+            if !is_current(generation) {
+                return;
+            }
+            buf.extend_from_slice(&Uint8Array::new(&chunk).to_vec());
+            loop {
+                if buf.len() < 4 {
+                    break;
+                }
+                let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if buf.len() < 4 + len {
+                    break;
+                }
+                let frame: Vec<u8> = buf.drain(..4 + len).skip(4).collect();
+                if let Some(msg) = decode::<ServerMsg>(&frame) {
+                    apply(store, msg);
+                }
+            }
+        }
+    });
+}
+
+/// Reader: datagrams (one message per datagram).
+fn read_datagrams(store: Store, generation: u64, readable: web_sys::ReadableStream) {
+    let mut stream = wasm_streams::ReadableStream::from_raw(readable).into_stream();
+    spawn_local(async move {
+        while let Some(Ok(chunk)) = stream.next().await {
+            if !is_current(generation) {
+                return;
+            }
+            if let Some(msg) = decode::<ServerMsg>(&Uint8Array::new(&chunk).to_vec()) {
+                apply(store, msg);
+            }
+        }
+    });
+}
+
+/// Benchmark this device and offer it to the server as a bot host.
+///
+/// Measured once per page load: the device doesn't get slower or faster
+/// between connections, and a reconnect is exactly when a phone that has
+/// just woken up should be answering the server, not searching a test
+/// board.
+async fn volunteer_compute(generation: u64) {
+    let mut rate = BENCHMARK.with(Cell::get);
+    if rate.is_none() {
+        rate = benchmark_sims_per_sec(generation).await;
+        BENCHMARK.with(|b| b.set(rate));
+    }
+    if is_current(generation)
+        && let Some(rate) = rate
+    {
+        send(&ClientMsg::Benchmark {
+            sims_per_sec: rate,
+            device: device_description(),
+            cores: web_sys::window()
+                .map_or(4, |w| num::to_u32(w.navigator().hardware_concurrency())),
+        });
+    }
 }
 
 thread_local! {
@@ -626,11 +746,11 @@ thread_local! {
 }
 
 /// Start the heartbeat. Sampling costs a timer callback every 50ms.
-pub fn watch_main_thread() {
+pub(crate) fn watch_main_thread() {
     let mut last = now();
     let beat = Interval::new(50, move || {
         let t = now();
-        let lag = ((t - last) - 50.0).max(0.0) as u32;
+        let lag = num::to_u32((t - last) - 50.0);
         last = t;
         LOOP_LAG_MS.with(|c| c.set(c.get().max(lag)));
     });
@@ -645,7 +765,12 @@ fn take_loop_lag() -> u32 {
 /// Tell the server whether this device can think right now. A hidden page
 /// has its workers suspended — saying nothing would leave its bots holding
 /// their heading into a wall while the phone sleeps.
-pub fn report_availability(visible: bool) {
+pub(crate) fn report_availability(visible: bool) {
+    // Focus and pageshow report "visible" too; only a return from hidden
+    // is a wake.
+    if HIDDEN.with(|h| h.replace(!visible)) && visible {
+        VISIBLE_SINCE.with(|v| v.set(now()));
+    }
     send(&ClientMsg::HostAvailable {
         can_compute: visible,
     });
@@ -660,7 +785,7 @@ fn device_description() -> String {
     let inner = ua
         .split_once('(')
         .and_then(|(_, rest)| rest.split_once(')'))
-        .map(|(inner, _)| inner.to_string())
+        .map(|(inner, _)| inner.to_owned())
         .unwrap_or(ua);
     inner.chars().take(80).collect()
 }
@@ -668,27 +793,27 @@ fn device_description() -> String {
 /// ~600ms of genuine search on a synthetic board, yielding between chunks.
 async fn benchmark_sims_per_sec(generation: u64) -> Option<u32> {
     use snek_shared::{Engine, GameConfig};
-    let config = GameConfig {
-        board_width: 13,
-        board_height: 13,
-        tick_ms: 1000,
-        food_emoji: snek_shared::DEFAULT_FOOD.to_string(),
-    };
-    let a: snek_shared::PlayerId = "bench-a".into();
-    let mut engine = Engine::new(config.clone(), vec![a.clone(), "bench-b".into()], 1);
-    let turn = engine.first_turn();
-
     // One timed search on the worker: it both proves a worker can run here
     // (no worker, no volunteering) and gives an initial speed for ranking
     // hosts. Everything after this is deadline-driven, so nothing is
     // predicted from it.
     const PROBE_MS: u32 = 300;
+    let config = GameConfig {
+        board_width: 13,
+        board_height: 13,
+        tick_ms: 1000,
+        food_emoji: snek_shared::DEFAULT_FOOD.to_owned(),
+    };
+    let a: PlayerId = "bench-a".into();
+    let mut engine = Engine::new(config.clone(), vec![a.clone(), "bench-b".into()], 1);
+    let turn = engine.first_turn();
+
     let (_dir, _proof, sims, _slices, _began, _search) =
         crate::botworker::compute(config, turn, a.clone(), PROBE_MS, 0).await?;
     if !is_current(generation) {
         return None;
     }
-    Some(((sims as f64) * 1000.0 / PROBE_MS as f64) as u32)
+    Some(num::to_u32(f64::from(sims) * 1000.0 / f64::from(PROBE_MS)))
 }
 
 fn schedule_reconnect(store: Store, generation: u64) {
@@ -701,8 +826,9 @@ fn schedule_reconnect(store: Store, generation: u64) {
         conn.transport = None;
         conn.control = None;
         conn.dgrams = None;
-        conn._ping = None;
-        conn._repeat = None;
+        conn.ping = None;
+        conn.repeat = None;
+        conn.attempt_started = None;
         let mode = conn.mode.clone();
         let backoff = conn.backoff_ms;
         conn.backoff_ms = (backoff * 2).min(BACKOFF_MAX_MS);
@@ -725,109 +851,29 @@ fn apply(store: Store, msg: ServerMsg) {
     // connection — not merely that a QUIC handshake finished. This is what
     // lets the hung-attempt guard recycle a stalled join.
     if store.conn.get_untracked() != ConnStatus::Connected {
+        ACTIVE.with(|a| {
+            if let Some(conn) = &mut *a.borrow_mut() {
+                conn.attempt_started = None;
+            }
+        });
         store.conn.set(ConnStatus::Connected);
+        report_reconnect();
         FAILED_ATTEMPTS.with(|c| c.set(0));
         store.quic_blocked.set(false);
     }
     match msg {
         ServerMsg::Welcome { your_id } => {
             store.me.set(your_id);
-            // A fresh connection: say again anything we said on the last one
-            // that never got through. Ready is the only such intent, and
-            // repeating it is harmless — the server holds a set, not a
-            // counter.
-            if let Some(ready) = store.want_ready.get_untracked() {
-                send(&ClientMsg::SetReady(ready));
-            }
         }
         ServerMsg::Sessions(list) => store.sessions.set(Some(list)),
-        ServerMsg::Lobby(lobby) => {
-            // Server phase truth: no game running + we hold an *unfinished*
-            // game means we missed the ending while away — fall back to the
-            // lobby. A finished game (results screen) stays until the user
-            // leaves it.
-            if !lobby.game_running {
-                let stale_unfinished = store.game.with_untracked(|g| {
-                    g.as_ref()
-                        .and_then(|g| g.turns.last())
-                        .map(|t| !t.game_over())
-                        .unwrap_or(false)
-                });
-                if stale_unfinished {
-                    store.game.set(None);
-                    store.view_turn.set(None);
-                    store.selected_dir.set(None);
-                }
-            }
-            let me_ready = lobby.ready.contains(&store.me.get_untracked());
-            if store.want_ready.get_untracked() == Some(me_ready) {
-                store.want_ready.set(None);
-            }
-            // A settings change by anyone (us included) flashes who made it.
-            // The first lobby of a session is not a change.
-            let changed = store.lobby.with_untracked(|old| {
-                old.as_ref()
-                    .map(|old| old.session == lobby.session && old.config_rev != lobby.config_rev)
-                    .unwrap_or(false)
-            });
-            if changed {
-                store.settings_flash_at.set(now());
-            }
-            store.lobby.set(Some(lobby));
-        }
+        ServerMsg::Lobby(lobby) => on_lobby(store, lobby),
         ServerMsg::GameStart {
             config,
             players,
             turn,
             countdown_ms,
-        } => {
-            LATEST_TURN.with(|c| c.set(turn.turn_number));
-            // Boot a worker for every bot now, during the countdown. Each
-            // worker compiles its own wasm instance on first use (~100ms+);
-            // paying that inside a move's deadline is what makes the first
-            // ticks of a game miss.
-            for bot in players.iter().filter(|p| snek_shared::is_bot(&p.id)) {
-                let (cfg, t, id) = (config.clone(), turn.clone(), bot.id.clone());
-                spawn_local(async move {
-                    let _ = crate::botworker::compute(cfg, t, id, 1, 0).await;
-                });
-            }
-            store.saved_id.set(None);
-            store.view_turn.set(None);
-            store.countdown_ends.set(now() + countdown_ms as f64);
-            // Pre-select the clockwise default heading on the d-pad.
-            let me = store.me.get_untracked();
-            // A fresh game always runs; never inherit the last one's hold.
-            store.paused.set(false);
-            store.want_ready.set(None);
-            store.selected_dir.set(
-                turn.snakes
-                    .get(&me)
-                    .map(|s| snek_shared::clockwise_start_dir(&config.clone(), s[0])),
-            );
-            store.game.set(Some(GameView {
-                config,
-                players,
-                turns: vec![turn],
-            }));
-        }
-        ServerMsg::Turn(turn) => {
-            LATEST_TURN.with(|c| c.set(c.get().max(turn.turn_number)));
-            // Datagram-class: dedup the redundant copies, drop stale
-            // reorderings, accept gaps (snapshots are full state).
-            let me = store.me.get_untracked();
-            store.game.update(|g| {
-                if let Some(g) = g {
-                    let last = g.turns.last().map(|t| t.turn_number).unwrap_or(0);
-                    if turn.turn_number > last {
-                        if let Some(&dir) = turn.moves.get(&me) {
-                            store.selected_dir.set(Some(dir));
-                        }
-                        g.turns.push(turn);
-                    }
-                }
-            });
-        }
+        } => on_game_start(store, config, players, turn, countdown_ms),
+        ServerMsg::Turn(turn) => on_turn(store, turn),
         ServerMsg::GameInProgress {
             config,
             players,
@@ -848,129 +894,245 @@ fn apply(store: Store, msg: ServerMsg) {
             think_ms,
             nonce,
             ..
-        } => {
-            // All search happens on the worker thread; the UI thread never
-            // touches it. A device that cannot spawn a worker never
-            // benchmarks, so it is never assigned a bot in the first place
-            // — and if one somehow arrives, staying silent makes the server
-            // hand that bot to another phone.
-            if !first_sighting(request_id) {
-                return; // another copy of this request got here first
-            }
-            if turn.turn_number < LATEST_TURN.with(|c| c.get()) {
-                web_sys::console::debug_1(&JsValue::from_str(&format!(
-                    "compute skipped as stale bot={bot_id} turn={}",
-                    turn.turn_number
-                )));
-                return; // superseded before we even started
-            }
-            let bot_label = bot_id.clone();
-            spawn_local(async move {
-                let requested_for = turn.turn_number;
-                let arrived = now();
-                let (dir, tm) = match crate::botworker::compute(
-                    config.clone(),
-                    turn.clone(),
-                    bot_id.clone(),
-                    think_ms,
-                    nonce,
-                )
-                .await
-                {
-                    Some((dir, _proof, sims, slices, began_ms, search_ms)) => (
-                        dir,
-                        ComputeTelemetry {
-                            queue_ms: (began_ms - arrived).max(0.0) as u32,
-                            search_ms,
-                            total_ms: (now() - arrived).max(0.0) as u32,
-                            think_ms,
-                            sims,
-                            slices,
-                            fallback: false,
-                            loop_lag_ms: take_loop_lag(),
-                        },
-                    ),
-                    None => {
-                        // The worker is gone. Say so — silence here is
-                        // indistinguishable from a dead client — then take
-                        // a short, bounded turn on this thread so the bot
-                        // still plays. A brief hitch beats a snake driving
-                        // into a wall.
-                        send_datagram(&ClientMsg::ComputeFailed {
-                            request_id,
-                            reason: "worker unavailable".into(),
-                        });
-                        let mut search =
-                            snek_shared::bot::begin(&config, &turn, &bot_id, u32::MAX, nonce);
-                        let cutoff = now() + (think_ms as f64).min(60.0);
-                        let mut sims = 0u32;
-                        while !search.step(64) {
-                            sims += 64;
-                            if now() >= cutoff {
-                                break;
-                            }
-                        }
-                        (
-                            search.result().0,
-                            ComputeTelemetry {
-                                queue_ms: 0,
-                                search_ms: (now() - cutoff + 60.0).max(0.0) as u32,
-                                total_ms: (now() - arrived).max(0.0) as u32,
-                                think_ms,
-                                sims,
-                                slices: sims / 64,
-                                fallback: true,
-                                loop_lag_ms: take_loop_lag(),
-                            },
-                        )
-                    }
-                };
-                web_sys::console::debug_1(&JsValue::from_str(&format!(
-                    "compute bot={bot_label} turn={requested_for} think={}ms queue={}ms search={}ms total={}ms sims={} slices={} fallback={}",
-                    tm.think_ms, tm.queue_ms, tm.search_ms, tm.total_ms, tm.sims,
-                    tm.slices, tm.fallback
-                )));
-                // Always report, even if the tick already resolved: the
-                // server discards a stale move but keeps the timings, and
-                // silence is indistinguishable from a broken client.
-                let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
-                // Datagrams, not the control stream: a bot move is only
-                // useful for one tick, and on the reliable stream a single
-                // lost packet head-of-line blocks every bot's answer at
-                // once — which is exactly how three independent workers end
-                // up defaulting on the same turn. Sent twice; the server
-                // ignores the duplicate.
-                let msg = ClientMsg::BotMove {
-                    request_id,
-                    dir,
-                    proof,
-                    tm,
-                };
-                send_datagram(&msg);
-                send_datagram(&msg);
-            });
-        }
+        } => on_compute_request(BotJob {
+            request_id,
+            bot_id,
+            config,
+            turn,
+            think_ms,
+            nonce,
+        }),
         ServerMsg::GameSaved { id, .. } => store.saved_id.set(Some(id)),
-        ServerMsg::Error(e) => {
-            // A version mismatch means this page is running code the server
-            // has moved past, and no amount of reconnecting will fix it —
-            // it just retries forever behind "Joining session…". Telling a
-            // stuck page to refresh itself is the only thing that works, and
-            // the shell is served no-cache so the reload picks up the new
-            // build. Once only: if a reload doesn't resolve it, looping
-            // would be worse than showing the error.
-            if e.contains("version") && !reloaded_recently() {
-                if let Some(w) = web_sys::window() {
-                    let _ = w
-                        .session_storage()
-                        .map(|s| s.map(|s| s.set_item(RELOAD_KEY, &now().to_string())));
-                    let _ = w.location().reload();
-                    return;
-                }
-            }
-            store.error.set(Some(e));
-        }
+        ServerMsg::Error(e) => on_error(store, e),
         ServerMsg::Paused(paused) => store.paused.set(paused),
         ServerMsg::Pong(_) => {}
     }
+}
+
+fn on_lobby(store: Store, lobby: LobbyState) {
+    // Server phase truth: no game running + we hold an *unfinished*
+    // game means we missed the ending while away — fall back to the
+    // lobby. A finished game (results screen) stays until the user
+    // leaves it.
+    if !lobby.game_running {
+        let stale_unfinished = store.game.with_untracked(|g| {
+            g.as_ref()
+                .and_then(|g| g.turns.last())
+                .is_some_and(|t| !t.game_over())
+        });
+        if stale_unfinished {
+            store.game.set(None);
+            store.view_turn.set(None);
+            store.selected_dir.set(None);
+        }
+    }
+    // A settings change by anyone (us included) flashes who made it.
+    // The first lobby of a session is not a change.
+    let changed = store.lobby.with_untracked(|old| {
+        old.as_ref()
+            .is_some_and(|old| old.session == lobby.session && old.config_rev != lobby.config_rev)
+    });
+    if changed {
+        store.settings_flash_at.set(now());
+    }
+    store.lobby.set(Some(lobby));
+}
+
+fn on_game_start(
+    store: Store,
+    config: GameConfig,
+    players: Vec<PlayerProfile>,
+    turn: Turn,
+    countdown_ms: u32,
+) {
+    LATEST_TURN.with(|c| c.set(turn.turn_number));
+    // Boot a worker for every bot now, during the countdown. Each
+    // worker compiles its own wasm instance on first use (~100ms+);
+    // paying that inside a move's deadline is what makes the first
+    // ticks of a game miss.
+    for bot in players.iter().filter(|p| snek_shared::is_bot(&p.id)) {
+        let (cfg, t, id) = (config.clone(), turn.clone(), bot.id.clone());
+        spawn_local(async move {
+            let _ = crate::botworker::compute(cfg, t, id, 1, 0).await;
+        });
+    }
+    store.saved_id.set(None);
+    store.view_turn.set(None);
+    store.countdown_ends.set(now() + f64::from(countdown_ms));
+    // Pre-select the clockwise default heading on the d-pad.
+    let me = store.me.get_untracked();
+    // A fresh game always runs; never inherit the last one's hold.
+    store.paused.set(false);
+    store.selected_dir.set(
+        turn.snakes
+            .get(&me)
+            .and_then(|s| s.first())
+            .map(|&head| snek_shared::clockwise_start_dir(&config, head)),
+    );
+    store.game.set(Some(GameView {
+        config,
+        players,
+        turns: vec![turn],
+    }));
+}
+
+fn on_turn(store: Store, turn: Turn) {
+    LATEST_TURN.with(|c| c.set(c.get().max(turn.turn_number)));
+    // Datagram-class: dedup the redundant copies, drop stale
+    // reorderings, accept gaps (snapshots are full state).
+    let me = store.me.get_untracked();
+    store.game.update(|g| {
+        if let Some(g) = g {
+            let last = g.turns.last().map_or(0, |t| t.turn_number);
+            if turn.turn_number > last {
+                if let Some(&dir) = turn.moves.get(&me) {
+                    store.selected_dir.set(Some(dir));
+                }
+                g.turns.push(turn);
+            }
+        }
+    });
+}
+
+/// A `ComputeRequest`: one bot move the server wants from this device.
+struct BotJob {
+    request_id: u64,
+    bot_id: PlayerId,
+    config: GameConfig,
+    turn: Turn,
+    think_ms: u32,
+    nonce: u64,
+}
+
+fn on_compute_request(job: BotJob) {
+    // All search happens on the worker thread; the UI thread never
+    // touches it. A device that cannot spawn a worker never
+    // benchmarks, so it is never assigned a bot in the first place
+    // — and if one somehow arrives, staying silent makes the server
+    // hand that bot to another phone.
+    if !first_sighting(job.request_id) {
+        return; // another copy of this request got here first
+    }
+    if job.turn.turn_number < LATEST_TURN.with(Cell::get) {
+        web_sys::console::debug_1(&JsValue::from_str(&format!(
+            "compute skipped as stale bot={} turn={}",
+            job.bot_id, job.turn.turn_number
+        )));
+        return; // superseded before we even started
+    }
+    spawn_local(think_for_bot(job));
+}
+
+/// Search for the bot's move, on the worker if there is one, and answer.
+async fn think_for_bot(job: BotJob) {
+    let requested_for = job.turn.turn_number;
+    let arrived = now();
+    let searched = crate::botworker::compute(
+        job.config.clone(),
+        job.turn.clone(),
+        job.bot_id.clone(),
+        job.think_ms,
+        job.nonce,
+    )
+    .await;
+    let (dir, tm) = if let Some((dir, _proof, sims, slices, began_ms, search_ms)) = searched {
+        (
+            dir,
+            ComputeTelemetry {
+                queue_ms: num::to_u32(began_ms - arrived),
+                search_ms,
+                total_ms: num::to_u32(now() - arrived),
+                think_ms: job.think_ms,
+                sims,
+                slices,
+                fallback: false,
+                loop_lag_ms: take_loop_lag(),
+            },
+        )
+    } else {
+        search_here(&job, arrived)
+    };
+    web_sys::console::debug_1(&JsValue::from_str(&format!(
+        "compute bot={} turn={requested_for} think={}ms queue={}ms search={}ms total={}ms sims={} slices={} fallback={}",
+        job.bot_id,
+        tm.think_ms,
+        tm.queue_ms,
+        tm.search_ms,
+        tm.total_ms,
+        tm.sims,
+        tm.slices,
+        tm.fallback
+    )));
+    // Always report, even if the tick already resolved: the
+    // server discards a stale move but keeps the timings, and
+    // silence is indistinguishable from a broken client.
+    let proof = snek_shared::bot::bind_proof(job.nonce, job.request_id, dir);
+    // Datagrams, not the control stream: a bot move is only
+    // useful for one tick, and on the reliable stream a single
+    // lost packet head-of-line blocks every bot's answer at
+    // once — which is exactly how three independent workers end
+    // up defaulting on the same turn. Sent twice; the server
+    // ignores the duplicate.
+    let msg = ClientMsg::BotMove {
+        request_id: job.request_id,
+        dir,
+        proof,
+        tm,
+    };
+    send_datagram(&msg);
+    send_datagram(&msg);
+}
+
+/// The worker is gone. Say so — silence here is indistinguishable from a
+/// dead client — then take a short, bounded turn on this thread so the bot
+/// still plays. A brief hitch beats a snake driving into a wall.
+fn search_here(job: &BotJob, arrived: f64) -> (Dir, ComputeTelemetry) {
+    send_datagram(&ClientMsg::ComputeFailed {
+        request_id: job.request_id,
+        reason: "worker unavailable".into(),
+    });
+    let mut search =
+        snek_shared::bot::begin(&job.config, &job.turn, &job.bot_id, u32::MAX, job.nonce);
+    let cutoff = now() + f64::from(job.think_ms).min(60.0);
+    let mut sims = 0u32;
+    while !search.step(64) {
+        sims += 64;
+        if now() >= cutoff {
+            break;
+        }
+    }
+    (
+        search.result().0,
+        ComputeTelemetry {
+            queue_ms: 0,
+            search_ms: num::to_u32(now() - cutoff + 60.0),
+            total_ms: num::to_u32(now() - arrived),
+            think_ms: job.think_ms,
+            sims,
+            slices: sims / 64,
+            fallback: true,
+            loop_lag_ms: take_loop_lag(),
+        },
+    )
+}
+
+fn on_error(store: Store, e: String) {
+    // A version mismatch means this page is running code the server
+    // has moved past, and no amount of reconnecting will fix it —
+    // it just retries forever behind "Joining session…". Telling a
+    // stuck page to refresh itself is the only thing that works, and
+    // the shell is served no-cache so the reload picks up the new
+    // build. Once only: if a reload doesn't resolve it, looping
+    // would be worse than showing the error.
+    if e.contains("version")
+        && !reloaded_recently()
+        && let Some(w) = web_sys::window()
+    {
+        let _ = w
+            .session_storage()
+            .map(|s| s.map(|s| s.set_item(RELOAD_KEY, &now().to_string())));
+        let _ = w.location().reload();
+        return;
+    }
+    store.error.set(Some(e));
 }

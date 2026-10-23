@@ -1,4 +1,4 @@
-//! The snek rules engine — a Rust port of tac's SnekProcessor, adapted from
+//! The snek rules engine — a Rust port of tac's `SnekProcessor`, adapted from
 //! turn-based simultaneous moves to fixed real-time ticks.
 //!
 //! Rules:
@@ -17,7 +17,8 @@
 //!   players are ranked by turns survived.
 
 use crate::rng::Rng;
-use crate::types::*;
+use crate::types::{Clash, ClashReason, Dir, GameConfig, GameRecord, PlayerId, Pos, Turn, Winner};
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 const START_LENGTH: usize = 3;
@@ -28,18 +29,24 @@ const FOOD_SPAWN_CHANCE: f64 = 0.15;
 const MIN_FOOD: usize = 1;
 
 /// The direction a snek starts moving: clockwise around the board, based on
-/// where it spawned. Of the two clockwise-tangent candidates, pick the one
-/// with more room before the wall (so corner spawns don't drive straight
-/// into it). Also used by the UI to pre-select the d-pad.
+/// where it spawned.
+///
+/// Of the two clockwise-tangent candidates, pick the one with more room
+/// before the wall (so corner spawns don't drive straight into it). Also
+/// used by the UI to pre-select the d-pad.
+#[must_use]
 pub fn clockwise_start_dir(config: &GameConfig, pos: Pos) -> Dir {
-    let (w, h) = (config.board_width as i16, config.board_height as i16);
-    let (x, y) = (pos as i16 % w, pos as i16 / w);
+    let (w, h) = (
+        i32::from(config.board_width),
+        i32::from(config.board_height),
+    );
+    let (x, y) = (i32::from(pos) % w, i32::from(pos) / w);
     // Offset from centre, doubled to stay in integers.
     let (vx, vy) = (2 * x - (w - 1), 2 * y - (h - 1));
     // Clockwise tangent in screen coordinates (y grows downward).
     let (tx, ty) = (-vy, vx);
 
-    let mut candidates: Vec<(i16, i16, Dir)> = Vec::new(); // (room, |component|, dir)
+    let mut candidates: Vec<(i32, i32, Dir)> = Vec::new(); // (room, |component|, dir)
     if tx > 0 {
         candidates.push(((w - 2) - x, tx.abs(), Dir::Right));
     }
@@ -55,12 +62,63 @@ pub fn clockwise_start_dir(config: &GameConfig, pos: Pos) -> Dir {
     candidates
         .into_iter()
         .max_by_key(|&(room, comp, _)| (room, comp))
-        .map(|(_, _, dir)| dir)
-        .unwrap_or(Dir::Right) // dead centre: arbitrary but deterministic
+        // Dead centre: arbitrary but deterministic.
+        .map_or(Dir::Right, |(_, _, dir)| dir)
 }
 
+/// The cell one step from `from` on a `w` x `h` board, or None off the
+/// edge. Shared with the bot, whose search must step exactly like this.
+pub(crate) fn step(from: Pos, dir: Dir, w: u16, h: u16) -> Option<Pos> {
+    let (x, y) = (from % w, from / w);
+    match dir {
+        Dir::Up => (y > 0).then(|| from - w),
+        Dir::Down => (y + 1 < h).then(|| from + w),
+        Dir::Left => (x > 0).then(|| from - 1),
+        Dir::Right => (x + 1 < w).then(|| from + 1),
+    }
+}
+
+/// The move that took a snek from `from` to `to`, if they are neighbours.
+pub(crate) const fn dir_between(from: Pos, to: Pos, width: u16) -> Option<Dir> {
+    let (fx, fy) = (from % width, from / width);
+    let (tx, ty) = (to % width, to / width);
+    if fx == tx {
+        if ty + 1 == fy {
+            Some(Dir::Up)
+        } else if fy + 1 == ty {
+            Some(Dir::Down)
+        } else {
+            None
+        }
+    } else if fy == ty {
+        if tx + 1 == fx {
+            Some(Dir::Left)
+        } else if fx + 1 == tx {
+            Some(Dir::Right)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// `a + (b - a) * i / segments` rounded like JS `Math.round` (halves toward
+/// +inf), matching tac's `getMidpoints` exactly. Done in integers: with
+/// `i < segments` every term is non-negative, so the division floors.
+fn lerp_round(a: u16, b: u16, i: u32, segments: u32) -> u16 {
+    let doubled = 2 * u32::from(a) * (segments - i) + 2 * u32::from(b) * i + segments;
+    // Always between a and b, so it fits.
+    u16::try_from(doubled / (2 * segments)).unwrap_or_else(|_| a.max(b))
+}
+
+/// One game: its rules, plus the state that isn't in the turns themselves
+/// (the random stream and how long everyone has survived).
 pub struct Engine {
+    /// The settings the game is played with.
     pub config: GameConfig,
+    /// Everyone playing. Start positions and tied rankings follow this
+    /// order.
     pub players: Vec<PlayerId>,
     seed: u64,
     rng: Rng,
@@ -69,9 +127,11 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// A game that hasn't started: call [`Engine::first_turn`] next.
+    #[must_use]
     pub fn new(config: GameConfig, players: Vec<PlayerId>, seed: u64) -> Self {
         let survival = players.iter().map(|p| (p.clone(), 0)).collect();
-        Engine {
+        Self {
             config,
             players,
             seed,
@@ -82,48 +142,57 @@ impl Engine {
 
     /// The seed this game was created with (stored in the game record so a
     /// finished game can be re-simulated).
-    pub fn initial_seed(&self) -> u64 {
+    #[must_use]
+    pub const fn initial_seed(&self) -> u64 {
         self.seed
     }
 
-    /// Re-run a stored game from its inputs. Returns the reconstructed turns.
+    /// Re-run a stored game from its inputs. Returns the reconstructed
+    /// turns: the starting position, then one per recorded turn after it.
+    #[must_use]
     pub fn replay(record: &GameRecord) -> Vec<Turn> {
         let players: Vec<PlayerId> = record.players.iter().map(|p| p.id.clone()).collect();
-        let mut engine = Engine::new(record.config.clone(), players, record.seed);
-        let mut turns = vec![engine.first_turn()];
-        for recorded in &record.turns[1..] {
-            let next = engine.next_turn(turns.last().unwrap(), &recorded.moves);
-            turns.push(next);
+        let mut engine = Self::new(record.config.clone(), players, record.seed);
+        let mut turns = Vec::with_capacity(record.turns.len());
+        let mut last = engine.first_turn();
+        for recorded in record.turns.iter().skip(1) {
+            let next = engine.next_turn(&last, &recorded.moves);
+            turns.push(std::mem::replace(&mut last, next));
         }
+        turns.push(last);
         turns
     }
 
-    fn width(&self) -> i16 {
-        self.config.board_width as i16
+    fn width(&self) -> u16 {
+        u16::from(self.config.board_width)
     }
 
-    fn height(&self) -> i16 {
-        self.config.board_height as i16
+    fn height(&self) -> u16 {
+        u16::from(self.config.board_height)
     }
 
-    fn pos(&self, x: i16, y: i16) -> Pos {
-        (y * self.width() + x) as Pos
+    fn pos(&self, x: u16, y: u16) -> Pos {
+        y * self.width() + x
     }
 
-    fn xy(&self, pos: Pos) -> (i16, i16) {
-        (pos as i16 % self.width(), pos as i16 / self.width())
+    fn xy(&self, pos: Pos) -> (u16, u16) {
+        (pos % self.width(), pos / self.width())
     }
 
     // ------------------------------------------------------------------
     // Game start
     // ------------------------------------------------------------------
 
+    /// The starting position: every snek stacked on its spawn cell, the
+    /// starting food placed. Call once, before any [`Engine::next_turn`].
     pub fn first_turn(&mut self) -> Turn {
         let snakes = self.initial_snakes();
         let food = self.initial_food(&snakes);
         let alive: Vec<PlayerId> = self.players.clone();
         for p in &alive {
-            *self.survival.get_mut(p).unwrap() += 1;
+            if let Some(turns) = self.survival.get_mut(p) {
+                *turns += 1;
+            }
         }
         Turn {
             turn_number: 1,
@@ -146,18 +215,18 @@ impl Engine {
             .collect()
     }
 
-    /// Port of tac's generateStartingPositions: corners of an inset ring,
+    /// Port of tac's `generateStartingPositions`: corners of an inset ring,
     /// then edge midpoints at increasing depth, then inner rings.
-    fn starting_positions(&self) -> Vec<(i16, i16)> {
+    fn starting_positions(&self) -> Vec<(u16, u16)> {
         let (w, h) = (self.width(), self.height());
-        let n = self.players.len();
+        let wanted = self.players.len();
 
-        let start_x = if (w - 1) % 4 == 0 { 2 } else { 1 };
-        let start_y = if (h - 1) % 4 == 0 { 2 } else { 1 };
-        let end_x = w - start_x - 1;
-        let end_y = h - start_y - 1;
+        let start_x = if w.saturating_sub(1) % 4 == 0 { 2 } else { 1 };
+        let start_y = if h.saturating_sub(1) % 4 == 0 { 2 } else { 1 };
+        let end_x = w.saturating_sub(start_x + 1);
+        let end_y = h.saturating_sub(start_y + 1);
 
-        let mut positions: Vec<(i16, i16)> = vec![
+        let mut positions: Vec<(u16, u16)> = vec![
             (start_x, start_y),
             (end_x, start_y),
             (start_x, end_y),
@@ -172,22 +241,19 @@ impl Engine {
         ];
 
         let mut depth = 0u32;
-        while positions.len() < n {
+        while positions.len() < wanted {
             let mut added = 0;
-            let segments = 2i32.pow(depth + 1);
+            let segments = 2u32.pow(depth + 1);
             for &((sx, sy), (ex, ey)) in &edges {
-                let mut i = 1;
-                while i < segments {
-                    // JS Math.round semantics (half rounds toward +inf),
-                    // matching tac's getMidpoints exactly.
-                    let js_round = |v: f64| (v + 0.5).floor() as i16;
-                    let x = js_round(sx as f64 + (ex - sx) as f64 * i as f64 / segments as f64);
-                    let y = js_round(sy as f64 + (ey - sy) as f64 * i as f64 / segments as f64);
+                let mut odd = 1;
+                while odd < segments {
+                    let x = lerp_round(sx, ex, odd, segments);
+                    let y = lerp_round(sy, ey, odd, segments);
                     if !positions.contains(&(x, y)) {
                         positions.push((x, y));
                         added += 1;
                     }
-                    i += 2;
+                    odd += 2;
                 }
             }
             depth += 1;
@@ -197,29 +263,30 @@ impl Engine {
         }
 
         // Inner rings if the edges ran out of room.
-        let (mut isx, mut isy, mut iex, mut iey) = (3, 3, w - 4, h - 4);
-        while positions.len() < n && isx < iex && isy < iey {
-            let mut ring = vec![(isx, isy), (iex, isy), (isx, iey), (iex, iey)];
-            if iex - isx > 2 {
-                ring.push(((isx + iex) / 2, isy));
-                ring.push(((isx + iex) / 2, iey));
+        let (mut left, mut top) = (3, 3);
+        let (mut right, mut bottom) = (w.saturating_sub(4), h.saturating_sub(4));
+        while positions.len() < wanted && left < right && top < bottom {
+            let mut ring = vec![(left, top), (right, top), (left, bottom), (right, bottom)];
+            if right - left > 2 {
+                ring.push((left.midpoint(right), top));
+                ring.push((left.midpoint(right), bottom));
             }
-            if iey - isy > 2 {
-                ring.push((isx, (isy + iey) / 2));
-                ring.push((iex, (isy + iey) / 2));
+            if bottom - top > 2 {
+                ring.push((left, top.midpoint(bottom)));
+                ring.push((right, top.midpoint(bottom)));
             }
             for p in ring {
                 if !positions.contains(&p) {
                     positions.push(p);
                 }
             }
-            isx += 2;
-            isy += 2;
-            iex -= 2;
-            iey -= 2;
+            left += 2;
+            top += 2;
+            right -= 2;
+            bottom -= 2;
         }
 
-        positions.truncate(n);
+        positions.truncate(wanted);
         positions
     }
 
@@ -229,17 +296,23 @@ impl Engine {
     /// dead centre "for dramatic purposes".
     fn initial_food(&mut self, snakes: &BTreeMap<PlayerId, Vec<Pos>>) -> Vec<Pos> {
         let (w, h) = (self.width(), self.height());
-        let (cx, cy) = ((w - 1) / 2, (h - 1) / 2);
+        let (cx, cy) = (w.saturating_sub(1) / 2, h.saturating_sub(1) / 2);
         let mut occupied: Vec<Pos> = snakes.values().flatten().copied().collect();
         let mut food: Vec<Pos> = Vec::new();
 
-        let heads: Vec<(i16, i16)> = snakes.values().map(|s| self.xy(s[0])).collect();
+        let heads: Vec<(u16, u16)> = snakes
+            .values()
+            .filter_map(|s| s.first().map(|&head| self.xy(head)))
+            .collect();
         for (hx, hy) in heads {
             let mut available: Vec<Pos> = Vec::new();
             for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
-                let (fx, fy) = (hx + dx, hy + dy);
+                let (Some(fx), Some(fy)) = (hx.checked_add_signed(dx), hy.checked_add_signed(dy))
+                else {
+                    continue;
+                };
                 // Playable area only — our perimeter ring is wall.
-                if fx < 1 || fy < 1 || fx > w - 2 || fy > h - 2 {
+                if fx < 1 || fy < 1 || fx + 2 > w || fy + 2 > h {
                     continue;
                 }
                 let p = self.pos(fx, fy);
@@ -280,147 +353,25 @@ impl Engine {
     // Tick resolution
     // ------------------------------------------------------------------
 
+    /// Resolve one tick from `prev` with the moves players submitted for it
+    /// (anyone missing keeps going the way they were heading).
     pub fn next_turn(&mut self, prev: &Turn, submitted: &BTreeMap<PlayerId, Dir>) -> Turn {
         let mut snakes = prev.snakes.clone();
         let mut health = prev.health.clone();
         let mut food = prev.food.clone();
         let mut alive = prev.alive.clone();
         let mut clashes: Vec<Clash> = Vec::new();
-        let mut dead: Vec<PlayerId> = Vec::new();
-        let mut applied: BTreeMap<PlayerId, Dir> = BTreeMap::new();
 
-        // --- Move every living snek ---------------------------------------
-        for player in prev.alive.clone() {
-            let snake = snakes.get_mut(&player).unwrap();
-            let head = snake[0];
-            let last_dir = last_direction(snake, self.config.board_width as i16);
-
-            let mut dir = submitted.get(&player).copied();
-            // Ignore reversing straight into your own neck.
-            if let (Some(d), Some(last)) = (dir, last_dir) {
-                if d == last.opposite() {
-                    dir = None;
-                }
-            }
-            let dir = dir
-                .or(last_dir)
-                // Stacked snek with no history: head off clockwise.
-                .unwrap_or_else(|| clockwise_start_dir(&self.config, head));
-            applied.insert(player.clone(), dir);
-
-            let target = self.target(head, dir);
-            let target = match target {
-                Some(t) if !self.config.is_wall(t) => t,
-                _ => {
-                    // Off the board or into the wall: die where you stood.
-                    // The corpse is removed before cross-snake collisions —
-                    // running into a snake that died this tick is safe.
-                    dead.push(player.clone());
-                    let body = snake.clone();
-                    clashes.extend(body.into_iter().map(|pos| Clash {
-                        pos,
-                        players: vec![player.clone()],
-                        reason: ClashReason::Wall,
-                    }));
-                    continue;
-                }
-            };
-
-            snake.pop();
-            if snake.contains(&target) {
-                dead.push(player.clone());
-                let body = snake.clone();
-                clashes.extend(body.into_iter().map(|pos| Clash {
-                    pos,
-                    players: vec![player.clone()],
-                    reason: ClashReason::SelfCollision,
-                }));
-                continue;
-            }
-            snake.insert(0, target);
-        }
-
+        let (applied, dead) = self.move_snakes(&prev.alive, submitted, &mut snakes, &mut clashes);
         // Phase 1 deaths (walls, self-collisions) resolve first and their
         // corpses leave the board: a snake that died this tick cannot kill
         // anyone else.
         remove_dead(&mut snakes, &mut health, &mut alive, &dead);
-        dead.clear();
 
-        // --- Cross-snek collisions (among survivors, simultaneously) ------
-        let mut heads_at: BTreeMap<Pos, Vec<PlayerId>> = BTreeMap::new();
-        let mut occupants_at: BTreeMap<Pos, Vec<PlayerId>> = BTreeMap::new();
-        for (player, snake) in &snakes {
-            for (i, &pos) in snake.iter().enumerate() {
-                occupants_at.entry(pos).or_default().push(player.clone());
-                if i == 0 {
-                    heads_at.entry(pos).or_default().push(player.clone());
-                }
-            }
-        }
-
-        for (&pos, players_here) in &heads_at {
-            if players_here.len() > 1 {
-                // Head-on: the shortest snek(s) die.
-                let min_len = players_here.iter().map(|p| snakes[p].len()).min().unwrap();
-                for p in players_here {
-                    if snakes[p].len() == min_len && !dead.contains(p) {
-                        dead.push(p.clone());
-                        // Dead player first, so renderers know whose corpse
-                        // (and head cell) this clash trail belongs to.
-                        let mut involved = vec![p.clone()];
-                        involved.extend(players_here.iter().filter(|o| *o != p).cloned());
-                        clashes.extend(snakes[p].iter().map(|&pos| Clash {
-                            pos,
-                            players: involved.clone(),
-                            reason: ClashReason::HeadOn,
-                        }));
-                    }
-                }
-            } else {
-                let p = &players_here[0];
-                let others: Vec<PlayerId> = occupants_at[&pos]
-                    .iter()
-                    .filter(|o| *o != p)
-                    .cloned()
-                    .collect();
-                if !others.is_empty() && !dead.contains(p) {
-                    dead.push(p.clone());
-                    let mut involved = vec![p.clone()];
-                    involved.extend(others);
-                    clashes.extend(snakes[p].iter().map(|&pos| Clash {
-                        pos,
-                        players: involved.clone(),
-                        reason: ClashReason::Body,
-                    }));
-                }
-            }
-        }
-
+        let dead = collide(&snakes, &mut clashes);
         remove_dead(&mut snakes, &mut health, &mut alive, &dead);
 
-        // --- Food + health -------------------------------------------------
-        let mut starved: Vec<PlayerId> = Vec::new();
-        for player in alive.clone() {
-            let snake = snakes.get_mut(&player).unwrap();
-            let head = snake[0];
-            if let Some(i) = food.iter().position(|&f| f == head) {
-                food.remove(i);
-                let tail = *snake.last().unwrap();
-                snake.push(tail);
-                health.insert(player.clone(), MAX_HEALTH);
-            } else {
-                let hp = health.get_mut(&player).unwrap();
-                *hp = hp.saturating_sub(1);
-                if *hp == 0 {
-                    starved.push(player.clone());
-                    clashes.extend(snake.iter().map(|&pos| Clash {
-                        pos,
-                        players: vec![player.clone()],
-                        reason: ClashReason::Starved,
-                    }));
-                }
-            }
-        }
+        let starved = feed(&alive, &mut snakes, &mut health, &mut food, &mut clashes);
         remove_dead(&mut snakes, &mut health, &mut alive, &starved);
 
         // --- Spawn food (battlesnake standard rules) -----------------------
@@ -434,22 +385,14 @@ impl Engine {
 
         // --- Survival + winners -------------------------------------------
         for p in &alive {
-            *self.survival.get_mut(p).unwrap() += 1;
+            if let Some(turns) = self.survival.get_mut(p) {
+                *turns += 1;
+            }
         }
 
-        let over_threshold = if self.players.len() > 1 { 1 } else { 0 };
+        let over_threshold = usize::from(self.players.len() > 1);
         let winners = if alive.len() <= over_threshold {
-            let mut winners: Vec<Winner> = self
-                .players
-                .iter()
-                .map(|p| Winner {
-                    player: p.clone(),
-                    survival_turns: self.survival[p],
-                    length: snakes.get(p).map(|s| s.len() as u16).unwrap_or(0),
-                })
-                .collect();
-            winners.sort_by_key(|w| std::cmp::Reverse(w.survival_turns));
-            winners
+            self.ranking(&snakes)
         } else {
             Vec::new()
         };
@@ -466,42 +409,203 @@ impl Engine {
         }
     }
 
-    fn target(&self, from: Pos, dir: Dir) -> Option<Pos> {
-        let (x, y) = self.xy(from);
-        let (dx, dy) = dir.delta();
-        let (nx, ny) = (x + dx, y + dy);
-        if nx < 0 || nx >= self.width() || ny < 0 || ny >= self.height() {
-            None
-        } else {
-            Some(self.pos(nx, ny))
+    /// Move every living snek one cell: its submitted direction, else the
+    /// way it was going, else clockwise. Returns the direction each one
+    /// actually took, and who died doing it (into a wall or itself).
+    fn move_snakes(
+        &self,
+        players: &[PlayerId],
+        submitted: &BTreeMap<PlayerId, Dir>,
+        snakes: &mut BTreeMap<PlayerId, Vec<Pos>>,
+        clashes: &mut Vec<Clash>,
+    ) -> (BTreeMap<PlayerId, Dir>, Vec<PlayerId>) {
+        let mut applied: BTreeMap<PlayerId, Dir> = BTreeMap::new();
+        let mut dead: Vec<PlayerId> = Vec::new();
+        for player in players {
+            let Some(snake) = snakes.get_mut(player) else {
+                continue;
+            };
+            let Some(&head) = snake.first() else {
+                continue;
+            };
+            let last_dir = last_direction(snake, self.width());
+
+            let dir = submitted
+                .get(player)
+                .copied()
+                // Ignore reversing straight into your own neck.
+                .filter(|&d| last_dir != Some(d.opposite()))
+                .or(last_dir)
+                // Stacked snek with no history: head off clockwise.
+                .unwrap_or_else(|| clockwise_start_dir(&self.config, head));
+            applied.insert(player.clone(), dir);
+
+            let target = self.target(head, dir);
+            let target = match target {
+                Some(t) if !self.config.is_wall(t) => t,
+                _ => {
+                    // Off the board or into the wall: die where you stood.
+                    // The corpse is removed before cross-snake collisions —
+                    // running into a snake that died this tick is safe.
+                    dead.push(player.clone());
+                    clashes.extend(snake.iter().map(|&pos| Clash {
+                        pos,
+                        players: vec![player.clone()],
+                        reason: ClashReason::Wall,
+                    }));
+                    continue;
+                }
+            };
+
+            snake.pop();
+            if snake.contains(&target) {
+                dead.push(player.clone());
+                clashes.extend(snake.iter().map(|&pos| Clash {
+                    pos,
+                    players: vec![player.clone()],
+                    reason: ClashReason::SelfCollision,
+                }));
+                continue;
+            }
+            snake.insert(0, target);
         }
+        (applied, dead)
+    }
+
+    /// Everyone, best first: by turns survived, ties in player order.
+    fn ranking(&self, snakes: &BTreeMap<PlayerId, Vec<Pos>>) -> Vec<Winner> {
+        let mut winners: Vec<Winner> = self
+            .players
+            .iter()
+            .map(|p| Winner {
+                player: p.clone(),
+                survival_turns: self.survival[p],
+                // A snek can't outgrow the board, which has far fewer cells.
+                length: snakes
+                    .get(p)
+                    .map_or(0, |s| u16::try_from(s.len()).unwrap_or(u16::MAX)),
+            })
+            .collect();
+        winners.sort_by_key(|w| Reverse(w.survival_turns));
+        winners
+    }
+
+    fn target(&self, from: Pos, dir: Dir) -> Option<Pos> {
+        step(from, dir, self.width(), self.height())
     }
 
     fn free_cells(&self, snakes: &BTreeMap<PlayerId, Vec<Pos>>, food: &[Pos]) -> Vec<Pos> {
         let mut occupied = vec![false; self.config.cells()];
         for &pos in snakes.values().flatten().chain(food.iter()) {
-            occupied[pos as usize] = true;
+            occupied[usize::from(pos)] = true;
         }
-        (0..self.config.cells() as u16)
-            .filter(|&p| !occupied[p as usize] && !self.config.is_wall(p))
+        (0..self.width() * self.height())
+            .filter(|&p| !occupied[usize::from(p)] && !self.config.is_wall(p))
             .collect()
     }
 }
 
-fn last_direction(snake: &[Pos], width: i16) -> Option<Dir> {
-    let (head, neck) = (snake[0] as i16, *snake.get(1)? as i16);
+/// Head-on and body collisions among the survivors of the move, all at
+/// once. Returns who died.
+fn collide(snakes: &BTreeMap<PlayerId, Vec<Pos>>, clashes: &mut Vec<Clash>) -> Vec<PlayerId> {
+    let mut dead: Vec<PlayerId> = Vec::new();
+    let mut heads_at: BTreeMap<Pos, Vec<PlayerId>> = BTreeMap::new();
+    let mut occupants_at: BTreeMap<Pos, Vec<PlayerId>> = BTreeMap::new();
+    for (player, snake) in snakes {
+        for (i, &pos) in snake.iter().enumerate() {
+            occupants_at.entry(pos).or_default().push(player.clone());
+            if i == 0 {
+                heads_at.entry(pos).or_default().push(player.clone());
+            }
+        }
+    }
+
+    for (&pos, players_here) in &heads_at {
+        match players_here.as_slice() {
+            [p] => {
+                let others: Vec<PlayerId> = occupants_at[&pos]
+                    .iter()
+                    .filter(|o| *o != p)
+                    .cloned()
+                    .collect();
+                if !others.is_empty() && !dead.contains(p) {
+                    dead.push(p.clone());
+                    let mut involved = vec![p.clone()];
+                    involved.extend(others);
+                    clashes.extend(snakes[p].iter().map(|&pos| Clash {
+                        pos,
+                        players: involved.clone(),
+                        reason: ClashReason::Body,
+                    }));
+                }
+            }
+            meeting => {
+                // Head-on: the shortest snek(s) die.
+                let Some(min_len) = meeting.iter().map(|p| snakes[p].len()).min() else {
+                    continue;
+                };
+                for p in meeting {
+                    if snakes[p].len() == min_len && !dead.contains(p) {
+                        dead.push(p.clone());
+                        // Dead player first, so renderers know whose corpse
+                        // (and head cell) this clash trail belongs to.
+                        let mut involved = vec![p.clone()];
+                        involved.extend(meeting.iter().filter(|o| *o != p).cloned());
+                        clashes.extend(snakes[p].iter().map(|&pos| Clash {
+                            pos,
+                            players: involved.clone(),
+                            reason: ClashReason::HeadOn,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    dead
+}
+
+/// Eating and starvation: a head on food eats it (growing by one and
+/// healing fully), every other snek loses one health. Returns who starved.
+fn feed(
+    alive: &[PlayerId],
+    snakes: &mut BTreeMap<PlayerId, Vec<Pos>>,
+    health: &mut BTreeMap<PlayerId, u8>,
+    food: &mut Vec<Pos>,
+    clashes: &mut Vec<Clash>,
+) -> Vec<PlayerId> {
+    let mut starved: Vec<PlayerId> = Vec::new();
+    for player in alive {
+        let Some(snake) = snakes.get_mut(player) else {
+            continue;
+        };
+        let (Some(&head), Some(&tail)) = (snake.first(), snake.last()) else {
+            continue;
+        };
+        if let Some(i) = food.iter().position(|&f| f == head) {
+            food.remove(i);
+            snake.push(tail);
+            health.insert(player.clone(), MAX_HEALTH);
+        } else if let Some(hp) = health.get_mut(player) {
+            *hp = hp.saturating_sub(1);
+            if *hp == 0 {
+                starved.push(player.clone());
+                clashes.extend(snake.iter().map(|&pos| Clash {
+                    pos,
+                    players: vec![player.clone()],
+                    reason: ClashReason::Starved,
+                }));
+            }
+        }
+    }
+    starved
+}
+
+fn last_direction(snake: &[Pos], width: u16) -> Option<Dir> {
+    let (&head, &neck) = (snake.first()?, snake.get(1)?);
     if head == neck {
         return None; // still stacked at start
     }
-    let (hx, hy) = (head % width, head / width);
-    let (nx, ny) = (neck % width, neck / width);
-    match (hx - nx, hy - ny) {
-        (0, -1) => Some(Dir::Up),
-        (0, 1) => Some(Dir::Down),
-        (-1, 0) => Some(Dir::Left),
-        (1, 0) => Some(Dir::Right),
-        _ => None,
-    }
+    dir_between(neck, head, width)
 }
 
 fn remove_dead(
@@ -520,13 +624,14 @@ fn remove_dead(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{DEFAULT_FOOD, PlayerProfile};
 
     fn config() -> GameConfig {
         GameConfig {
             board_width: 13,
             board_height: 13,
             tick_ms: 1000,
-            food_emoji: DEFAULT_FOOD.to_string(),
+            food_emoji: DEFAULT_FOOD.to_owned(),
         }
     }
 
@@ -535,7 +640,7 @@ mod tests {
     }
 
     fn moves(pairs: &[(&str, Dir)]) -> BTreeMap<PlayerId, Dir> {
-        pairs.iter().map(|(p, d)| (p.to_string(), *d)).collect()
+        pairs.iter().map(|&(p, d)| (p.to_owned(), d)).collect()
     }
 
     /// Official battlesnake start food: one per snek exactly two moves
@@ -547,12 +652,12 @@ mod tests {
         let players: Vec<PlayerId> = (0..4).map(|i| format!("p{i}")).collect();
         let mut e = Engine::new(cfg.clone(), players, 3);
         let t = e.first_turn();
-        let (w, h) = (cfg.board_width as i16, cfg.board_height as i16);
+        let (w, h) = (i32::from(cfg.board_width), i32::from(cfg.board_height));
         let (cx, cy) = ((w - 1) / 2, (h - 1) / 2);
-        let xy = |p: Pos| (p as i16 % w, p as i16 / w);
+        let xy = |p: Pos| (i32::from(p) % w, i32::from(p) / w);
 
         assert!(
-            t.food.contains(&((cy * w + cx) as Pos)),
+            t.food.iter().any(|&f| xy(f) == (cx, cy)),
             "centre food is mandatory"
         );
         assert_eq!(
@@ -562,7 +667,7 @@ mod tests {
             t.food
         );
 
-        let heads: Vec<(i16, i16)> = t.snakes.values().map(|s| xy(s[0])).collect();
+        let heads: Vec<(i32, i32)> = t.snakes.values().map(|s| xy(s[0])).collect();
         for &f in &t.food {
             let (fx, fy) = xy(f);
             if (fx, fy) == (cx, cy) {
@@ -623,7 +728,7 @@ mod tests {
         let t1 = e.first_turn();
         let head_a = t1.snakes["a"][0];
         let t2 = e.next_turn(&t1, &moves(&[("a", Dir::Right), ("b", Dir::Left)]));
-        if t2.alive.contains(&"a".to_string()) {
+        if t2.alive.contains(&"a".to_owned()) {
             assert_eq!(t2.snakes["a"][0], head_a + 1);
             assert_eq!(t2.snakes["a"].len(), 3);
             assert!(t2.health["a"] == 99 || t2.health["a"] == 100);
@@ -661,7 +766,7 @@ mod tests {
             }
             t = e.next_turn(&t, &moves(&[("a", Dir::Right), ("b", Dir::Down)]));
         }
-        assert!(!t.alive.contains(&"a".to_string()));
+        assert!(!t.alive.contains(&"a".to_owned()));
     }
 
     #[test]
@@ -672,39 +777,28 @@ mod tests {
         // Walk the snek onto a known food cell.
         let food = t1.food[0];
         let head = t1.snakes["solo"][0];
-        let w = cfg.board_width as i16;
-        let (fx, fy) = (food as i16 % w, food as i16 / w);
-        let (hx, hy) = (head as i16 % w, head as i16 / w);
+        let width = u16::from(cfg.board_width);
+        let (food_x, food_y) = (food % width, food / width);
 
         let mut t = t1;
-        let mut x = hx;
-        let mut y = hy;
+        let (mut x, mut y) = (head % width, head / width);
         // Move horizontally then vertically toward the food.
         for _ in 0..40 {
             if t.game_over() {
                 break;
             }
-            let dir = if x != fx {
-                if fx > x {
-                    Dir::Right
-                } else {
-                    Dir::Left
-                }
-            } else if y != fy {
-                if fy > y {
-                    Dir::Down
-                } else {
-                    Dir::Up
-                }
+            let dir = if x != food_x {
+                if food_x > x { Dir::Right } else { Dir::Left }
+            } else if y != food_y {
+                if food_y > y { Dir::Down } else { Dir::Up }
             } else {
                 break;
             };
             t = e.next_turn(&t, &moves(&[("solo", dir)]));
             if let Some(s) = t.snakes.get("solo") {
-                x = s[0] as i16 % w;
-                y = s[0] as i16 / w;
+                (x, y) = (s[0] % width, s[0] / width);
             }
-            if x == fx && y == fy {
+            if x == food_x && y == food_y {
                 break;
             }
         }
@@ -724,18 +818,18 @@ mod tests {
         let expected = |pos: Pos| {
             let (x, y) = (pos % 13, pos / 13);
             match (x, y) {
-                (2, 2) => Dir::Right,  // top-left corner
-                (10, 2) => Dir::Down,  // top-right corner
-                (2, 10) => Dir::Up,    // bottom-left corner
-                (10, 10) => Dir::Left, // bottom-right corner
-                (6, 2) => Dir::Right,  // top mid
-                (10, 6) => Dir::Down,  // right mid
-                (6, 10) => Dir::Left,  // bottom mid
-                (2, 6) => Dir::Up,     // left mid
+                // Top-left corner, top mid.
+                (2 | 6, 2) => Dir::Right,
+                // Top-right corner, right mid.
+                (10, 2 | 6) => Dir::Down,
+                // Bottom-left corner, left mid.
+                (2, 10 | 6) => Dir::Up,
+                // Bottom-right corner, bottom mid.
+                (10 | 6, 10) => Dir::Left,
                 other => panic!("unexpected spawn position {other:?}"),
             }
         };
-        let heads: std::collections::BTreeMap<PlayerId, Pos> =
+        let heads: BTreeMap<PlayerId, Pos> =
             t1.snakes.iter().map(|(p, s)| (p.clone(), s[0])).collect();
 
         // Nobody submits a move; everyone should head off clockwise, safely.

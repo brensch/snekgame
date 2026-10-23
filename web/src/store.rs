@@ -3,9 +3,10 @@
 use leptos::prelude::*;
 use snek_shared::protocol::{LobbyState, ProfileInfo, SessionSummary};
 use snek_shared::{Dir, GameConfig, PlayerId, PlayerProfile, Turn};
+use std::fmt::Write as _;
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Route {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
     Home,
     Session(String),
     History,
@@ -14,7 +15,7 @@ pub enum Route {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConnStatus {
+pub(crate) enum ConnStatus {
     Idle,
     Connecting,
     Connected,
@@ -22,15 +23,15 @@ pub enum ConnStatus {
 }
 
 /// The game currently on screen (live from the server).
-#[derive(Clone, Debug, PartialEq)]
-pub struct GameView {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GameView {
     pub config: GameConfig,
     pub players: Vec<PlayerProfile>,
     pub turns: Vec<Turn>,
 }
 
 #[derive(Clone, Copy)]
-pub struct Store {
+pub(crate) struct Store {
     pub route: RwSignal<Route>,
     /// Editable profile fields; the public id comes back from the server.
     pub profile: RwSignal<ProfileInfo>,
@@ -45,19 +46,9 @@ pub struct Store {
     pub game: RwSignal<Option<GameView>>,
     /// History scrubber position when reviewing a finished game (None = live).
     pub view_turn: RwSignal<Option<usize>>,
-    /// The lobby's hand of foods. It lives here, not in the lobby view,
-    /// because that view is rebuilt every time anything in the lobby
-    /// changes — a hand held there would be re-dealt on every click,
-    /// including the click that picks from it.
-    pub food_hand: RwSignal<Vec<String>>,
     /// Set once we have evidence the network passes TCP but not UDP —
     /// which is a firewall eating QUIC, not a broken site.
     pub quic_blocked: RwSignal<bool>,
-    /// "I said I was ready" (or wasn't). Kept until the server is seen to
-    /// agree, so a press that lands on a dead connection isn't simply lost —
-    /// the intent outlives the socket it was sent on, and the screen shows
-    /// it from the moment of the tap rather than after the reconnect.
-    pub want_ready: RwSignal<Option<bool>>,
     /// When the lobby's settings last changed under us (ms), so the "last
     /// changed by" box can flash — and keep flashing across the lobby being
     /// redrawn for some other reason partway through.
@@ -77,8 +68,8 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new() -> Store {
-        Store {
+    pub(crate) fn new() -> Self {
+        Self {
             route: RwSignal::new(Route::Home),
             profile: RwSignal::new(load_profile()),
             me: RwSignal::new(String::new()),
@@ -89,13 +80,7 @@ impl Store {
             sessions: RwSignal::new(None),
             game: RwSignal::new(None),
             view_turn: RwSignal::new(None),
-            food_hand: RwSignal::new(crate::palette::shuffled_with(
-                crate::palette::FOODS,
-                crate::palette::FOOD_HAND,
-                snek_shared::DEFAULT_FOOD,
-            )),
             quic_blocked: RwSignal::new(false),
-            want_ready: RwSignal::new(None),
             settings_flash_at: RwSignal::new(0.0),
             paused: RwSignal::new(false),
             selected_dir: RwSignal::new(None),
@@ -106,8 +91,8 @@ impl Store {
         }
     }
 
-    pub fn use_store() -> Store {
-        expect_context::<Store>()
+    pub(crate) fn use_store() -> Self {
+        expect_context::<Self>()
     }
 }
 
@@ -117,7 +102,7 @@ fn storage() -> Option<web_sys::Storage> {
 
 /// The private secret proving our identity to the server. Never shown to or
 /// shared with other players — they only ever see the hash the server derives.
-pub fn secret() -> String {
+pub(crate) fn secret() -> String {
     let get = || -> Option<String> { storage()?.get_item("snek_secret").ok()? };
     get().unwrap_or_else(|| {
         let secret = random_secret();
@@ -131,18 +116,22 @@ pub fn secret() -> String {
 /// Random hex string. Uses `crypto.getRandomValues`, which (unlike
 /// `crypto.randomUUID`) also works in non-secure contexts like plain-http
 /// LAN addresses; falls back to Math.random only if even that is missing.
-pub fn random_hex(bytes: usize) -> String {
+pub(crate) fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     let ok = web_sys::window()
         .and_then(|w| w.crypto().ok())
-        .map(|c| c.get_random_values_with_u8_array(&mut buf).is_ok())
-        .unwrap_or(false);
+        .is_some_and(|c| c.get_random_values_with_u8_array(&mut buf).is_ok());
     if !ok {
-        for b in buf.iter_mut() {
-            *b = (js_sys::Math::random() * 256.0) as u8;
+        for b in &mut buf {
+            *b =
+                u8::try_from(crate::num::to_u32(js_sys::Math::random() * 256.0)).unwrap_or(u8::MAX);
         }
     }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    buf.iter()
+        .fold(String::with_capacity(bytes * 2), |mut hex, b| {
+            let _ = write!(hex, "{b:02x}");
+            hex
+        })
 }
 
 fn random_secret() -> String {
@@ -150,7 +139,7 @@ fn random_secret() -> String {
 }
 
 /// Opaque id for a newly created session — this is what goes in the URL.
-pub fn new_session_id() -> String {
+pub(crate) fn new_session_id() -> String {
     random_hex(8)
 }
 
@@ -158,12 +147,12 @@ fn load_profile() -> ProfileInfo {
     let s = storage();
     let get = |key: &str| -> Option<String> { s.as_ref()?.get_item(key).ok()? };
 
-    let random = || (js_sys::Math::random() * 1e9) as usize;
     let emoji = get("snek_emoji").unwrap_or_else(|| {
-        crate::palette::EMOJIS[random() % crate::palette::EMOJIS.len()].to_string()
+        crate::palette::EMOJIS[crate::num::random_index(crate::palette::EMOJIS.len())].to_owned()
     });
-    let colour =
-        get("snek_colour").unwrap_or_else(|| crate::palette::colour((random() % 360) as u32));
+    let colour = get("snek_colour").unwrap_or_else(|| {
+        crate::palette::colour(crate::num::to_u32(js_sys::Math::random() * 360.0))
+    });
 
     ProfileInfo {
         name: get("snek_name").unwrap_or_default(),
@@ -172,7 +161,7 @@ fn load_profile() -> ProfileInfo {
     }
 }
 
-pub fn save_profile(p: &ProfileInfo) {
+pub(crate) fn save_profile(p: &ProfileInfo) {
     if let Some(s) = storage() {
         let _ = s.set_item("snek_name", &p.name);
         let _ = s.set_item("snek_emoji", &p.emoji);

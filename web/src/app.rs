@@ -7,14 +7,15 @@ use crate::history_page::{history_page, replay_page};
 use crate::net;
 use crate::palette;
 use crate::session_page::session_page;
-use crate::store::{save_profile, Route, Store};
+use crate::store::{Route, Store, save_profile};
 use gloo_timers::callback::Interval;
 use leptos::ev;
 use leptos::prelude::*;
-use snek_shared::protocol::ClientMsg;
 use snek_shared::Dir;
+use snek_shared::protocol::ClientMsg;
 use std::cell::Cell;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
 
 thread_local! {
     static TOUCH_START: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
@@ -27,122 +28,28 @@ thread_local! {
 /// back to consume it — popstate then actually closes the modal, so the
 /// history stack never ends up with a stale entry.
 fn close_profile_editor(store: Store) {
-    if MODAL_HISTORY.with(|c| c.get()) {
-        if let Some(w) = web_sys::window() {
-            if let Ok(h) = w.history() {
-                let _ = h.back();
-                return;
-            }
-        }
+    if MODAL_HISTORY.with(Cell::get)
+        && let Some(w) = web_sys::window()
+        && let Ok(h) = w.history()
+    {
+        let _ = h.back();
+        return;
     }
     store.show_profile_editor.set(false);
 }
 
-pub fn app() -> impl IntoView {
+pub(crate) fn app() -> impl IntoView {
     let store = Store::new();
     provide_context(store);
 
     // --- routing ----------------------------------------------------------
-    let read_route = move || {
-        let hash = web_sys::window()
-            .and_then(|w| w.location().hash().ok())
-            .unwrap_or_default();
-        store.route.set(parse_hash(&hash));
-    };
-    read_route();
-    window_event_listener(ev::hashchange, move |_| read_route());
+    read_route(store);
+    window_event_listener(ev::hashchange, move |_| read_route(store));
 
     net::watch_main_thread();
-
-    // The play screen sizes itself against whatever is above it. Measuring
-    // beats guessing: a long name or a bigger font can wrap the header onto
-    // two lines, and a constant here would quietly push the d-pad off the
-    // bottom of the screen on exactly the phones that can least afford it.
-    {
-        use wasm_bindgen::closure::Closure;
-        use wasm_bindgen::JsCast;
-        let measure = move || {
-            let Some(w) = web_sys::window() else { return };
-            let Some(doc) = w.document() else { return };
-            // Document-relative, not viewport-relative: a bounding rect
-            // moves with the scroll position, and measuring mid-scroll gave
-            // a header nine pixels tall and a play area taller than the
-            // screen.
-            let bottom = doc
-                .query_selector(".topbar")
-                .ok()
-                .flatten()
-                .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
-                .map(|e| (e.offset_top() + e.offset_height()) as f64)
-                .filter(|h| (24.0..320.0).contains(h))
-                .unwrap_or(104.0);
-            if let Some(root) = doc.document_element() {
-                let style = root.unchecked_ref::<web_sys::HtmlElement>().style();
-                let _ = style.set_property("--topbar-h", &format!("{bottom}px"));
-            }
-        };
-        measure();
-        let cb = Closure::<dyn FnMut()>::new(measure);
-        if let Some(w) = web_sys::window() {
-            let _ = w.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
-            let _ = w
-                .add_event_listener_with_callback("orientationchange", cb.as_ref().unchecked_ref());
-        }
-        cb.forget();
-        // The header isn't in the DOM on the very first pass; catch it once
-        // it is, and again after fonts settle.
-        for delay in [0, 250, 1_000] {
-            let cb = Closure::<dyn FnMut()>::new(measure);
-            if let Some(w) = web_sys::window() {
-                let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(
-                    cb.as_ref().unchecked_ref(),
-                    delay,
-                );
-            }
-            cb.forget();
-        }
-    }
-
-    // --- shared coarse clock + liveness watchdog ---------------------------
-    let clock = Interval::new(200, move || {
-        store.now_ms.set(net::now());
-        let visible = web_sys::window()
-            .and_then(|w| w.document())
-            .map(|d| !d.hidden())
-            .unwrap_or(true);
-        if visible {
-            net::check_liveness(store);
-        }
-    });
-    clock.forget();
-
-    // --- coming back to the app reconnects immediately --------------------
-    {
-        use wasm_bindgen::closure::Closure;
-        use wasm_bindgen::JsCast;
-        let cb = Closure::<dyn FnMut()>::new(move || {
-            let visible = web_sys::window()
-                .and_then(|w| w.document())
-                .map(|d| !d.hidden())
-                .unwrap_or(true);
-            net::report_availability(visible);
-            if visible {
-                net::nudge(store);
-            }
-        });
-        if let Some(w) = web_sys::window() {
-            let _ = w.add_event_listener_with_callback("focus", cb.as_ref().unchecked_ref());
-            let _ = w.add_event_listener_with_callback("online", cb.as_ref().unchecked_ref());
-            let _ = w.add_event_listener_with_callback("pageshow", cb.as_ref().unchecked_ref());
-            if let Some(d) = w.document() {
-                let _ = d.add_event_listener_with_callback(
-                    "visibilitychange",
-                    cb.as_ref().unchecked_ref(),
-                );
-            }
-        }
-        cb.forget();
-    }
+    track_topbar_height();
+    start_clock(store);
+    reconnect_on_return(store);
 
     // --- the connection follows the route ---------------------------------
     Effect::new(move |_| {
@@ -161,84 +68,8 @@ pub fn app() -> impl IntoView {
         }
     });
 
-    // --- global direction input -------------------------------------------
-    window_event_listener(ev::keydown, move |e: web_sys::KeyboardEvent| {
-        if store.game.get_untracked().is_none() {
-            return;
-        }
-        let dir = match e.key().as_str() {
-            "ArrowUp" | "w" | "W" => Some(Dir::Up),
-            "ArrowDown" | "s" | "S" => Some(Dir::Down),
-            "ArrowLeft" | "a" | "A" => Some(Dir::Left),
-            "ArrowRight" | "d" | "D" => Some(Dir::Right),
-            _ => None,
-        };
-        if let Some(dir) = dir {
-            e.prevent_default();
-            net::send_move(store, dir);
-        }
-    });
-
-    window_event_listener(ev::touchstart, move |e: web_sys::TouchEvent| {
-        if let Some(t) = e.touches().item(0) {
-            TOUCH_START.with(|c| c.set(Some((t.client_x(), t.client_y()))));
-        }
-    });
-    window_event_listener(ev::touchend, move |e: web_sys::TouchEvent| {
-        if store.game.get_untracked().is_none() {
-            return;
-        }
-        let Some((sx, sy)) = TOUCH_START.with(|c| c.take()) else {
-            return;
-        };
-        let Some(t) = e.changed_touches().item(0) else {
-            return;
-        };
-        let (dx, dy) = (t.client_x() - sx, t.client_y() - sy);
-        if dx.abs() < 30 && dy.abs() < 30 {
-            return; // a tap — handled by cell clicks
-        }
-        let dir = if dx.abs() >= dy.abs() {
-            if dx > 0 {
-                Dir::Right
-            } else {
-                Dir::Left
-            }
-        } else if dy > 0 {
-            Dir::Down
-        } else {
-            Dir::Up
-        };
-        net::send_move(store, dir);
-    });
-
-    // Whenever the modal opens, push one history entry so mobile back
-    // closes it; popstate is the single place that actually closes.
-    Effect::new(move |_| {
-        if store.show_profile_editor.get() {
-            MODAL_HISTORY.with(|c| {
-                if !c.get() {
-                    if let Some(w) = web_sys::window() {
-                        if let Ok(h) = w.history() {
-                            if h.push_state(&JsValue::NULL, "").is_ok() {
-                                c.set(true);
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-    window_event_listener(ev::popstate, move |_| {
-        if MODAL_HISTORY.with(|c| c.get()) {
-            MODAL_HISTORY.with(|c| c.set(false));
-            store.show_profile_editor.set(false);
-        } else {
-            // Back/forward across pushState entries (e.g. the clean "/"
-            // home URL) — sync the route to wherever we landed.
-            read_route();
-        }
-    });
+    steer_from_keys_and_swipes(store);
+    back_closes_profile_editor(store);
 
     let share_copied = RwSignal::new(false);
     view! {
@@ -258,41 +89,7 @@ pub fn app() -> impl IntoView {
                 }
                 view! {
                     <div>
-                        <div class="topbar">
-                            <a class="brand" href="#/">"snek 🐍"</a>
-                            <span style="display: flex; gap: 8px;">
-                                {move || {
-                                    if let Route::Session(name) = store.route.get() {
-                                        Some(
-                                            view! {
-                                                <span
-                                                    class="profile-chip"
-                                                    on:click=move |_| share_session(&name, share_copied)
-                                                >
-                                                    {move || {
-                                                        if share_copied.get() { "copied ✓" } else { "share" }
-                                                    }}
-                                                </span>
-                                            },
-                                        )
-                                    } else {
-                                        None
-                                    }
-                                }}
-                                <span
-                                    class="profile-chip"
-                                    style=move || {
-                                        format!("background: {};", store.profile.get().colour)
-                                    }
-                                    on:click=move |_| store.show_profile_editor.set(true)
-                                >
-                                    {move || {
-                                        let p = store.profile.get();
-                                        format!("{} {}", p.name, p.emoji)
-                                    }}
-                                </span>
-                            </span>
-                        </div>
+                        {topbar(store, share_copied)}
                         {move || store.error.get().map(|e| view! {
                             <div class="banner error">{e}</div>
                         })}
@@ -327,6 +124,218 @@ pub fn app() -> impl IntoView {
     }
 }
 
+/// The route is whatever the URL hash says.
+fn read_route(store: Store) {
+    let hash = web_sys::window()
+        .and_then(|w| w.location().hash().ok())
+        .unwrap_or_default();
+    store.route.set(parse_hash(&hash));
+}
+
+/// Whether the page is on screen. Without a document to ask, assume so.
+fn page_visible() -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .is_none_or(|d| !d.hidden())
+}
+
+/// The play screen sizes itself against whatever is above it. Measuring
+/// beats guessing: a long name or a bigger font can wrap the header onto two
+/// lines, and a constant here would quietly push the d-pad off the bottom of
+/// the screen on exactly the phones that can least afford it.
+fn track_topbar_height() {
+    let measure = move || {
+        let Some(w) = web_sys::window() else { return };
+        let Some(doc) = w.document() else { return };
+        // Document-relative, not viewport-relative: a bounding rect
+        // moves with the scroll position, and measuring mid-scroll gave
+        // a header nine pixels tall and a play area taller than the
+        // screen.
+        let bottom = doc
+            .query_selector(".topbar")
+            .ok()
+            .flatten()
+            .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+            .map(|e| f64::from(e.offset_top() + e.offset_height()))
+            .filter(|h| (24.0..320.0).contains(h))
+            .unwrap_or(104.0);
+        if let Some(root) = doc.document_element() {
+            let style = root.unchecked_ref::<web_sys::HtmlElement>().style();
+            let _ = style.set_property("--topbar-h", &format!("{bottom}px"));
+        }
+    };
+    measure();
+    let cb = Closure::<dyn FnMut()>::new(measure);
+    if let Some(w) = web_sys::window() {
+        let _ = w.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+        let _ =
+            w.add_event_listener_with_callback("orientationchange", cb.as_ref().unchecked_ref());
+    }
+    cb.forget();
+    // The header isn't in the DOM on the very first pass; catch it once
+    // it is, and again after fonts settle.
+    for delay in [0, 250, 1_000] {
+        let cb = Closure::<dyn FnMut()>::new(measure);
+        if let Some(w) = web_sys::window() {
+            let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(
+                cb.as_ref().unchecked_ref(),
+                delay,
+            );
+        }
+        cb.forget();
+    }
+}
+
+/// The shared coarse clock, which also drives the liveness watchdog.
+fn start_clock(store: Store) {
+    let clock = Interval::new(200, move || {
+        store.now_ms.set(net::now());
+        if page_visible() {
+            net::check_liveness(store);
+        }
+    });
+    clock.forget();
+}
+
+/// Coming back to the app reconnects immediately, and tells the server
+/// whether this device can think for bots.
+fn reconnect_on_return(store: Store) {
+    let cb = Closure::<dyn FnMut()>::new(move || {
+        let visible = page_visible();
+        net::report_availability(visible);
+        if visible {
+            net::nudge(store);
+        }
+    });
+    if let Some(w) = web_sys::window() {
+        let _ = w.add_event_listener_with_callback("focus", cb.as_ref().unchecked_ref());
+        let _ = w.add_event_listener_with_callback("online", cb.as_ref().unchecked_ref());
+        let _ = w.add_event_listener_with_callback("pageshow", cb.as_ref().unchecked_ref());
+        if let Some(d) = w.document() {
+            let _ =
+                d.add_event_listener_with_callback("visibilitychange", cb.as_ref().unchecked_ref());
+        }
+    }
+    cb.forget();
+}
+
+/// Global direction input: arrows and WASD on a keyboard, swipes anywhere
+/// on a touch screen.
+fn steer_from_keys_and_swipes(store: Store) {
+    window_event_listener(ev::keydown, move |e: web_sys::KeyboardEvent| {
+        if store.game.get_untracked().is_none() {
+            return;
+        }
+        let dir = match e.key().as_str() {
+            "ArrowUp" | "w" | "W" => Some(Dir::Up),
+            "ArrowDown" | "s" | "S" => Some(Dir::Down),
+            "ArrowLeft" | "a" | "A" => Some(Dir::Left),
+            "ArrowRight" | "d" | "D" => Some(Dir::Right),
+            _ => None,
+        };
+        if let Some(dir) = dir {
+            e.prevent_default();
+            net::send_move(store, dir);
+        }
+    });
+
+    window_event_listener(ev::touchstart, move |e: web_sys::TouchEvent| {
+        if let Some(t) = e.touches().item(0) {
+            TOUCH_START.with(|c| c.set(Some((t.client_x(), t.client_y()))));
+        }
+    });
+    window_event_listener(ev::touchend, move |e: web_sys::TouchEvent| {
+        if store.game.get_untracked().is_none() {
+            return;
+        }
+        let Some((sx, sy)) = TOUCH_START.with(Cell::take) else {
+            return;
+        };
+        let Some(t) = e.changed_touches().item(0) else {
+            return;
+        };
+        let (dx, dy) = (t.client_x() - sx, t.client_y() - sy);
+        if dx.abs() < 30 && dy.abs() < 30 {
+            return; // a tap — handled by cell clicks
+        }
+        let dir = if dx.abs() >= dy.abs() {
+            if dx > 0 { Dir::Right } else { Dir::Left }
+        } else if dy > 0 {
+            Dir::Down
+        } else {
+            Dir::Up
+        };
+        net::send_move(store, dir);
+    });
+}
+
+/// Whenever the modal opens, push one history entry so mobile back closes
+/// it; popstate is the single place that actually closes.
+fn back_closes_profile_editor(store: Store) {
+    Effect::new(move |_| {
+        if store.show_profile_editor.get() {
+            MODAL_HISTORY.with(|c| {
+                if !c.get()
+                    && let Some(w) = web_sys::window()
+                    && let Ok(h) = w.history()
+                    && h.push_state(&JsValue::NULL, "").is_ok()
+                {
+                    c.set(true);
+                }
+            });
+        }
+    });
+    window_event_listener(ev::popstate, move |_| {
+        if MODAL_HISTORY.with(Cell::get) {
+            MODAL_HISTORY.with(|c| c.set(false));
+            store.show_profile_editor.set(false);
+        } else {
+            // Back/forward across pushState entries (e.g. the clean "/"
+            // home URL) — sync the route to wherever we landed.
+            read_route(store);
+        }
+    });
+}
+
+/// The header: home, a share button in a session, and who you are.
+fn topbar(store: Store, share_copied: RwSignal<bool>) -> impl IntoView {
+    view! {
+        <div class="topbar">
+            <a class="brand" href="#/">"snek 🐍"</a>
+            <span style="display: flex; gap: 8px;">
+                {move || {
+                    if let Route::Session(name) = store.route.get() {
+                        Some(
+                            view! {
+                                <span
+                                    class="profile-chip"
+                                    on:click=move |_| share_session(&name, share_copied)
+                                >
+                                    {move || {
+                                        if share_copied.get() { "copied ✓" } else { "share" }
+                                    }}
+                                </span>
+                            },
+                        )
+                    } else {
+                        None
+                    }
+                }}
+                <span
+                    class="profile-chip"
+                    style=move || format!("background: {};", store.profile.get().colour)
+                    on:click=move |_| store.show_profile_editor.set(true)
+                >
+                    {move || {
+                        let p = store.profile.get();
+                        format!("{} {}", p.name, p.emoji)
+                    }}
+                </span>
+            </span>
+        </div>
+    }
+}
+
 /// Built-in browser share sheet where it exists (mobile / secure contexts);
 /// clipboard where that exists; a plain prompt as the everywhere-fallback.
 /// Feature-checked with Reflect so nothing here can throw on plain http.
@@ -351,8 +360,7 @@ fn share_session(word: &str, copied: RwSignal<bool>) {
         let _ = nav.share_with_data(&data);
     } else if has("clipboard")
         && !js_sys::Reflect::get(nav.as_ref(), &"clipboard".into())
-            .map(|c| c.is_undefined())
-            .unwrap_or(true)
+            .map_or(true, |c| c.is_undefined())
     {
         let _ = nav.clipboard().write_text(&url);
         copied.set(true);
@@ -362,15 +370,23 @@ fn share_session(word: &str, copied: RwSignal<bool>) {
     }
 }
 
+/// Go somewhere in the app. Only the hash changes; the hashchange listener
+/// turns that into a route like any other navigation.
+pub(crate) fn navigate(hash: &str) {
+    if let Some(w) = web_sys::window() {
+        let _ = w.location().set_hash(hash);
+    }
+}
+
 fn parse_hash(hash: &str) -> Route {
     let path = hash.trim_start_matches('#').trim_matches('/');
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     match parts.as_slice() {
-        [] | ["games"] => Route::Home,
         ["s", name] => Route::Session(normalize_word(name)),
         ["history"] => Route::History,
         ["compute"] => Route::Compute,
-        ["history", id] => id.parse().map(Route::Replay).unwrap_or(Route::History),
+        ["history", id] => id.parse().map_or(Route::History, Route::Replay),
+        // "", "games", and anything we don't recognise.
         _ => Route::Home,
     }
 }
@@ -436,7 +452,7 @@ fn profile_form() -> impl IntoView {
                                         palette::EMOJI_HAND,
                                         &draft.get_untracked().emoji,
                                     ),
-                                )
+                                );
                         }
                     >
                         "🎲 shuffle"
@@ -455,10 +471,10 @@ fn profile_form() -> impl IntoView {
                                         class="pick"
                                         class:selected=move || draft.get().emoji == sel
                                         on:click=move |_| {
-                                            draft.update(|p| p.emoji = pick.clone());
+                                            draft.update(|p| p.emoji.clone_from(&pick));
                                         }
                                     >
-                                        {e.clone()}
+                                        {e}
                                     </div>
                                 }
                             })
@@ -478,7 +494,7 @@ fn profile_form() -> impl IntoView {
                                     class:selected=move || draft.get().colour == sel
                                     style=format!("background: {c};")
                                     on:click=move |_| {
-                                        draft.update(|p| p.colour = pick.clone());
+                                        draft.update(|p| p.colour.clone_from(&pick));
                                     }
                                 ></div>
                             }

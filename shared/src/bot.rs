@@ -35,12 +35,15 @@
 //! checks only [`bind_proof`], which binds its nonce and request id to the
 //! move.
 
-use crate::types::*;
+use crate::engine::{dir_between, step};
+use crate::types::{BotDifficulty, Dir, GameConfig, PlayerId, Turn};
 use std::cell::RefCell;
+use std::cmp::{Ordering, Reverse};
 use std::collections::VecDeque;
 
 /// Per-move thinking budget in milliseconds.
-pub fn budget_ms(difficulty: BotDifficulty) -> u32 {
+#[must_use]
+pub const fn budget_ms(difficulty: BotDifficulty) -> u32 {
     match difficulty {
         BotDifficulty::Easy => 8,
         BotDifficulty::Medium => 35,
@@ -70,9 +73,12 @@ const DIRS: [Dir; 4] = [Dir::Up, Dir::Down, Dir::Left, Dir::Right];
 // ---------------------------------------------------------------------------
 
 /// Deterministic move for a fixed simulation count, plus a tamper-evidence
-/// proof: fnv1a over the nonce, the chosen move, and the root visit
-/// distribution. Identical on every platform for identical inputs, so any
-/// party can re-run the search and verify both outputs.
+/// proof.
+///
+/// The proof is fnv1a over the nonce, the chosen move, and the root visit
+/// distribution. Both are identical on every platform for identical inputs,
+/// so any party can re-run the search and verify them.
+#[must_use]
 pub fn think(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32, nonce: u64) -> (Dir, u64) {
     // Index the world: alive snakes in turn order, me somewhere among them.
     let order: Vec<&PlayerId> = turn.alive.iter().collect();
@@ -86,7 +92,7 @@ pub fn think(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32, nonce: 
         0 => return (Dir::Up, fnv1a(&[nonce, 1])),
         1 => {
             let d = root_cands[0];
-            return (d, fnv1a(&[nonce, 2, dir_index(d) as u64]));
+            return (d, fnv1a(&[nonce, 2, dir_index(d)]));
         }
         _ => {}
     }
@@ -94,24 +100,33 @@ pub fn think(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32, nonce: 
 }
 
 /// The response checksum a compute host must include: binds the server's
-/// nonce and request id to the chosen move. Verified server-side in
-/// nanoseconds; a response without the right binding is discarded and
-/// strikes the host. (Proves the request was received and answered
-/// deliberately — not that the search ran honestly; the deterministic
-/// `think` keeps full recompute-audits available if ever needed.)
+/// nonce and request id to the chosen move.
+///
+/// Verified server-side in nanoseconds; a response without the right
+/// binding is discarded and strikes the host. (Proves the request was
+/// received and answered deliberately — not that the search ran honestly;
+/// the deterministic `think` keeps full recompute-audits available if ever
+/// needed.)
+#[must_use]
 pub fn bind_proof(nonce: u64, request_id: u64, dir: Dir) -> u64 {
-    fnv1a(&[nonce, request_id, dir_index(dir) as u64, 0x736e_656b])
+    fnv1a(&[nonce, request_id, dir_index(dir), 0x736e_656b])
 }
 
-fn dir_index(d: Dir) -> usize {
-    DIRS.iter().position(|&x| x == d).unwrap_or(0)
+/// The move's position in [`DIRS`], as a proof word.
+const fn dir_index(d: Dir) -> u64 {
+    match d {
+        Dir::Up => 0,
+        Dir::Down => 1,
+        Dir::Left => 2,
+        Dir::Right => 3,
+    }
 }
 
 fn fnv1a(words: &[u64]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for w in words {
         for b in w.to_le_bytes() {
-            h ^= b as u64;
+            h ^= u64::from(b);
             h = h.wrapping_mul(0x1000_0000_01b3);
         }
     }
@@ -122,18 +137,23 @@ fn fnv1a(words: &[u64]) -> u64 {
 /// rounded everywhere, but libm's `ln` is not — so UCB uses this polynomial
 /// (exponent split + cubic in the mantissa). Accuracy ~1e-3, plenty for
 /// exploration terms; determinism is the point.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "mul_add rounds differently (moving every search result) and is a slow libm call on wasm"
+)]
 fn fast_ln(x: f32) -> f32 {
     if x <= 0.0 {
         return 0.0;
     }
     let bits = x.to_bits();
-    let e = ((bits >> 23) & 0xff) as i32 - 127;
+    // Shifting out the sign bit leaves the biased exponent in the top byte.
+    let exponent = f32::from((bits << 1).to_be_bytes()[0]) - 127.0;
     // The mantissa, in [1, 2).
-    let m = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
+    let mantissa = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
     // Least-squares cubic fit of log2(m) on [1,2); max error ~1.3e-3.
-    let (a, b, c, d) = (0.153_937f32, -1.029_631_1, 3.010_985, -2.133_964_3);
-    let l2 = ((a * m + b) * m + c) * m + d;
-    core::f32::consts::LN_2 * (e as f32 + l2)
+    let (c3, c2, c1, c0) = (0.153_937f32, -1.029_631_1, 3.010_985, -2.133_964_3);
+    let l2 = ((c3 * mantissa + c2) * mantissa + c1) * mantissa + c0;
+    core::f32::consts::LN_2 * (exponent + l2)
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +178,8 @@ impl Snake {
 
 #[derive(Clone)]
 struct FastBoard {
-    w: i16,
-    h: i16,
+    w: u16,
+    h: u16,
     snakes: Vec<Snake>,
     food: Vec<u16>,
     alive_count: usize,
@@ -168,7 +188,7 @@ struct FastBoard {
 }
 
 impl FastBoard {
-    fn from_turn(config: &GameConfig, turn: &Turn, order: &[&PlayerId]) -> FastBoard {
+    fn from_turn(config: &GameConfig, turn: &Turn, order: &[&PlayerId]) -> Self {
         let snakes = order
             .iter()
             .map(|p| Snake {
@@ -178,13 +198,13 @@ impl FastBoard {
             })
             .collect::<Vec<_>>();
         let alive_count = snakes.len();
-        FastBoard {
-            w: config.board_width as i16,
-            h: config.board_height as i16,
+        Self {
+            w: u16::from(config.board_width),
+            h: u16::from(config.board_height),
             snakes,
             food: turn.food.clone(),
             alive_count,
-            min_alive: if alive_count > 1 { 1 } else { 0 },
+            min_alive: usize::from(alive_count > 1),
         }
     }
 
@@ -192,8 +212,9 @@ impl FastBoard {
     /// same food (in any order — eating reorders the list). Food is what
     /// makes reuse safe: the search never spawns any, so a tree whose child
     /// matches the new turn exactly was built for the world that happened.
-    fn same_position(&self, other: &FastBoard) -> bool {
-        if (self.w, self.h) != (other.w, other.h)
+    fn same_position(&self, other: &Self) -> bool {
+        if self.w != other.w
+            || self.h != other.h
             || self.snakes.len() != other.snakes.len()
             || self.food.len() != other.food.len()
         {
@@ -214,30 +235,26 @@ impl FastBoard {
         a == b
     }
 
-    fn is_wall(&self, pos: u16) -> bool {
-        let (x, y) = (pos as i16 % self.w, pos as i16 / self.w);
+    const fn is_wall(&self, pos: u16) -> bool {
+        let (x, y) = (pos % self.w, pos / self.w);
         x == 0 || y == 0 || x == self.w - 1 || y == self.h - 1
     }
 
     fn step_dir(&self, from: u16, dir: Dir) -> Option<u16> {
-        let (x, y) = (from as i16 % self.w, from as i16 / self.w);
-        let (dx, dy) = dir.delta();
-        let (nx, ny) = (x + dx, y + dy);
-        if nx < 0 || nx >= self.w || ny < 0 || ny >= self.h {
-            None
-        } else {
-            Some((ny * self.w + nx) as u16)
-        }
+        step(from, dir, self.w, self.h)
     }
 
-    fn is_terminal(&self) -> bool {
+    const fn is_terminal(&self) -> bool {
         self.alive_count <= self.min_alive
     }
 
     /// Sole survivor of a multi game, if the board is terminal that way.
     fn winner(&self) -> Option<usize> {
-        (self.min_alive == 1 && self.alive_count == 1)
-            .then(|| self.snakes.iter().position(|s| s.alive).unwrap())
+        if self.min_alive == 1 && self.alive_count == 1 {
+            self.snakes.iter().position(|s| s.alive)
+        } else {
+            None
+        }
     }
 
     /// One tick of the real rules (minus random food spawns): wall/self
@@ -309,8 +326,9 @@ impl FastBoard {
             let head = self.snakes[i].head();
             if let Some(f) = self.food.iter().position(|&c| c == head) {
                 self.food.swap_remove(f);
-                let tail = *self.snakes[i].body.back().unwrap();
-                self.snakes[i].body.push_back(tail);
+                if let Some(&tail) = self.snakes[i].body.back() {
+                    self.snakes[i].body.push_back(tail);
+                }
                 self.snakes[i].health = 100;
             } else {
                 self.snakes[i].health = self.snakes[i].health.saturating_sub(1);
@@ -332,17 +350,7 @@ fn last_dir(board: &FastBoard, i: usize) -> Option<Dir> {
     if s.len() < 2 || s.body[0] == s.body[1] {
         return None;
     }
-    let (head, neck) = (s.body[0] as i16, s.body[1] as i16);
-    match (
-        head % board.w - neck % board.w,
-        head / board.w - neck / board.w,
-    ) {
-        (0, -1) => Some(Dir::Up),
-        (0, 1) => Some(Dir::Down),
-        (-1, 0) => Some(Dir::Left),
-        (1, 0) => Some(Dir::Right),
-        _ => None,
-    }
+    dir_between(s.body[1], s.body[0], board.w)
 }
 
 /// Up to four moves, inline: candidate lists are built for every snake at
@@ -354,13 +362,13 @@ struct Cands {
 }
 
 impl Cands {
-    const fn empty() -> Cands {
-        Cands {
+    const fn empty() -> Self {
+        Self {
             dirs: [Dir::Up; 4],
             n: 0,
         }
     }
-    fn push(&mut self, d: Dir) {
+    const fn push(&mut self, d: Dir) {
         self.dirs[self.n as usize] = d;
         self.n += 1;
     }
@@ -390,7 +398,7 @@ fn candidates(board: &FastBoard, i: usize) -> Cands {
         return v;
     }
     let head = board.snakes[i].head();
-    let reverse = last_dir(board, i).map(|d| d.opposite());
+    let reverse = last_dir(board, i).map(Dir::opposite);
     for &m in &DIRS {
         if Some(m) == reverse {
             continue;
@@ -435,17 +443,12 @@ fn safe_candidates(board: &FastBoard, i: usize) -> Cands {
     for &m in base.iter() {
         if board
             .step_dir(head, m)
-            .map(|t| !danger.contains(&t))
-            .unwrap_or(false)
+            .is_some_and(|t| !danger.contains(&t))
         {
             safe.push(m);
         }
     }
-    if safe.n == 0 {
-        base
-    } else {
-        safe
-    }
+    if safe.n == 0 { base } else { safe }
 }
 
 // ---------------------------------------------------------------------------
@@ -468,13 +471,13 @@ struct Node {
 }
 
 impl Node {
-    fn new(board: FastBoard) -> Node {
+    fn new(board: FastBoard) -> Self {
         let terminal = board.is_terminal();
         let mut cands = [Cands::empty(); MAX_SNAKES];
         for (i, c) in cands.iter_mut().enumerate().take(board.snakes.len()) {
             *c = safe_candidates(&board, i);
         }
-        Node {
+        Self {
             stats: vec![[0.0; 2]; board.snakes.len() * 4],
             board,
             cands,
@@ -492,20 +495,25 @@ impl Node {
     }
 
     /// UCB1 for one snake: first unvisited candidate, else
-    /// argmax Q + c·√(ln(total+1)/n). Deterministic tie-break.
-    fn select(&self, i: usize, c_uct: f32) -> usize {
-        let n_cands = self.cands[i].len();
+    /// argmax Q + c·√(ln(total+1)/n). Deterministic tie-break. Returns the
+    /// candidate's index (below 4, so it packs into the joint-move key).
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "mul_add rounds differently (moving every search result) and is a slow libm call on wasm"
+    )]
+    fn select(&self, i: usize, c_uct: f32) -> u8 {
+        let n_cands = self.cands[i].n;
         if n_cands == 1 {
             return 0;
         }
         let stats = &self.stats[i * 4..i * 4 + 4];
-        if let Some(c) = (0..n_cands).find(|&c| stats[c][0] == 0.0) {
+        if let Some(c) = (0..n_cands).find(|&c| stats[usize::from(c)][0] == 0.0) {
             return c;
         }
         let ln_total = fast_ln(self.total + 1.0);
         let mut best = 0;
         let mut best_score = f32::NEG_INFINITY;
-        for (c, &[n, v]) in stats.iter().enumerate().take(n_cands) {
+        for (c, &[n, v]) in (0..n_cands).zip(stats) {
             let q = v / n;
             let score = q + c_uct * (ln_total / n).sqrt();
             if score > best_score {
@@ -526,7 +534,9 @@ const EVAL: EvalFn = evaluate;
 /// simulations are sequential, so N+M sims equals one run of N+M.
 pub struct Search {
     nodes: Vec<Node>,
-    path: Vec<(usize, [usize; MAX_SNAKES])>,
+    /// The current descent: each node and the candidate every snake chose
+    /// there.
+    path: Vec<(usize, [u8; MAX_SNAKES])>,
     /// Who each board index is (the turn's alive list), so a later turn can
     /// tell whether this tree still describes its world.
     order: Vec<PlayerId>,
@@ -555,11 +565,13 @@ impl Search {
     }
 
     /// Nodes in the tree, including any carried over from the last turn.
-    pub fn tree_size(&self) -> usize {
+    #[must_use]
+    pub const fn tree_size(&self) -> usize {
         self.nodes.len()
     }
 
     /// The chosen move and its proof. Valid once `step` has returned true.
+    #[must_use]
     pub fn result(&self) -> (Dir, u64) {
         if let Some(done) = self.immediate {
             return done;
@@ -576,40 +588,39 @@ impl Search {
                 break eval(&nodes[cur].board);
             }
             let n = nodes[cur].board.snakes.len();
-            let mut cidx = [0usize; MAX_SNAKES];
+            let mut cidx = [0u8; MAX_SNAKES];
             let mut key = 0u32;
             for (i, slot) in cidx.iter_mut().enumerate().take(n) {
                 let c = nodes[cur].select(i, c_uct);
                 *slot = c;
-                key = key * 4 + c as u32;
+                key = key * 4 + u32::from(c);
             }
             path.push((cur, cidx));
-            match nodes[cur].child(key) {
-                Some(child) => cur = child,
-                None => {
-                    let mut child = nodes[cur].board.clone();
-                    let mut moves = [Dir::Up; MAX_SNAKES];
-                    for (i, m) in moves.iter_mut().enumerate().take(n) {
-                        *m = nodes[cur].cands[i][cidx[i]];
-                    }
-                    child.step(&moves[..n]);
-                    let vals = eval(&child);
-                    // At the size cap the tree stops growing but the search
-                    // doesn't: the leaf is scored and backed up, unstored.
-                    if nodes.len() < MAX_NODES {
-                        let id = nodes.len();
-                        nodes.push(Node::new(child));
-                        nodes[cur].children.push((key, id as u32));
-                    }
-                    break vals;
+            let Some(child) = nodes[cur].child(key) else {
+                let mut child = nodes[cur].board.clone();
+                let mut moves = [Dir::Up; MAX_SNAKES];
+                for (i, m) in moves.iter_mut().enumerate().take(n) {
+                    *m = nodes[cur].cands[i][usize::from(cidx[i])];
                 }
-            }
+                child.step(&moves[..n]);
+                let vals = eval(&child);
+                // At the size cap the tree stops growing but the search
+                // doesn't: the leaf is scored and backed up, unstored.
+                if nodes.len() < MAX_NODES
+                    && let Ok(id) = u32::try_from(nodes.len())
+                {
+                    nodes.push(Node::new(child));
+                    nodes[cur].children.push((key, id));
+                }
+                break vals;
+            };
+            cur = child;
         };
         for &(nid, cidx) in path.iter() {
             let node = &mut nodes[nid];
             node.total += 1.0;
             for i in 0..node.board.snakes.len() {
-                let st = &mut node.stats[i * 4 + cidx[i]];
+                let st = &mut node.stats[i * 4 + usize::from(cidx[i])];
                 st[0] += 1.0;
                 st[1] += leaf_vals[i];
             }
@@ -619,15 +630,16 @@ impl Search {
 
 /// Argmax visits (Q breaks ties), plus the proof binding the nonce to the
 /// work actually performed.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "visit counts are whole numbers in [0, 2^24], exact in f32 and in u64; Rust has no From<f32> for integers"
+)]
 fn readout(nodes: &[Node], me: usize, nonce: u64) -> (Dir, u64) {
     let root_node = &nodes[0];
     let q = |c: usize| {
         let [n, v] = root_node.stats[me * 4 + c];
-        if n > 0.0 {
-            v / n
-        } else {
-            f32::NEG_INFINITY
-        }
+        if n > 0.0 { v / n } else { f32::NEG_INFINITY }
     };
     let mut best = 0usize;
     for c in 1..root_node.cands[me].len() {
@@ -637,7 +649,7 @@ fn readout(nodes: &[Node], me: usize, nonce: u64) -> (Dir, u64) {
         }
     }
     let dir = root_node.cands[me][best];
-    let mut words: Vec<u64> = vec![nonce, dir_index(dir) as u64];
+    let mut words: Vec<u64> = vec![nonce, dir_index(dir)];
     for c in 0..root_node.cands[me].len() {
         words.push(root_node.stats[me * 4 + c][0] as u64);
     }
@@ -662,17 +674,20 @@ fn search(root: &FastBoard, me: usize, max_sims: usize, nonce: u64, eval: EvalFn
 
 /// Start a search that the caller drives with [`Search::step`]. Trivial
 /// positions (boxed in, or a single legal move) finish immediately.
+#[must_use]
 pub fn begin(config: &GameConfig, turn: &Turn, me: &PlayerId, sims: u32, nonce: u64) -> Search {
     begin_from(None, config, turn, me, sims, nonce)
 }
 
-/// [`begin`], but starting from last turn's tree when it still applies:
-/// the subtree under the joint move that actually happened is already a
+/// [`begin`], but starting from last turn's tree when it still applies.
+///
+/// The subtree under the joint move that actually happened is already a
 /// search of this exact position, often thousands of simulations deep. It
 /// applies only if that child's board *is* this turn — same snakes, same
 /// health, same food. New food (the one thing the search never imagines)
 /// or a death changing who is playing means no child matches, and the
 /// search starts fresh.
+#[must_use]
 pub fn begin_from(
     prev: Option<Search>,
     config: &GameConfig,
@@ -704,7 +719,7 @@ pub fn begin_from(
         0 => finished((Dir::Up, fnv1a(&[nonce, 1]))),
         1 => {
             let d = cands[0];
-            finished((d, fnv1a(&[nonce, 2, dir_index(d) as u64])))
+            finished((d, fnv1a(&[nonce, 2, dir_index(d)])))
         }
         _ => {
             let nodes = prev
@@ -744,8 +759,11 @@ fn reroot(nodes: Vec<Node>, root: usize) -> Vec<Node> {
         let kids = std::mem::take(&mut out[i].children);
         let mut moved = Vec::with_capacity(kids.len());
         for (key, old) in kids {
-            if let Some(node) = slots[old as usize].take() {
-                moved.push((key, out.len() as u32));
+            // Ids were u32 in the old arena, and this one holds fewer nodes.
+            if let Ok(id) = u32::try_from(out.len())
+                && let Some(node) = slots[old as usize].take()
+            {
+                moved.push((key, id));
                 out.push(node);
             }
         }
@@ -956,9 +974,9 @@ struct Scratch {
     /// `blocked_until` for an empty board of `walls_for` — the wall ring —
     /// built once per board size and copied in.
     walls: Vec<u16>,
-    walls_for: (i16, i16),
+    walls_for: (u16, u16),
     /// Non-wall cells on that board.
-    interior: usize,
+    interior: u16,
 }
 
 thread_local! {
@@ -969,11 +987,17 @@ fn evaluate_impl(board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
     SCRATCH.with(|scratch| evaluate_with(&mut scratch.borrow_mut(), board, tuning))
 }
 
+/// A body or board count as the u16 the evaluation works in. Nothing on a
+/// board of at most 255 x 255 cells counts past that.
+fn count(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
 fn evaluate_with(sc: &mut Scratch, board: &FastBoard, tuning: Tuning) -> [f32; MAX_SNAKES] {
     let mut vals = [-1.0f32; MAX_SNAKES];
     if board.is_terminal() {
         match board.winner() {
-            Some(w) => vals[w] = 1.0,
+            Some(winner) => vals[winner] = 1.0,
             None => {
                 for v in vals.iter_mut().take(board.snakes.len()) {
                     *v = DRAW_VALUE;
@@ -983,46 +1007,107 @@ fn evaluate_with(sc: &mut Scratch, board: &FastBoard, tuning: Tuning) -> [f32; M
         return vals;
     }
 
-    let w = board.w as usize;
-    let cells = w * board.h as usize;
-    let n = board.snakes.len();
-    let mut alive_buf = [0usize; MAX_SNAKES];
-    let mut n_alive_snakes = 0;
-    for i in 0..n {
-        if board.snakes[i].alive {
-            alive_buf[n_alive_snakes] = i;
-            n_alive_snakes += 1;
+    // Living snakes by index, and every snake's length.
+    let mut lens = [0u16; MAX_SNAKES];
+    let mut alive_buf = [0u8; MAX_SNAKES];
+    let mut n_alive = 0u8;
+    for (id, s) in (0u8..).zip(&board.snakes) {
+        lens[usize::from(id)] = count(s.len());
+        if s.alive {
+            alive_buf[usize::from(n_alive)] = id;
+            n_alive += 1;
         }
     }
-    let alive = &alive_buf[..n_alive_snakes];
+    let alive = &alive_buf[..usize::from(n_alive)];
 
     // Turns until each cell is vacated (walls never are).
+    let cells = usize::from(board.w) * usize::from(board.h);
     if sc.walls_for != (board.w, board.h) || sc.walls.len() != cells {
-        sc.walls = (0..cells as u16)
+        sc.walls = (0..board.w * board.h)
             .map(|pos| if board.is_wall(pos) { u16::MAX } else { 0 })
             .collect();
         sc.walls_for = (board.w, board.h);
-        sc.interior = sc.walls.iter().filter(|&&b| b == 0).count();
+        sc.interior = sc.walls.iter().fold(0, |n, &b| n + u16::from(b == 0));
     }
     let blocked_until = &mut sc.blocked_until;
     blocked_until.clear();
     blocked_until.extend_from_slice(&sc.walls);
     // Distinct cells under living bodies (stacked tail segments share one).
-    let mut occupied = 0usize;
-    for &i in alive {
-        let s = &board.snakes[i];
-        let len = s.len();
-        for (k, &seg) in s.body.iter().enumerate() {
-            let c = seg as usize;
+    let mut occupied = 0u16;
+    for &id in alive {
+        // Segment k of an L-long body frees after L - k turns.
+        let mut frees_after = lens[usize::from(id)];
+        for &seg in &board.snakes[usize::from(id)].body {
+            let c = usize::from(seg);
             if blocked_until[c] == 0 {
                 occupied += 1;
             }
-            blocked_until[c] = blocked_until[c].max((len - k) as u16);
+            blocked_until[c] = blocked_until[c].max(frees_after);
+            frees_after = frees_after.saturating_sub(1);
         }
     }
 
-    // Ownership race: longer snakes claim first within a turn; equal-length
-    // same-turn contests void the cell and stop both floods.
+    let flood = ownership_race(sc, board, alive, &lens);
+
+    let free = sc.interior.saturating_sub(occupied).max(1);
+    for &id in alive {
+        let i = usize::from(id);
+        let s = &board.snakes[i];
+        // Trap: only "is there room for my body?" matters (anything at or
+        // past `len` scores 0), so the flood stops once it has counted
+        // that much.
+        let reach = reachable_cells(
+            board,
+            i,
+            &sc.blocked_until,
+            lens[i],
+            (&mut sc.seen, &mut sc.stamp, &mut sc.queue),
+        );
+        let outlook = Outlook {
+            len: lens[i],
+            longest_other: alive
+                .iter()
+                .filter(|&&j| j != id)
+                .map(|&j| lens[usize::from(j)])
+                .max()
+                .unwrap_or(0),
+            health: s.health,
+            area: flood.area[i],
+            free,
+            n_alive,
+            food_dist: flood.food_dist[i],
+            food_any: flood.food_any[i],
+            reach,
+        };
+        vals[i] = snake_value(&outlook, tuning);
+    }
+    vals
+}
+
+/// What the ownership race found, per snake.
+struct Flood {
+    /// Cells owned outright.
+    area: [u16; MAX_SNAKES],
+    /// Earliest arrival at food the snake wins the race to (`u16::MAX`:
+    /// none).
+    food_dist: [u16; MAX_SNAKES],
+    /// Earliest arrival at food it reaches first *or ties for*.
+    food_any: [u16; MAX_SNAKES],
+}
+
+/// The time-expanded Voronoi flood over `sc.blocked_until`: all heads at
+/// once, one turn per layer. Longer snakes claim first within a turn;
+/// equal-length same-turn contests void the cell and stop both floods.
+fn ownership_race(
+    sc: &mut Scratch,
+    board: &FastBoard,
+    alive: &[u8],
+    lens: &[u16; MAX_SNAKES],
+) -> Flood {
+    let width = usize::from(board.w);
+    let cells = sc.blocked_until.len();
+    let n = board.snakes.len();
+    let blocked_until = &sc.blocked_until;
     let owner = &mut sc.owner;
     owner.clear();
     owner.resize(cells, UNCLAIMED);
@@ -1035,14 +1120,15 @@ fn evaluate_with(sc: &mut Scratch, board: &FastBoard, tuning: Tuning) -> [f32; M
     is_food.clear();
     is_food.resize(cells, false);
     for &f in &board.food {
-        is_food[f as usize] = true;
+        is_food[usize::from(f)] = true;
     }
     let mut food_any = [u16::MAX; MAX_SNAKES];
     // Cells owned outright, tallied as the flood claims (and contests) them.
-    let mut area = [0usize; MAX_SNAKES];
-    let mut race_buf = alive_buf;
-    let race_order = &mut race_buf[..n_alive_snakes];
-    race_order.sort_by_key(|&i| std::cmp::Reverse(board.snakes[i].len()));
+    let mut area = [0u16; MAX_SNAKES];
+    let mut race_buf = [0u8; MAX_SNAKES];
+    let race_order = &mut race_buf[..alive.len()];
+    race_order.copy_from_slice(alive);
+    race_order.sort_by_key(|&id| Reverse(lens[usize::from(id)]));
     let race_order = &*race_order;
     if sc.frontier.len() < n {
         sc.frontier.resize_with(n, Vec::new);
@@ -1052,49 +1138,52 @@ fn evaluate_with(sc: &mut Scratch, board: &FastBoard, tuning: Tuning) -> [f32; M
     for f in frontier.iter_mut().take(n) {
         f.clear();
     }
-    for &i in alive {
-        frontier[i].push(board.snakes[i].head() as usize);
+    for &id in alive {
+        let i = usize::from(id);
+        frontier[i].push(usize::from(board.snakes[i].head()));
     }
-    let mut t: u16 = 0;
-    while frontier[..n].iter().any(|f| !f.is_empty()) && (t as usize) <= cells {
-        t += 1;
+    let mut turn: u16 = 0;
+    while frontier[..n].iter().any(|f| !f.is_empty()) && usize::from(turn) <= cells {
+        turn += 1;
         for f in next.iter_mut().take(n) {
             f.clear();
         }
-        for &i in race_order {
-            let my_len = board.snakes[i].len();
+        for &me in race_order {
+            let i = usize::from(me);
+            let my_len = lens[i];
             for &c in &frontier[i] {
-                if t > 1 && owner[c] != i as u8 {
+                if turn > 1 && owner[c] != me {
                     continue; // this frontier cell got contested away
                 }
                 // Flood cells are never walls and the board is ringed by
                 // walls, so all four neighbours are in range: no
                 // coordinates, no bounds checks.
-                for nc in [c + w, c - w, c + 1, c - 1] {
-                    if blocked_until[nc] > t {
+                for nc in [c + width, c - width, c + 1, c - 1] {
+                    if blocked_until[nc] > turn {
                         continue;
                     }
                     match owner[nc] {
                         UNCLAIMED => {
-                            owner[nc] = i as u8;
+                            owner[nc] = me;
                             area[i] += 1;
-                            arrival[nc] = t;
+                            arrival[nc] = turn;
                             next[i].push(nc);
                             if is_food[nc] {
-                                food_any[i] = food_any[i].min(t);
+                                food_any[i] = food_any[i].min(turn);
                             }
                         }
                         o if o != CONTESTED
-                            && o != i as u8
-                            && arrival[nc] == t
-                            && board.snakes[o as usize].len() == my_len =>
+                            && o != me
+                            && arrival[nc] == turn
+                            && lens[usize::from(o)] == my_len =>
                         {
+                            let o = usize::from(o);
                             owner[nc] = CONTESTED;
-                            area[o as usize] -= 1;
+                            area[o] -= 1;
                             if is_food[nc] {
                                 // Both can be here at t; both should see it.
-                                food_any[i] = food_any[i].min(t);
-                                food_any[o as usize] = food_any[o as usize].min(t);
+                                food_any[i] = food_any[i].min(turn);
+                                food_any[o] = food_any[o].min(turn);
                             }
                         }
                         _ => {}
@@ -1108,127 +1197,135 @@ fn evaluate_with(sc: &mut Scratch, board: &FastBoard, tuning: Tuning) -> [f32; M
     // Earliest arrival at food this snake wins the race to.
     let mut food_dist = [u16::MAX; MAX_SNAKES];
     for &f in &board.food {
-        let c = f as usize;
+        let c = usize::from(f);
         let o = owner[c];
         if o != UNCLAIMED && o != CONTESTED {
-            let o = o as usize;
+            let o = usize::from(o);
             food_dist[o] = food_dist[o].min(arrival[c]);
         }
     }
+    Flood {
+        area,
+        food_dist,
+        food_any,
+    }
+}
 
-    let free = (sc.interior - occupied).max(1);
-    let n_alive = alive.len() as f32;
-    for &i in alive {
-        let s = &board.snakes[i];
-        let len = s.len() as f32;
-        let area_score = ((area[i] as f32 / free as f32) * n_alive - 1.0).clamp(-1.0, 1.0);
-        let health = (s.health as f32 / 100.0) * 2.0 - 1.0;
-        let longest_other = alive
-            .iter()
-            .filter(|&&j| j != i)
-            .map(|&j| board.snakes[j].len())
-            .max()
-            .unwrap_or(0) as f32;
-        let length = ((len - longest_other) / 4.0).clamp(-1.0, 1.0);
-        // Hunger: the race between health and the nearest food we can win,
-        // weighted by how hungry we actually are.
-        let hunger = ((100.0 - s.health as f32) / 60.0).clamp(0.0, 1.0);
-        let urgency = if tuning.growth > 0.0 {
-            // Shorter (or merely equal — ties die too) than the biggest
-            // rival: food matters even on full health.
-            let growth_need = if tuning.bully_target {
-                // Parity is worthless: full urgency until strictly ahead,
-                // tapering once the head-on lead is banked.
-                if len <= longest_other {
-                    1.0
-                } else {
-                    ((longest_other + 2.0 - len) / 2.0).clamp(0.0, 1.0)
-                }
-            } else {
-                ((longest_other + 2.0 - len) / 4.0).clamp(0.0, 1.0)
-            };
-            // Early game: leads are cheap to take and expensive to concede.
-            let early = if len.max(longest_other) < tuning.early_until {
-                tuning.early_boost
-            } else {
+/// One living snake's position, as the blend scores it.
+struct Outlook {
+    len: u16,
+    /// Longest living rival (0 when alone).
+    longest_other: u16,
+    health: u8,
+    /// Cells owned outright, out of `free` unoccupied ones, shared among
+    /// `n_alive` snakes.
+    area: u16,
+    free: u16,
+    n_alive: u8,
+    /// See [`Flood`].
+    food_dist: u16,
+    food_any: u16,
+    /// Cells reachable at all, counted up to `len`.
+    reach: u16,
+}
+
+/// The Voronoi blend for one snake, in [-1, 1].
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "mul_add rounds differently (moving every search result) and is a slow libm call on wasm"
+)]
+fn snake_value(o: &Outlook, tuning: Tuning) -> f32 {
+    let len = f32::from(o.len);
+    let longest_other = f32::from(o.longest_other);
+    let area_score =
+        ((f32::from(o.area) / f32::from(o.free)) * f32::from(o.n_alive) - 1.0).clamp(-1.0, 1.0);
+    let health = (f32::from(o.health) / 100.0) * 2.0 - 1.0;
+    let length = ((len - longest_other) / 4.0).clamp(-1.0, 1.0);
+    // Hunger: the race between health and the nearest food we can win,
+    // weighted by how hungry we actually are.
+    let hunger = ((100.0 - f32::from(o.health)) / 60.0).clamp(0.0, 1.0);
+    let urgency = if tuning.growth > 0.0 {
+        // Shorter (or merely equal — ties die too) than the biggest
+        // rival: food matters even on full health.
+        let growth_need = if tuning.bully_target {
+            // Parity is worthless: full urgency until strictly ahead,
+            // tapering once the head-on lead is banked.
+            if o.len <= o.longest_other {
                 1.0
-            };
-            hunger.max((tuning.growth * early).min(1.0) * growth_need)
-        } else {
-            hunger
-        };
-        let _ = urgency;
-        let margin = if food_dist[i] == u16::MAX {
-            -1.0
-        } else {
-            ((s.health as f32 - food_dist[i] as f32) / 25.0).clamp(-1.0, 1.0)
-        };
-        let food = if tuning.gradient_food {
-            // Appetite: a healthy snake at parity still wants food a bit
-            // (that is opportunistic eating), more when hungry, more when
-            // behind on length. Everything continuous — no switches.
-            let deficit = ((longest_other + 1.0 - len) / 4.0).clamp(0.0, 1.0);
-            let appetite = (tuning.appetite_base + 0.60 * hunger + 0.50 * deficit).min(1.0);
-            // Prefer food we own outright; fall back to food we merely tie
-            // the race to, at a discount.
-            let (dist, share) = if food_dist[i] != u16::MAX {
-                (food_dist[i], 1.0)
             } else {
-                (food_any[i], tuning.contested_food)
-            };
-            match dist {
-                // Nothing reachable at all: bad in proportion to hunger.
-                u16::MAX => -0.5 * hunger,
-                _ if share <= 0.0 => -0.5 * hunger,
-                d if (d as f32) > s.health as f32 => -1.0, // cannot make it
-                d => {
-                    // Smooth pull, so there is always a slope to climb.
-                    let attraction = 1.0 / (1.0 + d as f32 / tuning.food_scale);
-                    appetite * attraction * share
-                }
+                ((longest_other + 2.0 - len) / 2.0).clamp(0.0, 1.0)
             }
         } else {
-            urgency * margin
+            ((longest_other + 2.0 - len) / 4.0).clamp(0.0, 1.0)
         };
-        // Trap: a reachable region smaller than the body is a death sentence.
-        // Only "is there room for my body?" matters (anything at or past
-        // `len` scores 0), so the flood stops once it has counted that much.
-        let reach = reachable_cells(
-            board,
-            i,
-            blocked_until,
-            s.len(),
-            (&mut sc.seen, &mut sc.stamp, &mut sc.queue),
-        );
-        let trap = ((reach as f32 - len) / len).clamp(-1.0, 0.0);
-        let (w_health, w_length) = if tuning.length_heavy {
-            (0.05, W_LENGTH + 0.05)
+        // Early game: leads are cheap to take and expensive to concede.
+        let early = if len.max(longest_other) < tuning.early_until {
+            tuning.early_boost
         } else {
-            (W_HEALTH, W_LENGTH)
+            1.0
         };
-        // Head-on standing: strictly longer wins the collision, exact
-        // parity kills us both, shorter simply loses it.
-        let dominance = if tuning.dominance > 0.0 {
-            let standing = if len > longest_other {
-                1.0
-            } else if len == longest_other {
-                -1.0
-            } else {
-                -0.5
-            };
-            tuning.dominance * standing
+        hunger.max((tuning.growth * early).min(1.0) * growth_need)
+    } else {
+        hunger
+    };
+    let margin = if o.food_dist == u16::MAX {
+        -1.0
+    } else {
+        ((f32::from(o.health) - f32::from(o.food_dist)) / 25.0).clamp(-1.0, 1.0)
+    };
+    let food = if tuning.gradient_food {
+        // Appetite: a healthy snake at parity still wants food a bit
+        // (that is opportunistic eating), more when hungry, more when
+        // behind on length. Everything continuous — no switches.
+        let deficit = ((longest_other + 1.0 - len) / 4.0).clamp(0.0, 1.0);
+        let appetite = (tuning.appetite_base + 0.60 * hunger + 0.50 * deficit).min(1.0);
+        // Prefer food we own outright; fall back to food we merely tie
+        // the race to, at a discount.
+        let (dist, share) = if o.food_dist == u16::MAX {
+            (o.food_any, tuning.contested_food)
         } else {
-            0.0
+            (o.food_dist, 1.0)
         };
-        vals[i] = (W_AREA * area_score
-            + w_health * health
-            + w_length * length
-            + W_FOOD * food
-            + W_TRAP * trap
-            + dominance)
-            .clamp(-1.0, 1.0);
-    }
-    vals
+        match dist {
+            // Nothing reachable at all: bad in proportion to hunger.
+            u16::MAX => -0.5 * hunger,
+            _ if share <= 0.0 => -0.5 * hunger,
+            d if d > u16::from(o.health) => -1.0, // cannot make it
+            d => {
+                // Smooth pull, so there is always a slope to climb.
+                let attraction = 1.0 / (1.0 + f32::from(d) / tuning.food_scale);
+                appetite * attraction * share
+            }
+        }
+    } else {
+        urgency * margin
+    };
+    // Trap: a reachable region smaller than the body is a death sentence.
+    let trap = ((f32::from(o.reach) - len) / len).clamp(-1.0, 0.0);
+    let (w_health, w_length) = if tuning.length_heavy {
+        (0.05, W_LENGTH + 0.05)
+    } else {
+        (W_HEALTH, W_LENGTH)
+    };
+    // Head-on standing: strictly longer wins the collision, exact
+    // parity kills us both, shorter simply loses it.
+    let dominance = if tuning.dominance > 0.0 {
+        let standing = match o.len.cmp(&o.longest_other) {
+            Ordering::Greater => 1.0,
+            Ordering::Equal => -1.0,
+            Ordering::Less => -0.5,
+        };
+        tuning.dominance * standing
+    } else {
+        0.0
+    };
+    (W_AREA * area_score
+        + w_health * health
+        + w_length * length
+        + W_FOOD * food
+        + W_TRAP * trap
+        + dominance)
+        .clamp(-1.0, 1.0)
 }
 
 /// Cells snake `i` can reach at all, opponents parked and tails decaying:
@@ -1238,10 +1335,10 @@ fn reachable_cells(
     board: &FastBoard,
     i: usize,
     blocked_until: &[u16],
-    enough: usize,
+    enough: u16,
     (seen, stamp, queue): (&mut Vec<u32>, &mut u32, &mut Vec<(usize, u16)>),
-) -> usize {
-    let w = board.w as usize;
+) -> u16 {
+    let width = usize::from(board.w);
     if seen.len() != blocked_until.len() || *stamp == u32::MAX {
         seen.clear();
         seen.resize(blocked_until.len(), 0);
@@ -1252,42 +1349,44 @@ fn reachable_cells(
     // A Vec read from the front is the same FIFO as a VecDeque, minus the
     // allocation.
     queue.clear();
-    let start = board.snakes[i].head() as usize;
+    let start = usize::from(board.snakes[i].head());
     seen[start] = mark;
     queue.push((start, 0u16));
-    let mut count = 0usize;
+    let mut reached = 0u16;
     let mut head = 0;
     while head < queue.len() {
         let (c, t) = queue[head];
         head += 1;
         // Never a wall (see the ownership flood), so no bounds checks.
-        for nc in [c + w, c - w, c + 1, c - 1] {
+        for nc in [c + width, c - width, c + 1, c - 1] {
             if seen[nc] == mark || blocked_until[nc] > t + 1 {
                 continue;
             }
             seen[nc] = mark;
-            count += 1;
-            if count >= enough {
-                return count;
+            reached += 1;
+            if reached >= enough {
+                return reached;
             }
             queue.push((nc, t + 1));
         }
     }
-    count
+    reached
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::Engine;
+    use crate::types::DEFAULT_FOOD;
     use std::collections::BTreeMap;
+    use std::hint::black_box;
 
     fn config() -> GameConfig {
         GameConfig {
             board_width: 13,
             board_height: 13,
             tick_ms: 1000,
-            food_emoji: DEFAULT_FOOD.to_string(),
+            food_emoji: DEFAULT_FOOD.to_owned(),
         }
     }
 
@@ -1312,8 +1411,7 @@ mod tests {
             turn.winners
                 .iter()
                 .find(|w| &w.player == p)
-                .map(|w| w.survival_turns)
-                .unwrap_or(turn.turn_number)
+                .map_or(turn.turn_number, |w| w.survival_turns)
         };
         (survival(&a), survival(&b))
     }
@@ -1321,7 +1419,7 @@ mod tests {
     /// A solo hard bot must cruise indefinitely (food discipline included).
     #[test]
     fn bot_survives_solo() {
-        let me: PlayerId = "bot".to_string();
+        let me: PlayerId = "bot".to_owned();
         let mut engine = Engine::new(config(), vec![me.clone()], 9);
         let mut turn = engine.first_turn();
         for i in 0..150 {
@@ -1428,7 +1526,7 @@ mod tests {
             turn_number: 57,
             health: [(a.clone(), 90u8), (b.clone(), 90u8)].into_iter().collect(),
             snakes,
-            alive: vec![a.clone(), b.clone()],
+            alive: vec![a, b],
             food: vec![],
             moves: BTreeMap::new(),
             clashes: Vec::new(),
@@ -1467,12 +1565,24 @@ mod tests {
             board_width: size,
             board_height: size,
             tick_ms: 1000,
-            food_emoji: DEFAULT_FOOD.to_string(),
+            food_emoji: DEFAULT_FOOD.to_owned(),
         }
     }
 
-    /// One deterministic duel. Returns (challenger_score, incumbent_score)
-    /// where a score is (survival_turns, final_length) — length breaks the
+    /// Final length of `p`'s snake (0 if dead), for arena scores.
+    fn final_length(turn: &Turn, p: &PlayerId) -> u32 {
+        turn.snakes
+            .get(p)
+            .map_or(0, |s| u32::try_from(s.len()).unwrap())
+    }
+
+    /// Mean of `total` over `n` games, for arena printouts.
+    fn mean(total: u32, n: usize) -> f64 {
+        f64::from(total) / f64::from(u32::try_from(n).unwrap())
+    }
+
+    /// One deterministic duel. Returns (challenger score, incumbent score)
+    /// where a score is (survival turns, final length) — length breaks the
     /// "both alive at the cap" ties that make survival-only tests blind.
     fn duel(
         challenger: EvalFn,
@@ -1481,7 +1591,7 @@ mod tests {
         seed: u64,
         swap: bool,
         board: u8,
-    ) -> ((u32, usize), (u32, usize)) {
+    ) -> ((u32, u32), (u32, u32)) {
         let cfg = board_config(board);
         let a: PlayerId = "a".into();
         let b: PlayerId = "b".into();
@@ -1507,10 +1617,8 @@ mod tests {
                 .winners
                 .iter()
                 .find(|w| &w.player == p)
-                .map(|w| w.survival_turns)
-                .unwrap_or(turn.turn_number);
-            let len = turn.snakes.get(p).map(|s| s.len()).unwrap_or(0);
-            (survived, len)
+                .map_or(turn.turn_number, |w| w.survival_turns);
+            (survived, final_length(&turn, p))
         };
         if swap {
             (score(&b), score(&a))
@@ -1522,7 +1630,7 @@ mod tests {
     /// Head-to-head arena, parallel across cores. Run with
     /// `--ignored --nocapture` to see the score.
     fn run_arena(name: &str, challenger: EvalFn, incumbent: EvalFn, seeds: u64, sims: u32) {
-        run_arena_on(name, challenger, incumbent, seeds, sims, 11)
+        run_arena_on(name, challenger, incumbent, seeds, sims, 11);
     }
 
     fn run_arena_on(
@@ -1536,46 +1644,46 @@ mod tests {
         let jobs: Vec<(u64, bool)> = (0..seeds)
             .flat_map(|s| [(100 + s, false), (100 + s, true)])
             .collect();
-        let results: Vec<((u32, usize), (u32, usize))> = std::thread::scope(|scope| {
-            let chunks: Vec<_> = jobs
-                .chunks(jobs.len().div_ceil(12).max(1))
-                .map(|chunk| {
-                    scope.spawn(move || {
-                        chunk
-                            .iter()
-                            .map(|&(seed, swap)| {
-                                duel(challenger, incumbent, sims, seed, swap, board)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            chunks.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        let results: Vec<((u32, u32), (u32, u32))> = std::thread::scope(|scope| {
+            // Every thread starts before the first join.
+            let mut handles = Vec::new();
+            for chunk in jobs.chunks(jobs.len().div_ceil(12).max(1)) {
+                handles.push(scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&(seed, swap)| duel(challenger, incumbent, sims, seed, swap, board))
+                        .collect::<Vec<_>>()
+                }));
+            }
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
         });
 
         let (mut wins, mut losses, mut draws) = (0, 0, 0);
-        let (mut ch_len, mut in_len) = (0usize, 0usize);
+        let (mut ch_len, mut in_len) = (0u32, 0u32);
         for (ch, inc) in &results {
             ch_len += ch.1;
             in_len += inc.1;
             match ch.cmp(inc) {
-                std::cmp::Ordering::Greater => wins += 1,
-                std::cmp::Ordering::Less => losses += 1,
-                std::cmp::Ordering::Equal => draws += 1,
+                Ordering::Greater => wins += 1,
+                Ordering::Less => losses += 1,
+                Ordering::Equal => draws += 1,
             }
         }
         let n = results.len();
         println!(
             "ARENA {name}: {wins}W {losses}L {draws}D of {n} @ {sims} sims, {board}x{board} \
              | mean final length {:.1} vs {:.1}",
-            ch_len as f32 / n as f32,
-            in_len as f32 / n as f32,
+            mean(ch_len, n),
+            mean(in_len, n),
         );
     }
 
     /// Do the two evals even disagree? (Sanity check for arena power.)
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: only prints; run with --ignored --nocapture"]
     fn evals_disagree_often_enough() {
         let cfg = arena_config();
         let a: PlayerId = "a".into();
@@ -1590,9 +1698,9 @@ mod tests {
             let m1 = think_with(&cfg, &turn, &a, 1_200, evaluate_pre_gradient);
             let m2 = think_with(&cfg, &turn, &a, 1_200, evaluate);
             if m1 == m2 {
-                same += 1
+                same += 1;
             } else {
-                diff += 1
+                diff += 1;
             }
             let mut moves = BTreeMap::new();
             moves.insert(a.clone(), m1);
@@ -1605,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
     fn arena_ablation() {
         run_arena(
             "growth-urgency only",
@@ -1625,7 +1733,7 @@ mod tests {
 
     /// Bully candidates: each isolated against the shipped tuning.
     #[test]
-    #[ignore]
+    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
     fn arena_bully_candidates() {
         run_arena_on(
             "bully-target",
@@ -1640,7 +1748,7 @@ mod tests {
     /// Does a continuous appetite + proximity gradient beat the shipped
     /// threshold-based tuning? (And how hungry should a healthy snake be?)
     #[test]
-    #[ignore]
+    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
     fn arena_gradient_food() {
         // The shipped model against the tuning it replaced.
         run_arena_on(
@@ -1679,7 +1787,7 @@ mod tests {
 
     /// Where does appetite peak now that contested food is visible?
     #[test]
-    #[ignore]
+    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
     fn arena_appetite_sweep() {
         run_arena_on(
             "shipped @11x11",
@@ -1693,7 +1801,7 @@ mod tests {
 
     /// How long should "early" last, and does the boost hold up?
     #[test]
-    #[ignore]
+    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
     fn arena_early_sweep() {
         run_arena_on(
             "pre-gradient vs legacy",
@@ -1708,7 +1816,7 @@ mod tests {
     /// Confirmation: does growth-urgency hold up at higher power, on the
     /// default board, and across strengths?
     #[test]
-    #[ignore]
+    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
     fn arena_confirm_growth() {
         run_arena_on(
             "shipped 0.7 @13x13",
@@ -1758,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: only prints; run with --ignored --nocapture"]
     fn print_search_fingerprint() {
         let t0 = std::time::Instant::now();
         let fp = search_fingerprint();
@@ -1772,7 +1880,7 @@ mod tests {
     /// Where a simulation's time goes: evaluation, board copy + step, and
     /// node setup, each timed alone over the fingerprint positions.
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: only prints; run with --ignored --nocapture"]
     fn profile_parts() {
         let boards: Vec<FastBoard> = fingerprint_positions()
             .iter()
@@ -1781,7 +1889,7 @@ mod tests {
                 FastBoard::from_turn(cfg, turn, &order)
             })
             .collect();
-        let reps = 4_000;
+        let reps = 4_000u32;
         let time = |name: &str, f: &mut dyn FnMut(&FastBoard)| {
             let t0 = std::time::Instant::now();
             for _ in 0..reps {
@@ -1789,21 +1897,22 @@ mod tests {
                     f(b);
                 }
             }
-            let per = t0.elapsed().as_nanos() as f64 / (reps * boards.len()) as f64;
+            let calls = f64::from(reps) * f64::from(u32::try_from(boards.len()).unwrap());
+            let per = t0.elapsed().as_secs_f64() * 1e9 / calls;
             println!("PART {name:<12} {per:>8.0} ns");
         };
-        let mut sink = 0f32;
-        time("evaluate", &mut |b| sink += evaluate(b)[0]);
+        time("evaluate", &mut |b| {
+            black_box(evaluate(b));
+        });
         time("clone+step", &mut |b| {
             let mut c = b.clone();
             let moves: Vec<Dir> = (0..c.snakes.len()).map(|i| candidates(b, i)[0]).collect();
             c.step(&moves);
-            sink += c.alive_count as f32;
+            black_box(c);
         });
         time("node", &mut |b| {
-            sink += Node::new(b.clone()).cands[0].len() as f32
+            black_box(Node::new(b.clone()));
         });
-        println!("(sink {sink})");
     }
 
     /// A bot as it plays a whole game: a search budget per move, and
@@ -1822,8 +1931,8 @@ mod tests {
     }
 
     impl Agent {
-        fn new(spec: Spec) -> Agent {
-            Agent { spec, prev: None }
+        const fn new(spec: Spec) -> Self {
+            Self { spec, prev: None }
         }
         fn act(&mut self, cfg: &GameConfig, turn: &Turn, me: &PlayerId) -> Dir {
             let prev = if self.spec.reuse {
@@ -1849,7 +1958,7 @@ mod tests {
         seed: u64,
         swap: bool,
         board: u8,
-    ) -> ((u32, usize), (u32, usize)) {
+    ) -> ((u32, u32), (u32, u32)) {
         let cfg = board_config(board);
         let a: PlayerId = "a".into();
         let b: PlayerId = "b".into();
@@ -1878,9 +1987,8 @@ mod tests {
                 .winners
                 .iter()
                 .find(|w| &w.player == p)
-                .map(|w| w.survival_turns)
-                .unwrap_or(turn.turn_number);
-            (survived, turn.snakes.get(p).map(|s| s.len()).unwrap_or(0))
+                .map_or(turn.turn_number, |w| w.survival_turns);
+            (survived, final_length(&turn, p))
         };
         if swap {
             (score(&b), score(&a))
@@ -1896,42 +2004,46 @@ mod tests {
         let jobs: Vec<(u64, bool)> = (0..seeds)
             .flat_map(|s| [(1_000 + s, false), (1_000 + s, true)])
             .collect();
-        let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+        let threads = std::thread::available_parallelism().map_or(8, std::num::NonZero::get);
         let next = std::sync::atomic::AtomicUsize::new(0);
         let results = std::sync::Mutex::new(Vec::new());
         std::thread::scope(|scope| {
             for _ in 0..threads {
-                scope.spawn(|| loop {
-                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(&(seed, swap)) = jobs.get(k) else {
-                        break;
-                    };
-                    let r = agent_duel(challenger, incumbent, seed, swap, board);
-                    results.lock().unwrap().push(r);
+                scope.spawn(|| {
+                    loop {
+                        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&(seed, swap)) = jobs.get(k) else {
+                            break;
+                        };
+                        let r = agent_duel(challenger, incumbent, seed, swap, board);
+                        results.lock().unwrap().push(r);
+                    }
                 });
             }
         });
         let results = results.into_inner().unwrap();
-        let (mut w, mut l, mut d) = (0, 0, 0);
-        let (mut ch_len, mut in_len) = (0usize, 0usize);
+        let (mut w, mut l, mut d) = (0u32, 0u32, 0u32);
+        let (mut ch_len, mut in_len) = (0u32, 0u32);
         for (ch, inc) in &results {
             ch_len += ch.1;
             in_len += inc.1;
             match ch.cmp(inc) {
-                std::cmp::Ordering::Greater => w += 1,
-                std::cmp::Ordering::Less => l += 1,
-                std::cmp::Ordering::Equal => d += 1,
+                Ordering::Greater => w += 1,
+                Ordering::Less => l += 1,
+                Ordering::Equal => d += 1,
             }
         }
-        let n = results.len() as f64;
-        let score = (w as f64 + 0.5 * d as f64) / n;
+        let games = results.len();
+        let n = f64::from(u32::try_from(games).unwrap());
+        // Draws count half.
+        let score = mean(2 * w + d, games) / 2.0;
         let band = 2.0 * (score * (1.0 - score) / n).sqrt();
         println!(
             "ARENA {name:<28} {w:>3}W {l:>3}L {d:>2}D  score {:.1}% ±{:.1}  len {:.1} vs {:.1}  ({board}x{board})",
             100.0 * score,
             100.0 * band,
-            ch_len as f64 / n,
-            in_len as f64 / n,
+            mean(ch_len, games),
+            mean(in_len, games),
         );
         score
     }
@@ -1953,7 +2065,7 @@ mod tests {
     /// fresh search here — `print_search_fingerprint` shows the speedups
     /// left its moves identical.
     #[test]
-    #[ignore]
+    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
     fn arena_new_vs_old() {
         let old = Spec {
             sims: 30_000,
@@ -1968,7 +2080,7 @@ mod tests {
 
     /// Exploration constant, both sides reusing trees.
     #[test]
-    #[ignore]
+    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
     fn arena_c_uct() {
         for c in [0.5, 0.8, 1.7] {
             agent_arena(
@@ -1983,7 +2095,7 @@ mod tests {
 
     /// Does carrying the tree between turns win, at equal fresh work?
     #[test]
-    #[ignore]
+    #[ignore = "arena benchmark: minutes of CPU; run with --ignored --nocapture"]
     fn arena_tree_reuse() {
         agent_arena(
             "reuse vs fresh @11",
@@ -2008,7 +2120,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic: only prints; run with --ignored --nocapture"]
     fn print_node_size() {
         let (cfg, turn, me) = fingerprint_positions().remove(8);
         let mut s = begin(&cfg, &turn, &me, 50_000, 0);
@@ -2018,7 +2130,7 @@ mod tests {
             .iter()
             .map(|n| {
                 n.children.capacity() * 8
-                    + n.board.snakes.capacity() * std::mem::size_of::<Snake>()
+                    + n.board.snakes.capacity() * size_of::<Snake>()
                     + n.board
                         .snakes
                         .iter()
@@ -2029,17 +2141,17 @@ mod tests {
             .sum();
         println!(
             "NODE inline {} B, heap ~{} B/node over {} nodes",
-            std::mem::size_of::<Node>(),
+            size_of::<Node>(),
             heap / s.nodes.len(),
             s.nodes.len()
         );
     }
 
-    /// fast_ln tracks real ln closely enough for UCB.
+    /// `fast_ln` tracks real ln closely enough for UCB.
     #[test]
     fn fast_ln_is_close() {
-        for i in 1..2000 {
-            let x = i as f32 * 0.37;
+        for i in 1..2000u16 {
+            let x = f32::from(i) * 0.37;
             let err = (fast_ln(x) - x.ln()).abs();
             assert!(err < 0.02, "fast_ln({x}) off by {err}");
         }

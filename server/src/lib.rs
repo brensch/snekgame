@@ -1,9 +1,13 @@
+//! The snek server: the embedded web frontend and read-only history APIs
+//! over HTTP, and the games themselves over WebTransport — one actor per
+//! session, finished games kept in `SQLite`.
+
 pub mod db;
 pub mod session;
 pub mod wt;
 
-use axum::extract::{Path as AxumPath, State};
-use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -11,7 +15,7 @@ use db::Db;
 use session::Registry;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// Frontend build output, embedded so deployment is a single binary.
 /// (In debug builds rust-embed reads from disk, so `trunk build` output is
@@ -20,20 +24,34 @@ use std::sync::{Arc, OnceLock};
 #[folder = "../web/dist"]
 struct Assets;
 
+/// What every HTTP handler can reach.
 #[derive(Clone)]
-pub struct AppState {
-    pub registry: Registry,
-    pub db: Arc<Db>,
+struct AppState {
+    registry: Registry,
+    db: Arc<Db>,
+}
+
+/// Lock a mutex, carrying on past poisoning. A panic elsewhere while it was
+/// held leaves nothing half-done behind it here: the registry maps are only
+/// ever changed by single inserts and removes, and the database rolls back a
+/// statement that didn't finish. Refusing every later lock would turn one
+/// panicked task into a dead server.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Build the HTTP app (static frontend + read-only APIs) and the shared
 /// session registry that the WebTransport endpoint plugs into.
-pub fn build(db_path: &Path) -> (Router, Registry) {
+///
+/// # Errors
+///
+/// Fails if the history database at `db_path` can't be opened.
+pub fn build(db_path: &Path) -> anyhow::Result<(Router, Registry)> {
+    let db = Arc::new(Db::open(db_path)?);
     // Compress the frontend now, off the async runtime, so the first visitor
     // doesn't wait for it.
     std::thread::spawn(brotli_assets);
-    let db = Arc::new(Db::open(db_path).expect("failed to open sqlite db"));
-    let registry = Registry::new(db.clone());
+    let registry = Registry::new(Arc::clone(&db));
     let state = AppState {
         registry: registry.clone(),
         db,
@@ -46,7 +64,7 @@ pub fn build(db_path: &Path) -> (Router, Registry) {
         .route("/api/history/{id}/meta", get(history_meta))
         .fallback(static_handler)
         .with_state(state);
-    (router, registry)
+    Ok((router, registry))
 }
 
 /// Active games (someone in the lobby or playing right now).
@@ -56,14 +74,14 @@ async fn session_list(State(state): State<AppState>) -> Response {
 
 async fn history_list(
     State(state): State<AppState>,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let before = q.get("before").and_then(|v| v.parse::<i64>().ok());
     let limit = q
         .get("limit")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(10);
-    let db = state.db.clone();
+    let db = Arc::clone(&state.db);
     match tokio::task::spawn_blocking(move || db.list_games(before, limit)).await {
         Ok(Ok(page)) => Json(page).into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -72,7 +90,7 @@ async fn history_list(
 
 /// All-time client-compute statistics.
 async fn compute_overview(State(state): State<AppState>) -> Response {
-    let db = state.db.clone();
+    let db = Arc::clone(&state.db);
     match tokio::task::spawn_blocking(move || db.compute_overview()).await {
         Ok(Ok(overview)) => Json(overview).into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -82,7 +100,7 @@ async fn compute_overview(State(state): State<AppState>) -> Response {
 /// Who/where/when for one stored game (JSON) — the replay page shows this
 /// alongside the postcard turn data.
 async fn history_meta(State(state): State<AppState>, AxumPath(id): AxumPath<i64>) -> Response {
-    let db = state.db.clone();
+    let db = Arc::clone(&state.db);
     match tokio::task::spawn_blocking(move || db.get_game_meta(id)).await {
         Ok(Ok(Some(meta))) => Json(meta).into_response(),
         Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
@@ -93,7 +111,7 @@ async fn history_meta(State(state): State<AppState>, AxumPath(id): AxumPath<i64>
 /// Replay data as a postcard blob — the frontend decodes it with the same
 /// shared types the engine produced it with.
 async fn history_game(State(state): State<AppState>, AxumPath(id): AxumPath<i64>) -> Response {
-    let db = state.db.clone();
+    let db = Arc::clone(&state.db);
     match tokio::task::spawn_blocking(move || db.get_game_blob(id)).await {
         Ok(Ok(Some(blob))) => {
             ([(header::CONTENT_TYPE, "application/octet-stream")], blob).into_response()
@@ -113,7 +131,10 @@ const HASHED_CACHE: &str = "public, max-age=31536000, immutable";
 
 fn cache_policy(path: &str) -> &'static str {
     // trunk stamps a content hash into every asset filename it emits.
-    if path.ends_with(".html") {
+    if Path::new(path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("html"))
+    {
         SHELL_CACHE
     } else {
         HASHED_CACHE
@@ -176,9 +197,9 @@ fn asset_response(path: &str, mime: &str, cache: &'static str, headers: &HeaderM
             .into_response();
     };
     let base = [
-        (header::CONTENT_TYPE, mime.to_string()),
-        (header::CACHE_CONTROL, cache.to_string()),
-        (header::VARY, "accept-encoding".to_string()),
+        (header::CONTENT_TYPE, mime.to_owned()),
+        (header::CACHE_CONTROL, cache.to_owned()),
+        (header::VARY, "accept-encoding".to_owned()),
     ];
     match brotli_assets().get(path) {
         Some(br) if accepts_brotli(headers) => {

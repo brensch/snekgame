@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/brensch/snekgame/actions/workflows/ci.yml/badge.svg)](https://github.com/brensch/snekgame/actions/workflows/ci.yml)
 [![coverage](https://github.com/brensch/snekgame/raw/badges/coverage.svg)](https://github.com/brensch/snekgame/actions/workflows/ci.yml)
-![rust](https://img.shields.io/badge/rust-2021-000?logo=rust)
+![rust](https://img.shields.io/badge/rust-2024_edition-000?logo=rust)
 ![wasm](https://img.shields.io/badge/frontend-wasm-654ff0?logo=webassembly&logoColor=white)
 ![transport](https://img.shields.io/badge/transport-WebTransport%20%2F%20QUIC-1f6feb)
 
@@ -84,8 +84,12 @@ All game traffic goes over **WebTransport** (HTTP/3 over QUIC, UDP 443):
 
 Clients run a liveness watchdog: a connection that's been silent for 6 s, or
 an attempt that hasn't connected after 4 s, is torn down and redone. Coming
-back to the tab reconnects at once. Anything you said while disconnected,
-like "I'm ready", is resent as soon as you're back.
+back to the tab reconnects at once, and each reconnect reports how long it
+took, which the server logs.
+
+The screen only ever shows what the server last said. While a phone can't
+reach the server, its page stays up but greyed out and won't take taps, so
+no one acts on, or is shown, a state the other phones don't share.
 
 ### Identity and fairness
 

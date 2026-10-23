@@ -6,32 +6,41 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use snek_shared::protocol::ComputeOverview;
 
+/// `n / unit` as a float, for display. Worked out in two exact halves — the
+/// whole units, then the remainder — because a `u64` doesn't fit in an `f64`.
+fn per(n: u64, unit: u32) -> f64 {
+    let unit_64 = u64::from(unit);
+    let whole = u32::try_from(n / unit_64).unwrap_or(u32::MAX);
+    let rem = u32::try_from(n % unit_64).unwrap_or(0); // always below unit
+    f64::from(whole) + f64::from(rem) / f64::from(unit)
+}
+
 fn fmt_sims(sims: u64) -> String {
     match sims {
         0..=999 => sims.to_string(),
-        1_000..=999_999 => format!("{:.1}k", sims as f64 / 1e3),
-        1_000_000..=999_999_999 => format!("{:.1}M", sims as f64 / 1e6),
-        _ => format!("{:.2}B", sims as f64 / 1e9),
+        1_000..=999_999 => format!("{:.1}k", per(sims, 1_000)),
+        1_000_000..=999_999_999 => format!("{:.1}M", per(sims, 1_000_000)),
+        _ => format!("{:.2}B", per(sims, 1_000_000_000)),
     }
 }
 
 fn fmt_time(ms: u64) -> String {
     match ms {
         0..=999 => format!("{ms}ms"),
-        1_000..=59_999 => format!("{:.1}s", ms as f64 / 1e3),
-        60_000..=3_599_999 => format!("{:.1}min", ms as f64 / 60e3),
-        _ => format!("{:.1}h", ms as f64 / 3600e3),
+        1_000..=59_999 => format!("{:.1}s", per(ms, 1_000)),
+        60_000..=3_599_999 => format!("{:.1}min", per(ms, 60_000)),
+        _ => format!("{:.1}h", per(ms, 3_600_000)),
     }
 }
 
 fn fmt_rate(sims: u64, ms: u64) -> String {
     if ms == 0 {
-        return "—".to_string();
+        return "—".to_owned();
     }
     format!("{}k sims/s", sims / ms) // sims/ms == k sims/s
 }
 
-pub fn compute_page() -> impl IntoView {
+pub(crate) fn compute_page() -> impl IntoView {
     let overview = RwSignal::new(Option::<ComputeOverview>::None);
     let failed = RwSignal::new(false);
 

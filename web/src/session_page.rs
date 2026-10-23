@@ -3,11 +3,10 @@
 
 use crate::board::board_view;
 use crate::net;
-use crate::palette;
 use crate::store::{ConnStatus, GameView, Store};
 use leptos::prelude::*;
 use snek_shared::protocol::{ClientMsg, LobbyState};
-use snek_shared::{is_bot, is_draw, BotDifficulty, Dir, GameConfig, Pos, Turn};
+use snek_shared::{BotDifficulty, Dir, GameConfig, Pos, Turn, is_bot, is_draw};
 
 const BOARD_SIZES: &[(&str, u8)] = &[("Small", 11), ("Medium", 13), ("Large", 17)];
 const SPEEDS: &[(&str, u32)] = &[
@@ -16,7 +15,7 @@ const SPEEDS: &[(&str, u32)] = &[
     ("Fast (0.5s)", 500),
 ];
 
-pub fn session_page(_session: String) -> impl IntoView {
+pub(crate) fn session_page(_session: String) -> impl IntoView {
     let store = Store::use_store();
 
     view! {
@@ -31,15 +30,24 @@ pub fn session_page(_session: String) -> impl IntoView {
                         }
                     })
             }}
+            // What's on screen is the server's last word, and while it can't
+            // reach us that word may be out of date. Say so by greying it
+            // all out and refusing taps, rather than let anyone act on (or
+            // be shown) a state other phones no longer share.
+            <div class:offline=move || store.conn.get() != ConnStatus::Connected>
             {move || {
                 if let Some(game) = store.game.get() {
-                    view! { <div>{game_view(game)}</div> }.into_any()
-                } else if let Some(lobby) = store.lobby.get() {
-                    view! { <div>{lobby_view(lobby)}</div> }.into_any()
-                } else {
-                    view! { <div class="banner">"Joining session…"</div> }.into_any()
+                    return view! { <div>{game_view(&game)}</div> }.into_any();
                 }
+                store
+                    .lobby
+                    .get()
+                    .map_or_else(
+                        || view! { <div class="banner">"Joining session…"</div> }.into_any(),
+                        |lobby| view! { <div>{lobby_view(&lobby)}</div> }.into_any(),
+                    )
             }}
+            </div>
         </div>
     }
 }
@@ -51,7 +59,7 @@ pub fn session_page(_session: String) -> impl IntoView {
 /// Agreeing to play, wherever you do it. The lobby and the end of a game
 /// are the same decision, so they get the same button, the same rules and
 /// the same list of who everyone is still waiting on.
-fn ready_panel(lobby: &LobbyState) -> impl IntoView {
+fn ready_panel(lobby: &LobbyState) -> impl IntoView + use<> {
     let store = Store::use_store();
     let me = store.me.get();
     let humans: Vec<_> = lobby
@@ -61,21 +69,11 @@ fn ready_panel(lobby: &LobbyState) -> impl IntoView {
         .cloned()
         .collect();
     let i_am_in = humans.iter().any(|p| p.id == me);
-    // Our own tap counts the moment it lands. The server is the truth, but
-    // a phone that has just woken up is still reconnecting and hasn't told
-    // it yet; until it has, the screen goes with what we said, not with
-    // what the server last heard — which made us wait on ourselves.
-    let i_am_ready = store
-        .want_ready
-        .get()
-        .unwrap_or_else(|| lobby.ready.contains(&me));
-    let is_ready = |id: &str| {
-        if id == me {
-            i_am_ready
-        } else {
-            lobby.ready.iter().any(|r| r == id)
-        }
-    };
+    // Exactly what the server says, on every phone alike. While we are not
+    // connected the whole page is greyed out and can't be touched (see
+    // `session_page`), so there is never a tap the server hasn't heard.
+    let i_am_ready = lobby.ready.contains(&me);
+    let is_ready = |id: &str| lobby.ready.iter().any(|r| r == id);
     let all_ready = !humans.is_empty() && humans.iter().all(|p| is_ready(&p.id));
     let my_colour = store.profile.get_untracked().colour;
     let not_ready: Vec<String> = humans
@@ -84,11 +82,7 @@ fn ready_panel(lobby: &LobbyState) -> impl IntoView {
         .map(|p| p.name.clone())
         .collect();
 
-    let toggle = move |_| {
-        let ready = !i_am_ready;
-        store.want_ready.set(Some(ready));
-        net::send(&ClientMsg::SetReady(ready));
-    };
+    let toggle = move |_| net::send(&ClientMsg::SetReady(!i_am_ready));
 
     view! {
         <div>
@@ -137,15 +131,13 @@ fn ready_panel(lobby: &LobbyState) -> impl IntoView {
 /// Who last touched the settings. Changing them un-readies everyone, so
 /// whoever did it is worth knowing — and the moment it happens the name
 /// flashes, so a toggle flipping back to "no" never comes out of nowhere.
-fn settings_by(lobby: &LobbyState) -> impl IntoView {
+fn settings_by(lobby: &LobbyState) -> impl IntoView + use<> {
     let store = Store::use_store();
     let who = lobby.config_changed_by.as_ref().map(|id| {
-        lobby
-            .players
-            .iter()
-            .find(|p| &p.id == id)
-            .map(|p| (format!("{} {}", p.emoji, p.name), p.colour.clone()))
-            .unwrap_or_else(|| ("someone who left".to_string(), "#fff".to_string()))
+        lobby.players.iter().find(|p| &p.id == id).map_or_else(
+            || ("someone who left".to_owned(), "#fff".to_owned()),
+            |p| (format!("{} {}", p.emoji, p.name), p.colour.clone()),
+        )
     });
     // The lobby is rebuilt whenever anything in it changes, so the flash
     // picks up where it is rather than starting again from the top.
@@ -178,56 +170,44 @@ fn settings_by(lobby: &LobbyState) -> impl IntoView {
 
 const SETTINGS_FLASH_MS: f64 = 1800.0;
 
-fn lobby_view(lobby: LobbyState) -> impl IntoView {
-    let store = Store::use_store();
-
-    // Bots are always ready; only humans gate the start.
-    let humans: Vec<_> = lobby
+/// How the last game in this lobby ended, if there was one.
+fn last_game_banner(lobby: &LobbyState) -> Option<AnyView> {
+    let winner = lobby.last_winners.first()?;
+    if is_draw(&lobby.last_winners) {
+        return Some(
+            view! {
+                <div class="banner rainbow">"💀 Last game: a draw — nobody made it out"</div>
+            }
+            .into_any(),
+        );
+    }
+    let name = lobby
         .players
         .iter()
-        .filter(|p| !is_bot(&p.id))
-        .cloned()
-        .collect();
-
-    let current_width = lobby.config.board_width;
-    let current_tick = lobby.config.tick_ms;
-    let current_food = lobby.config.food_emoji.clone();
-
-    let last_game = (!lobby.last_winners.is_empty()).then(|| {
-        if is_draw(&lobby.last_winners) {
-            return view! {
-                <div class="banner rainbow">
-                    "💀 Last game: a draw — nobody made it out"
-                </div>
-            }
-            .into_any();
-        }
-        let winner = lobby.last_winners.first().unwrap().clone();
-        let name = lobby
-            .players
-            .iter()
-            .find(|p| p.id == winner.player)
-            .map(|p| format!("{} {}", p.name, p.emoji))
-            .unwrap_or_else(|| "someone who left".to_string());
+        .find(|p| p.id == winner.player)
+        .map_or_else(
+            || "someone who left".to_owned(),
+            |p| format!("{} {}", p.name, p.emoji),
+        );
+    let turns = winner.survival_turns;
+    Some(
         view! {
             <div class="banner rainbow">
-                "🏆 Last game: " {name} " survived " {winner.survival_turns} " turns"
+                "🏆 Last game: " {name} " survived " {turns} " turns"
             </div>
         }
-        .into_any()
-    });
+        .into_any(),
+    )
+}
 
-    let ready_button = ready_panel(&lobby);
-
-    // The food on offer this round, held in the store so that picking from
-    // it doesn't re-deal it. Shuffling deals a new hand; whatever is
-    // currently picked always survives into it, at the front.
-    let food_hand = store.food_hand;
-    let food_for_board = current_food.clone();
-    let food_for_speed = current_food.clone();
-    let food_now = current_food.clone();
-    let food_for_shuffle = current_food.clone();
-    let food_picker = view! {
+/// The foods on offer, as the server dealt them, so every phone shows the
+/// same hand. Shuffling asks the server for a new one; whatever is picked
+/// always survives into it, at the front.
+fn food_picker(config: &GameConfig, food_hand: Vec<String>) -> impl IntoView + use<> {
+    let current_width = config.board_width;
+    let current_tick = config.tick_ms;
+    let picked = config.food_emoji.clone();
+    view! {
         <div style="margin-top: 10px;">
             // Heading and shuffle on one line, the hand full width beneath —
             // the same shape as the profile editor's emoji picker.
@@ -236,25 +216,14 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                 <button
                     class="mini"
                     style="flex: 0 0 auto;"
-                    on:click=move |_| {
-                        food_hand
-                            .set(
-                                palette::shuffled_with(
-                                    palette::FOODS,
-                                    palette::FOOD_HAND,
-                                    &food_for_shuffle,
-                                ),
-                            );
-                    }
+                    on:click=move |_| net::send(&ClientMsg::ShuffleFood)
                 >
                     "🎲 shuffle"
                 </button>
             </div>
             <div>
                 <div class="food-hand">
-                    {move || {
-                        let picked = food_now.clone();
-                        palette::hand_showing(food_hand.get(), &picked, palette::FOOD_HAND)
+                    {food_hand
                             .into_iter()
                             .map(|f| {
                                 let is_picked = f == picked;
@@ -274,18 +243,24 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                                             );
                                         }
                                     >
-                                        {f.clone()}
+                                        {f}
                                     </div>
                                 }
                             })
-                            .collect_view()
-                    }}
+                            .collect_view()}
                 </div>
             </div>
         </div>
-    };
+    }
+}
 
-    let config_row = view! {
+/// Board size and speed.
+fn config_row(config: &GameConfig) -> impl IntoView + use<> {
+    let current_width = config.board_width;
+    let current_tick = config.tick_ms;
+    let food_for_board = config.food_emoji.clone();
+    let food_for_speed = config.food_emoji.clone();
+    view! {
         <div class="row">
             <label>
                 "Board"
@@ -334,15 +309,14 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                 </select>
             </label>
         </div>
-    };
-    let config_row = view! {
-        <div>
-            {config_row}
-            {food_picker}
-        </div>
-    };
+    }
+}
 
-    let roster = view! {
+/// Everyone in the lobby, whether they're ready, a bin to kick them, and
+/// the way to add a bot.
+fn roster(lobby: &LobbyState) -> impl IntoView + use<> {
+    let store = Store::use_store();
+    view! {
         <table class="players">
             <tbody>
                 {lobby
@@ -367,37 +341,43 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
                     .collect_view()}
                 <tr class="add-bot-row">
                     <td colspan="3">
-                        <button
-                            class="mini"
-                            on:click=move |_| store.show_bot_picker.set(true)
-                        >
+                        <button class="mini" on:click=move |_| store.show_bot_picker.set(true)>
                             "➕ add a bot"
                         </button>
                     </td>
                 </tr>
             </tbody>
         </table>
-    };
+    }
+}
 
-    // A game is known by its host: the first human in the lobby.
-    let host_line = humans
-        .first()
-        .map(|p| format!("{} {}'s game", p.emoji, p.name))
-        .unwrap_or_else(|| "new game".to_string());
+fn lobby_view(lobby: &LobbyState) -> impl IntoView + use<> {
+    let store = Store::use_store();
+
+    // A game is known by its host: the first human in the lobby. Bots are
+    // always ready; only humans gate the start.
+    let host_line = lobby.players.iter().find(|p| !is_bot(&p.id)).map_or_else(
+        || "new game".to_owned(),
+        |p| format!("{} {}'s game", p.emoji, p.name),
+    );
+    let current_food = lobby.config.food_emoji.clone();
 
     view! {
         <div>
             <h2 style="margin-top: 22px; margin-bottom: 14px;">{host_line}</h2>
-            {ready_button}
-            {last_game}
+            {ready_panel(lobby)}
+            {last_game_banner(lobby)}
             <h3 style="margin-top: 24px;">"Players"</h3>
-            {roster}
+            {roster(lobby)}
             <h3 style="margin-top: 24px;">"Settings"</h3>
-            {settings_by(&lobby)}
-            {config_row}
+            {settings_by(lobby)}
+            <div>
+                {config_row(&lobby.config)}
+                {food_picker(&lobby.config, lobby.food_hand.clone())}
+            </div>
             {move || store.show_bot_picker.get().then(bot_picker)}
             <p class="footnote" style="margin-top: 18px;">
-                "Steer with swipes, taps, arrows or WASD. Eat " {current_food.clone()}
+                "Steer with swipes, taps, arrows or WASD. Eat " {current_food}
                 " to grow and "
                 "refill health; you lose 1 health per turn. Walls, bodies and "
                 "bigger heads kill you. Outlive everyone."
@@ -441,7 +421,7 @@ fn bot_picker() -> impl IntoView {
 
 /// The winner's emoji rains down over the results, tac-style. Positions and
 /// timings are pseudo-random from the index so no timers are needed.
-fn emoji_rain(emoji: String) -> impl IntoView {
+fn emoji_rain(emoji: &str) -> impl IntoView + use<> {
     let drops = (0..36)
         .map(|i| {
             let left = (i * 37 + 13) % 100;
@@ -456,7 +436,7 @@ fn emoji_rain(emoji: String) -> impl IntoView {
                     "left: {left}%; animation-delay: {delay_ms}ms; \
                      animation-duration: {duration_ms}ms; font-size: {size}px; \
                      --spin: {spin}deg;",
-                )>{emoji.clone()}</span>
+                )>{emoji.to_owned()}</span>
             }
         })
         .collect_view();
@@ -498,25 +478,31 @@ fn dpad() -> impl IntoView {
     }
 }
 
-fn game_view(game: GameView) -> impl IntoView {
+/// Which way to steer for a tap on `pos`: towards it from `head`, along
+/// whichever axis it is further away on. A tap on the head itself says
+/// nothing.
+fn dir_towards(head: Pos, pos: Pos, width: i32) -> Option<Dir> {
+    let (hx, hy) = (i32::from(head) % width, i32::from(head) / width);
+    let (cx, cy) = (i32::from(pos) % width, i32::from(pos) / width);
+    let (dx, dy) = (cx - hx, cy - hy);
+    if dx == 0 && dy == 0 {
+        return None;
+    }
+    Some(if dx.abs() >= dy.abs() {
+        if dx > 0 { Dir::Right } else { Dir::Left }
+    } else if dy > 0 {
+        Dir::Down
+    } else {
+        Dir::Up
+    })
+}
+
+/// "ready", "steady", "spagheddi!" a second each, after the board has
+/// spotlit you for a few seconds. The clock is read *inside* the closure:
+/// otherwise the whole game view (board SVG included) would re-render five
+/// times a second with the shared clock.
+fn countdown(show_countdown: bool) -> impl IntoView {
     let store = Store::use_store();
-    let me = store.me.get();
-
-    let turn_count = game.turns.len();
-    let viewing = store
-        .view_turn
-        .get()
-        .unwrap_or(turn_count.saturating_sub(1))
-        .min(turn_count.saturating_sub(1));
-    let turn: Turn = game.turns[viewing].clone();
-    let last_turn = game.turns.last().unwrap().clone();
-    let over = last_turn.game_over();
-
-    // Before the first tick: the board spotlights you (see board_view) for
-    // a few seconds, then "ready", "steady", "spagheddi!" a second each.
-    // Read the clock *inside* a closure: otherwise this whole view (board
-    // SVG included) re-renders five times a second with the shared clock.
-    let show_countdown = !over && turn_count == 1;
     // A memo, so the word's card is only rebuilt (and pops in) when the
     // word changes, not on every tick of the clock.
     let word = Memo::new(move |_| {
@@ -531,7 +517,7 @@ fn game_view(game: GameView) -> impl IntoView {
             _ => None,
         }
     });
-    let countdown = move || {
+    move || {
         word.get().map(|word| {
             view! {
                 <div class="overlay countdown">
@@ -539,164 +525,165 @@ fn game_view(game: GameView) -> impl IntoView {
                 </div>
             }
         })
+    }
+}
+
+/// Anyone in the game can call a halt — it is a game among friends, not a
+/// tournament. The server owns the state, so every screen agrees.
+fn pause_button() -> impl IntoView {
+    let store = Store::use_store();
+    view! {
+        <div class="pause-row">
+            <button
+                class="icon-btn"
+                aria-label=move || if store.paused.get() { "resume" } else { "pause" }
+                title=move || if store.paused.get() { "resume" } else { "pause" }
+                on:click=move |_| {
+                    net::send(&ClientMsg::SetPaused(!store.paused.get()));
+                }
+            >
+                {move || if store.paused.get() { "▶️" } else { "⏸️" }}
+            </button>
+        </div>
+    }
+}
+
+/// Results, ranked, once the game is over — under a rain of the winner's
+/// emoji, as is tradition.
+fn results(
+    game: &GameView,
+    last_turn: &Turn,
+    lobby_now: Option<&LobbyState>,
+) -> impl IntoView + use<> {
+    let store = Store::use_store();
+    let draw = is_draw(&last_turn.winners);
+    // Draws rain skulls; wins rain the winner's emoji.
+    let rain = if draw {
+        Some(emoji_rain("💀"))
+    } else {
+        last_turn
+            .winners
+            .first()
+            .and_then(|w| game.players.iter().find(|p| p.id == w.player))
+            .map(|p| emoji_rain(&p.emoji))
     };
+    let rows = last_turn
+        .winners
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let p = game.players.iter().find(|p| p.id == w.player);
+            let name = p.map_or_else(|| "???".to_owned(), |p| format!("{} {}", p.name, p.emoji));
+            let colour = p.map(|p| p.colour.clone()).unwrap_or_default();
+            let medal = if draw {
+                "💀" // no winner to allocate
+            } else {
+                ["🥇", "🥈", "🥉"].get(i).copied().unwrap_or("💀")
+            };
+            let is_human = !is_bot(&w.player);
+            let ready_now = lobby_now.is_some_and(|l| l.ready.contains(&w.player));
+            let still_here = lobby_now.is_some_and(|l| l.players.iter().any(|p| p.id == w.player));
+            view! {
+                <tr style=format!("background: {colour};")>
+                    <td>
+                        {medal} " " {name}
+                        // How they did is the row; whether they are up
+                        // for another goes underneath, so neither costs
+                        // the other a column on a phone.
+                        {(is_human && still_here)
+                            .then(|| {
+                                view! {
+                                    <br />
+                                    <span class="footnote">
+                                        {if ready_now { "ready" } else { "not ready" }}
+                                    </span>
+                                }
+                            })}
+                    </td>
+                    <td class="right">{w.survival_turns} " turns"</td>
+                    <td class="right">"length " {w.length}</td>
+                </tr>
+            }
+        })
+        .collect_view();
+
+    view! {
+        <div class="results">
+            {rain}
+            <h3>{if draw { "Game over — it's a draw" } else { "Game over" }}</h3>
+            // The next game first: it is what most people want from
+            // here. Agreeing to a rematch is agreeing to a game, so it is
+            // the lobby's control, not a second one that behaves almost
+            // the same.
+            {lobby_now.map(ready_panel)}
+            <table class="players">
+                <tbody>{rows}</tbody>
+            </table>
+            <div class="row">
+                <button on:click=move |_| {
+                    store.game.set(None);
+                    store.view_turn.set(None);
+                }>"Back to lobby"</button>
+            </div>
+        </div>
+    }
+}
+
+/// Replay, right under the board it moves, once the game is over.
+fn scrubber(viewing: usize, last: usize) -> impl IntoView {
+    let store = Store::use_store();
+    view! {
+        <div class="replay-controls">
+            <input
+                type="range"
+                class="scrubber"
+                aria-label="replay"
+                min="0"
+                max=last.to_string()
+                prop:value=viewing.to_string()
+                on:input=move |ev| {
+                    if let Ok(i) = event_target_value(&ev).parse::<usize>() {
+                        store.view_turn.set(Some(i));
+                    }
+                }
+            />
+            <span class="turn-count">{format!("{viewing}/{last}")}</span>
+        </div>
+    }
+}
+
+/// The live game (or the one just finished). Nothing to show for a game
+/// with no turns, which the server never sends.
+fn game_view(game: &GameView) -> Option<impl IntoView + use<>> {
+    let store = Store::use_store();
+    let me = store.me.get();
+
+    let turn_count = game.turns.len();
+    let last = turn_count.saturating_sub(1);
+    let viewing = store.view_turn.get().unwrap_or(last).min(last);
+    let turn: Turn = game.turns.get(viewing)?.clone();
+    let last_turn = game.turns.last()?;
+    let over = last_turn.game_over();
+
+    // Before the first tick: the board spotlights you (see board_view) for
+    // a few seconds, then the countdown.
+    let show_countdown = !over && turn_count == 1;
 
     // Direction input: tap a cell relative to my head.
-    let my_head: Option<Pos> = turn.snakes.get(&me).map(|s| s[0]);
-    let width = game.config.board_width as i32;
+    let my_head: Option<Pos> = turn.snakes.get(&me).and_then(|s| s.first().copied());
+    let width = i32::from(game.config.board_width);
     let on_cell = move |pos: Pos| {
-        let Some(head) = my_head else { return };
-        let (hx, hy) = (head as i32 % width, head as i32 / width);
-        let (cx, cy) = (pos as i32 % width, pos as i32 / width);
-        let (dx, dy) = (cx - hx, cy - hy);
-        if dx == 0 && dy == 0 {
-            return;
+        if let Some(dir) = my_head.and_then(|head| dir_towards(head, pos, width)) {
+            net::send_move(store, dir);
         }
-        let dir = if dx.abs() >= dy.abs() {
-            if dx > 0 {
-                Dir::Right
-            } else {
-                Dir::Left
-            }
-        } else if dy > 0 {
-            Dir::Down
-        } else {
-            Dir::Up
-        };
-        net::send_move(store, dir);
     };
 
     let spectating = !game.players.iter().any(|p| p.id == me);
     let i_died = !spectating && !over && !last_turn.alive.contains(&me);
     let show_dpad = !over && !spectating && !i_died;
-
-    // Anyone in the game can call a halt — it is a game among friends, not a
-    // tournament. The server owns the state, so every screen agrees.
-    let pause_button = (!over && !show_countdown).then(|| {
-        view! {
-            <div class="pause-row">
-                <button
-                    class="icon-btn"
-                    aria-label=move || if store.paused.get() { "resume" } else { "pause" }
-                    title=move || if store.paused.get() { "resume" } else { "pause" }
-                    on:click=move |_| {
-                        net::send(&ClientMsg::SetPaused(!store.paused.get()));
-                    }
-                >
-                    {move || if store.paused.get() { "▶️" } else { "⏸️" }}
-                </button>
-            </div>
-        }
-    });
-
-    // Results, ranked, once the game is over — under a rain of the winner's
-    // emoji, as is tradition.
     let lobby_now = store.lobby.get();
-    let results = over.then(|| {
-        let draw = is_draw(&last_turn.winners);
-        // Draws rain skulls; wins rain the winner's emoji.
-        let rain = if draw {
-            Some(emoji_rain("💀".to_string()))
-        } else {
-            last_turn
-                .winners
-                .first()
-                .and_then(|w| game.players.iter().find(|p| p.id == w.player))
-                .map(|p| emoji_rain(p.emoji.clone()))
-        };
-        let rows = last_turn
-            .winners
-            .iter()
-            .enumerate()
-            .map(|(i, w)| {
-                let p = game.players.iter().find(|p| p.id == w.player);
-                let name = p
-                    .map(|p| format!("{} {}", p.name, p.emoji))
-                    .unwrap_or_else(|| "???".to_string());
-                let colour = p.map(|p| p.colour.clone()).unwrap_or_default();
-                let medal = if draw {
-                    "💀" // no winner to allocate
-                } else {
-                    ["🥇", "🥈", "🥉"].get(i).copied().unwrap_or("💀")
-                };
-                let is_human = !is_bot(&w.player);
-                let ready_now = lobby_now
-                    .as_ref()
-                    .map(|l| l.ready.contains(&w.player))
-                    .unwrap_or(false);
-                let still_here = lobby_now
-                    .as_ref()
-                    .map(|l| l.players.iter().any(|p| p.id == w.player))
-                    .unwrap_or(false);
-                view! {
-                    <tr style=format!("background: {colour};")>
-                        <td>
-                            {medal} " " {name}
-                            // How they did is the row; whether they are up
-                            // for another goes underneath, so neither costs
-                            // the other a column on a phone.
-                            {(is_human && still_here)
-                                .then(|| {
-                                    view! {
-                                        <br />
-                                        <span class="footnote">
-                                            {if ready_now { "ready" } else { "not ready" }}
-                                        </span>
-                                    }
-                                })}
-                        </td>
-                        <td class="right">{w.survival_turns} " turns"</td>
-                        <td class="right">"length " {w.length}</td>
-                    </tr>
-                }
-            })
-            .collect_view();
 
-        view! {
-            <div class="results">
-                {rain}
-                <h3>{if draw { "Game over — it's a draw" } else { "Game over" }}</h3>
-                // The next game first: it is what most people want from
-                // here. Agreeing to a rematch is agreeing to a game, so it is
-                // the lobby's control, not a second one that behaves almost
-                // the same.
-                {lobby_now.as_ref().map(ready_panel)}
-                <table class="players">
-                    <tbody>{rows}</tbody>
-                </table>
-                <div class="row">
-                    <button on:click=move |_| {
-                        store.game.set(None);
-                        store.view_turn.set(None);
-                    }>"Back to lobby"</button>
-                </div>
-            </div>
-        }
-    });
-
-    // Replay, right under the board it moves, once the game is over.
-    let scrub = over.then(|| {
-        view! {
-            <div class="replay-controls">
-                <input
-                    type="range"
-                    class="scrubber"
-                    aria-label="replay"
-                    min="0"
-                    max=(turn_count - 1).to_string()
-                    prop:value=viewing.to_string()
-                    on:input=move |ev| {
-                        if let Ok(i) = event_target_value(&ev).parse::<usize>() {
-                            store.view_turn.set(Some(i));
-                        }
-                    }
-                />
-                <span class="turn-count">{format!("{viewing}/{}", turn_count - 1)}</span>
-            </div>
-        }
-    });
-
-    view! {
+    Some(view! {
         // Once it's over nothing has to fit on one screen any more, so the
         // page simply grows and scrolls as a page — never a box of its own.
         <div class=if over { "play over" } else { "play" }>
@@ -715,17 +702,17 @@ fn game_view(game: GameView) -> impl IntoView {
                 };
                 note.map(|n| view! { <p class="play-note">{n}</p> })
             }}
-            {board_view(game.config, game.players.clone(), &turn, me.clone(), show_countdown, on_cell)}
-            {scrub}
+            {board_view(&game.config, &game.players, &turn, &me, show_countdown, on_cell)}
+            {over.then(|| scrubber(viewing, last))}
             // One bottom half, whichever state the game is in. Two layouts
             // meant two sets of rules for the same board, and the board
             // quietly changed size the moment the game ended.
             <div class="controls">
-                {pause_button}
+                {(!over && !show_countdown).then(pause_button)}
                 {show_dpad.then(dpad)}
-                {results}
+                {over.then(|| results(game, last_turn, lobby_now.as_ref()))}
             </div>
-            {countdown}
+            {countdown(show_countdown)}
         </div>
-    }
+    })
 }

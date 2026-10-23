@@ -1,17 +1,24 @@
-//! One actor task per session (lobby). Websocket connections forward decoded
-//! client messages in; the actor owns all game state, runs the tick loop, and
-//! broadcasts pre-encoded frames out through per-connection channels.
+//! One actor task per session (lobby).
+//!
+//! WebTransport connections forward decoded client messages in; the actor
+//! owns all game state, runs the tick loop, and broadcasts pre-encoded
+//! frames out through per-connection channels.
 //!
 //! This is the whole concurrency model: no locks around game state, no shared
 //! mutation — just message passing. A slow client whose outbound queue fills
 //! up gets dropped and reconnects into a full state snapshot.
 
 use crate::db::Db;
-use snek_shared::protocol::*;
-use snek_shared::{
-    bot, BotDifficulty, Dir, Engine, GameConfig, GameRecord, PlayerId, PlayerProfile, Turn, Winner,
+use crate::lock;
+use snek_shared::protocol::{
+    ClientMsg, ComputeStat, ComputeTelemetry, LobbyState, ReconnectReport, ServerMsg,
+    SessionSummary, encode,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use snek_shared::{
+    BotDifficulty, DEFAULT_FOOD, Dir, Engine, GameConfig, GameRecord, PlayerId, PlayerProfile,
+    Turn, Winner, bot,
+};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,7 +32,7 @@ const MAX_PLAYERS: usize = 8;
 const CONN_BUFFER: usize = 256;
 /// How long an empty session lingers (so a network blip or refresh doesn't
 /// wipe the lobby) before it is tidied away.
-const EMPTY_GRACE: Duration = Duration::from_secs(60);
+const EMPTY_GRACE: Duration = Duration::from_mins(1);
 /// How long a player keeps their seat after their connection drops. A
 /// backgrounded tab stops reading its socket and the server times it out
 /// within ten seconds, so without this, glancing at another app costs you
@@ -36,36 +43,57 @@ const AWAY_GRACE: Duration = Duration::from_secs(45);
 /// reliable stream; snapshots ride (redundant) datagrams and may be dropped.
 #[derive(Clone)]
 pub enum Frame {
+    /// Must arrive, in order: lobby state, game start/end, catch-ups.
     Control(Arc<[u8]>),
+    /// Superseded by the next one anyway, so losing it is fine.
     Snapshot(Arc<[u8]>),
 }
 
+/// Wall-clock time for the history record. A clock set before 1970 (or
+/// absurdly far ahead) records 0 rather than taking the game down with it.
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// A duration in whole milliseconds, for timings that are logged and
+/// compared. Saturates: no measured interval comes near `u64::MAX` ms.
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A count of players or bots as the protocol carries it. Lobbies hold at
+/// most `MAX_PLAYERS`, so this never actually saturates.
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 // ---------------------------------------------------------------------------
 // Registry: session name -> live actor
 // ---------------------------------------------------------------------------
 
+/// Every live session, shared by all connections: hands each one the actor
+/// it belongs to and keeps the active-games list current.
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<Mutex<HashMap<String, mpsc::Sender<Cmd>>>>,
     /// Live snapshots for the active-games list, kept fresh by the actors.
     infos: Arc<Mutex<HashMap<String, SessionSummary>>>,
-    /// Pushes the active list to /ws/games watchers on every change.
+    /// Pushes the active list to `WatchGames` subscribers on every change.
     games_watch: Arc<tokio::sync::watch::Sender<Vec<SessionSummary>>>,
     db: Arc<Db>,
     next_conn_id: Arc<AtomicU64>,
 }
 
 impl Registry {
-    pub fn new(db: Arc<Db>) -> Registry {
+    /// An empty registry whose sessions save finished games to `db`.
+    #[must_use]
+    pub fn new(db: Arc<Db>) -> Self {
         let (games_watch, _) = tokio::sync::watch::channel(Vec::new());
-        Registry {
+        Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             infos: Arc::new(Mutex::new(HashMap::new())),
             games_watch: Arc::new(games_watch),
@@ -74,20 +102,22 @@ impl Registry {
         }
     }
 
+    /// The active-games list, now and on every change after.
+    #[must_use]
     pub fn watch_games(&self) -> tokio::sync::watch::Receiver<Vec<SessionSummary>> {
         self.games_watch.subscribe()
     }
 
+    /// A fresh id for a connection, unique for the life of the process.
+    #[must_use]
     pub fn new_conn_id(&self) -> u64 {
         self.next_conn_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Sessions with someone actually in them, for the games list.
+    #[must_use]
     pub fn active_sessions(&self) -> Vec<SessionSummary> {
-        let mut list: Vec<SessionSummary> = self
-            .infos
-            .lock()
-            .unwrap()
+        let mut list: Vec<SessionSummary> = lock(&self.infos)
             .values()
             .filter(|s| s.players > 0)
             .cloned()
@@ -97,7 +127,7 @@ impl Registry {
     }
 
     fn publish(&self, info: SessionSummary) {
-        self.infos.lock().unwrap().insert(info.id.clone(), info);
+        lock(&self.infos).insert(info.id.clone(), info);
         self.games_watch.send_replace(self.active_sessions());
     }
 
@@ -113,10 +143,10 @@ impl Registry {
     ) -> mpsc::Sender<Cmd> {
         loop {
             let sender = {
-                let mut map = self.inner.lock().unwrap();
-                map.entry(session.to_string())
+                lock(&self.inner)
+                    .entry(session.to_owned())
                     .or_insert_with(|| {
-                        SessionActor::spawn(session.to_string(), self.clone(), self.db.clone())
+                        SessionActor::spawn(session.to_owned(), self.clone(), Arc::clone(&self.db))
                     })
                     .clone()
             };
@@ -130,20 +160,23 @@ impl Registry {
                 Ok(()) => return sender,
                 Err(_) => {
                     // Actor exited between lookup and send; clear and retry.
-                    self.inner.lock().unwrap().remove(session);
+                    lock(&self.inner).remove(session);
                 }
             }
         }
     }
 
     fn remove(&self, session: &str, sender: &mpsc::Sender<Cmd>) {
-        let mut map = self.inner.lock().unwrap();
-        if let Some(current) = map.get(session) {
-            if current.same_channel(sender) {
+        {
+            let mut map = lock(&self.inner);
+            if map
+                .get(session)
+                .is_some_and(|current| current.same_channel(sender))
+            {
                 map.remove(session);
             }
         }
-        self.infos.lock().unwrap().remove(session);
+        lock(&self.infos).remove(session);
         self.games_watch.send_replace(self.active_sessions());
     }
 }
@@ -152,23 +185,35 @@ impl Registry {
 // Session actor
 // ---------------------------------------------------------------------------
 
+/// What the transport tells a session's actor.
 pub enum Cmd {
+    /// A player's connection joined the session.
     Connect {
+        /// The connection, from `Registry::new_conn_id`.
         conn_id: u64,
+        /// Who it is, already validated, under their public id.
         profile: PlayerProfile,
+        /// Remote address, for telling devices apart in the compute stats.
         ip: String,
+        /// Where this connection's outbound frames go.
         tx: mpsc::Sender<Frame>,
     },
+    /// The connection went away. The player keeps their seat for a while.
     Disconnect {
+        /// The connection that went.
         conn_id: u64,
     },
+    /// A client message, from the stream or a datagram.
     Msg {
+        /// The connection it came in on.
         conn_id: u64,
+        /// The message itself.
         msg: ClientMsg,
     },
     /// A keepalive reached us. Cheaper than a full message and, for a
     /// device that is only watching, the sole evidence it is still there.
     Alive {
+        /// The connection it came in on.
         conn_id: u64,
     },
 }
@@ -246,8 +291,8 @@ struct ComputeAccum {
     worst_queue_ms: u32,
     /// Issue to answer, measured here. Everything the device didn't spend
     /// thinking is the wire.
-    worst_round_trip_ms: u32,
-    worst_wire_ms: u32,
+    worst_round_trip_ms: u64,
+    worst_wire_ms: u64,
     wire_ms_total: u64,
     worst_loop_lag_ms: u32,
     min_sims: u32,
@@ -256,7 +301,7 @@ struct ComputeAccum {
 
 impl Default for ComputeAccum {
     fn default() -> Self {
-        ComputeAccum {
+        Self {
             moves: 0,
             sims: 0,
             wall_ms: 0,
@@ -308,11 +353,11 @@ struct SessionActor {
     /// answer is still recognisable. Dropping them on sight made lateness
     /// invisible — and lateness is the one signal the thinking window is
     /// adjusted from, so a struggling device was never asked for less.
-    retired_compute: std::collections::VecDeque<(u64, RetiredCompute)>,
+    retired_compute: VecDeque<(u64, RetiredCompute)>,
     next_request_id: u64,
     next_tick: Option<Instant>,
     /// Set when the last connection drops; the actor tidies itself away
-    /// after EMPTY_GRACE unless someone comes back.
+    /// after `EMPTY_GRACE` unless someone comes back.
     empty_deadline: Option<Instant>,
     /// Players holding a seat with no connection behind it, and when that
     /// stops being true.
@@ -321,12 +366,14 @@ struct SessionActor {
     last_game_id: Option<i64>,
     config_changed_by: Option<PlayerId>,
     config_rev: u32,
+    /// The foods on offer in the lobby, the same on every phone.
+    food_hand: Vec<String>,
 }
 
 impl SessionActor {
     fn spawn(name: String, registry: Registry, db: Arc<Db>) -> mpsc::Sender<Cmd> {
         let (tx, rx) = mpsc::channel(1024);
-        let actor = SessionActor {
+        let actor = Self {
             name,
             registry,
             db,
@@ -342,7 +389,7 @@ impl SessionActor {
             bot_hosts: HashMap::new(),
             paused: false,
             pending_compute: HashMap::new(),
-            retired_compute: std::collections::VecDeque::new(),
+            retired_compute: VecDeque::new(),
             next_request_id: 1,
             next_tick: None,
             empty_deadline: None,
@@ -351,6 +398,7 @@ impl SessionActor {
             last_game_id: None,
             config_changed_by: None,
             config_rev: 0,
+            food_hand: deal_food_hand(DEFAULT_FOOD),
         };
         tokio::spawn(actor.run());
         tx
@@ -374,14 +422,14 @@ impl SessionActor {
                 .chain(
                     self.lobby
                         .iter()
-                        .filter(|p| host.map(|h| h.id != p.id).unwrap_or(true))
+                        .filter(|p| host.is_none_or(|h| h.id != p.id))
                         .filter(|p| !self.bots.contains_key(&p.id)),
                 )
                 .chain(self.lobby.iter().filter(|p| self.bots.contains_key(&p.id)))
                 .map(|p| p.emoji.clone())
                 .collect(),
-            players: humans as u32,
-            bots: self.bots.len() as u32,
+            players: count(humans),
+            bots: count(self.bots.len()),
             playing: self.game.is_some(),
         });
     }
@@ -409,17 +457,17 @@ impl SessionActor {
             };
             tokio::select! {
                 cmd = self.rx.recv() => match cmd {
-                    Some(cmd) => self.handle(cmd).await,
+                    Some(cmd) => self.handle(cmd),
                     None => break,
                 },
-                _ = tick_sleep => self.tick().await,
-                _ = empty_sleep => {
+                () = tick_sleep => self.tick().await,
+                () = empty_sleep => {
                     if self.conns.is_empty() {
                         break; // nobody came back — tidy up
                     }
                     self.empty_deadline = None;
                 }
-                _ = away_sleep => self.release_expired_seats().await,
+                () = away_sleep => self.release_expired_seats(),
             }
         }
         tracing::info!(session = %self.name, "session ended");
@@ -427,12 +475,12 @@ impl SessionActor {
     }
 
     /// Give up the seats of players who never came back.
-    async fn release_expired_seats(&mut self) {
+    fn release_expired_seats(&mut self) {
         let now = Instant::now();
         let expired: Vec<PlayerId> = self
             .away
             .iter()
-            .filter(|(_, &deadline)| deadline <= now)
+            .filter(|&(_, &deadline)| deadline <= now)
             .map(|(id, _)| id.clone())
             .collect();
         if expired.is_empty() {
@@ -445,10 +493,10 @@ impl SessionActor {
             self.ready.remove(id);
         }
         self.assign_bots();
-        self.broadcast_lobby().await;
+        self.broadcast_lobby();
     }
 
-    async fn handle(&mut self, cmd: Cmd) {
+    fn handle(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Connect {
                 conn_id,
@@ -456,6 +504,9 @@ impl SessionActor {
                 ip,
                 tx,
             } => {
+                // Logged so a drop and the return that follows it can be
+                // read off the log as a pair, with the time between them.
+                tracing::info!(session = %self.name, player = %profile.id, conn = conn_id, "connected");
                 self.empty_deadline = None;
                 self.conns.insert(
                     conn_id,
@@ -486,9 +537,9 @@ impl SessionActor {
                         players: game.players.clone(),
                         turns: game.turns.clone(),
                     });
-                    self.send_to(conn_id, frame).await;
+                    self.send_to(conn_id, frame);
                 }
-                self.broadcast_lobby().await;
+                self.broadcast_lobby();
             }
             Cmd::Disconnect { conn_id } => {
                 if let Some(conn) = self.conns.remove(&conn_id) {
@@ -511,9 +562,9 @@ impl SessionActor {
                     self.empty_deadline = Some(Instant::now() + EMPTY_GRACE);
                 }
                 self.assign_bots();
-                self.broadcast_lobby().await;
+                self.broadcast_lobby();
             }
-            Cmd::Msg { conn_id, msg } => self.client_msg(conn_id, msg).await,
+            Cmd::Msg { conn_id, msg } => self.client_msg(conn_id, msg),
             Cmd::Alive { conn_id } => self.mark_alive(conn_id),
         }
     }
@@ -539,7 +590,7 @@ impl SessionActor {
         }
     }
 
-    async fn client_msg(&mut self, conn_id: u64, msg: ClientMsg) {
+    fn client_msg(&mut self, conn_id: u64, msg: ClientMsg) {
         let player = match self.conns.get(&conn_id) {
             Some(c) => c.player.clone(),
             None => return,
@@ -562,7 +613,7 @@ impl SessionActor {
                     emoji: info.emoji,
                     colour: info.colour,
                 });
-                self.broadcast_lobby().await;
+                self.broadcast_lobby();
             }
             ClientMsg::SetReady(ready) => {
                 if ready {
@@ -570,26 +621,14 @@ impl SessionActor {
                 } else {
                     self.ready.remove(&player);
                 }
-                self.broadcast_lobby().await;
+                self.broadcast_lobby();
             }
-            ClientMsg::Configure(config) => {
-                // Picking what is already picked changes nothing, so it
-                // shouldn't un-ready anyone or claim the settings either.
-                if self.game.is_none() && config.valid() && config != self.config {
-                    self.config = config;
-                    self.config_changed_by = Some(player);
-                    self.config_rev = self.config_rev.wrapping_add(1);
-                    // Changing the deal un-readies everyone.
-                    self.ready.clear();
-                    self.broadcast_lobby().await;
-                }
-            }
+            ClientMsg::Configure(config) => self.configure(player, config),
             ClientMsg::SetPaused(paused) => {
                 if self.game.is_some() && self.paused != paused {
                     self.paused = paused;
                     tracing::info!(session = %self.name, paused, "game hold changed");
-                    self.broadcast(Frame::Control(encode(&ServerMsg::Paused(paused)).into()))
-                        .await;
+                    self.broadcast(&Frame::Control(encode(&ServerMsg::Paused(paused)).into()));
                     if paused {
                         self.next_tick = None;
                     } else {
@@ -597,49 +636,16 @@ impl SessionActor {
                     }
                 }
             }
-            ClientMsg::Start => self.start_game().await,
+            ClientMsg::Start => self.start_game(),
             ClientMsg::Move(dir) => {
-                if let Some(game) = &mut self.game {
-                    if game
-                        .turns
-                        .last()
-                        .map(|t| t.alive.contains(&player))
-                        .unwrap_or(false)
-                    {
-                        game.pending.insert(player, dir);
-                    }
+                if let Some(game) = &mut self.game
+                    && game.turns.last().is_some_and(|t| t.alive.contains(&player))
+                {
+                    game.pending.insert(player, dir);
                 }
             }
-            ClientMsg::AddBot(difficulty) => {
-                if self.game.is_none() && self.lobby.len() < MAX_PLAYERS {
-                    self.bot_counter += 1;
-                    let (name, emoji, colour) = match difficulty {
-                        BotDifficulty::Easy => ("cool guy", "🐛", "hsl(95, 45%, 65%)"),
-                        BotDifficulty::Medium => ("dude", "🤖", "hsl(210, 50%, 68%)"),
-                        BotDifficulty::Hard => ("lad", "🐲", "hsl(275, 45%, 68%)"),
-                    };
-                    let id = format!("bot-{}", self.bot_counter);
-                    self.bots.insert(id.clone(), difficulty);
-                    self.lobby.push(PlayerProfile {
-                        id,
-                        name: name.to_string(),
-                        emoji: emoji.to_string(),
-                        colour: colour.to_string(),
-                    });
-                    self.broadcast_lobby().await;
-                }
-            }
-            ClientMsg::Kick(target) => {
-                if self.game.is_none() {
-                    self.lobby.retain(|p| p.id != target);
-                    self.bots.remove(&target);
-                    self.ready.remove(&target);
-                    // Removing someone settles it — no held seat should
-                    // outlive the decision and put them back.
-                    self.away.remove(&target);
-                    self.broadcast_lobby().await;
-                }
-            }
+            ClientMsg::AddBot(difficulty) => self.add_bot(difficulty),
+            ClientMsg::Kick(target) => self.kick(&target),
             ClientMsg::Benchmark {
                 sims_per_sec,
                 device,
@@ -653,169 +659,14 @@ impl SessionActor {
                 self.assign_bots();
             }
             ClientMsg::HostAvailable { can_compute } => {
-                if let Some(conn) = self.conns.get_mut(&conn_id) {
-                    if conn.declared_available != can_compute {
-                        tracing::info!(
-                            session = %self.name, conn = conn_id, can_compute,
-                            "compute host availability changed"
-                        );
-                    }
-                    conn.declared_available = can_compute;
-                }
-                self.assign_bots();
-                if can_compute {
-                    self.resume_tick();
-                }
+                self.set_host_available(conn_id, can_compute);
             }
             ClientMsg::BotMove {
                 request_id,
                 dir,
                 proof,
                 tm,
-            } => {
-                let Some(pending) = self.pending_compute.remove(&request_id) else {
-                    // Not outstanding: either an answer we have already
-                    // given up waiting for, or noise. A late answer is worth
-                    // hearing — it says this device is trying to do more
-                    // than it can in the time it has.
-                    if let Some((_, r)) = self
-                        .retired_compute
-                        .iter()
-                        .find(|(id, _)| *id == request_id)
-                    {
-                        if r.conn_id == conn_id {
-                            let behind = self
-                                .game
-                                .as_ref()
-                                .and_then(|g| g.turns.last())
-                                .map(|t| t.turn_number.saturating_sub(r.turn_number))
-                                .unwrap_or(0);
-                            tracing::info!(
-                                session = %self.name, bot = %r.bot_id, conn = conn_id,
-                                answered_for = r.turn_number, ticks_behind = behind,
-                                total_ms = tm.total_ms, queue_ms = tm.queue_ms,
-                                sims = tm.sims,
-                                loop_lag_ms = tm.loop_lag_ms,
-                                round_trip_ms = r.issued_at.elapsed().as_millis() as u64,
-                                wire_ms = (r.issued_at.elapsed().as_millis() as u64)
-                                    .saturating_sub(tm.total_ms as u64),
-                                "compute answer arrived after its tick had gone"
-                            );
-                            if let Some(conn) = self.conns.get_mut(&conn_id) {
-                                conn.misses = 0;
-                                if !r.penalised {
-                                    conn.think_share = (conn.think_share * 0.7).max(0.45);
-                                }
-                            }
-                            // Answers are sent twice for redundancy, so the
-                            // second copy must not be read as a second
-                            // failure and shrink the window all over again.
-                            if let Some((_, r)) = self
-                                .retired_compute
-                                .iter_mut()
-                                .find(|(id, _)| *id == request_id)
-                            {
-                                r.penalised = true;
-                            }
-                        }
-                    }
-                    return;
-                };
-                if pending.conn_id != conn_id {
-                    // Someone answered a request that wasn't theirs.
-                    self.strike(conn_id, "answered another host's request");
-                    return;
-                }
-                // Guard, not fortress: the checksum must bind our nonce and
-                // request id to the move. Cheap to verify, impossible to
-                // replay. (The deterministic search keeps full recompute
-                // audits on the table if cheating ever gets real.)
-                if proof != bot::bind_proof(pending.nonce, request_id, dir) {
-                    self.strike(conn_id, "bad response checksum");
-                    return;
-                }
-                if let Some(game) = &mut self.game {
-                    let acc = game.compute.entry(conn_id).or_default();
-                    acc.moves += 1;
-                    acc.sims += tm.sims as u64;
-                    acc.wall_ms += tm.search_ms.min(60_000) as u64;
-                    acc.worst_total_ms = acc.worst_total_ms.max(tm.total_ms);
-                    acc.worst_queue_ms = acc.worst_queue_ms.max(tm.queue_ms);
-                    let round_trip = pending.issued_at.elapsed().as_millis() as u32;
-                    acc.worst_round_trip_ms = acc.worst_round_trip_ms.max(round_trip);
-                    acc.worst_wire_ms = acc
-                        .worst_wire_ms
-                        .max(round_trip.saturating_sub(tm.total_ms));
-                    acc.wire_ms_total += round_trip.saturating_sub(tm.total_ms) as u64;
-                    acc.worst_loop_lag_ms = acc.worst_loop_lag_ms.max(tm.loop_lag_ms);
-                    acc.min_sims = acc.min_sims.min(tm.sims);
-                    if tm.fallback {
-                        acc.fallbacks += 1;
-                    }
-                }
-                // Anything that explains a bad-looking bot gets said out
-                // loud; the rest is summarised when the game ends. A move
-                // with no slices at all is a *forced* one — a single legal
-                // option, decided without searching — which is correct, not
-                // poor.
-                let forced = tm.slices == 0 && tm.sims == 0;
-                if !forced && (tm.fallback || tm.sims < 800 || tm.total_ms > self.config.tick_ms) {
-                    tracing::info!(
-                        session = %self.name, conn = conn_id, bot = %pending.bot_id,
-                        think_ms = tm.think_ms, queue_ms = tm.queue_ms,
-                        search_ms = tm.search_ms, total_ms = tm.total_ms,
-                        sims = tm.sims, slices = tm.slices, fallback = tm.fallback,
-                        "compute was poor"
-                    );
-                }
-                // Ranking signal only: how much thinking this device got
-                // done inside its deadline.
-                if tm.search_ms >= 4 && tm.sims > 0 {
-                    if let Some(conn) = self.conns.get_mut(&conn_id) {
-                        let rate = (tm.sims as u64 * 1000 / tm.search_ms as u64) as u32;
-                        conn.recent_sims_per_sec = Some(match conn.recent_sims_per_sec {
-                            Some(prev) => (prev * 7 + rate * 3) / 10,
-                            None => rate,
-                        });
-                    }
-                }
-
-                if let Some(game) = &mut self.game {
-                    let current = game.turns.last().map(|t| t.turn_number);
-                    if current != Some(pending.turn.turn_number) {
-                        tracing::info!(
-                            session = %self.name,
-                            bot = %pending.bot_id,
-                            answered_for = pending.turn.turn_number,
-                            now_at = current.unwrap_or(0),
-                            total_ms = tm.total_ms,
-                            queue_ms = tm.queue_ms,
-                            sims = tm.sims,
-                            "compute answer arrived too late to be used"
-                        );
-                        if let Some(conn) = self.conns.get_mut(&conn_id) {
-                            conn.misses = 0;
-                            // Floor it well above uselessness: a bot given
-                            // a few dozen milliseconds plays at random,
-                            // which looks worse than the occasional late
-                            // answer it was protecting us from.
-                            conn.think_share = (conn.think_share * 0.7).max(0.45);
-                        }
-                    } else if let Some(conn) = self.conns.get_mut(&conn_id) {
-                        conn.misses = 0;
-                        conn.think_share = (conn.think_share + 0.05).min(1.0);
-                    }
-                    if current == Some(pending.turn.turn_number)
-                        && game
-                            .turns
-                            .last()
-                            .map(|t| t.alive.contains(&pending.bot_id))
-                            .unwrap_or(false)
-                    {
-                        game.pending.insert(pending.bot_id.clone(), dir);
-                    }
-                }
-            }
+            } => self.bot_move(conn_id, request_id, dir, proof, &tm),
             ClientMsg::ComputeFailed { request_id, reason } => {
                 let bot = self
                     .pending_compute
@@ -828,11 +679,264 @@ impl SessionActor {
                 );
             }
             ClientMsg::Ping(n) => {
-                self.send_to(conn_id, control_frame(&ServerMsg::Pong(n)))
-                    .await;
+                self.send_to(conn_id, control_frame(&ServerMsg::Pong(n)));
             }
+            ClientMsg::ShuffleFood => self.shuffle_food(),
+            ClientMsg::Reconnected(report) => self.log_reconnect(&player, conn_id, report),
             // Handled at the transport layer before a session exists.
             ClientMsg::WatchGames => {}
+        }
+    }
+
+    /// Change the settings for the next game, between games only.
+    fn configure(&mut self, player: PlayerId, config: GameConfig) {
+        // Picking what is already picked changes nothing, so it shouldn't
+        // un-ready anyone or claim the settings either.
+        if self.game.is_some() || !config.valid() || config == self.config {
+            return;
+        }
+        // Picks come from the shared hand; one that doesn't (an older
+        // client's) gets a hand of its own around it.
+        if !self.food_hand.contains(&config.food_emoji) {
+            self.food_hand = deal_food_hand(&config.food_emoji);
+        }
+        self.config = config;
+        self.config_changed_by = Some(player);
+        self.config_rev = self.config_rev.wrapping_add(1);
+        // Changing the deal un-readies everyone.
+        self.ready.clear();
+        self.broadcast_lobby();
+    }
+
+    /// Deal the lobby a new hand of foods, between games only.
+    fn shuffle_food(&mut self) {
+        if self.game.is_none() {
+            self.food_hand = deal_food_hand(&self.config.food_emoji);
+            self.broadcast_lobby();
+        }
+    }
+
+    /// A client's account of how its reconnect went, for the log: the only
+    /// place a slow one on somebody's phone can be seen afterwards.
+    fn log_reconnect(&self, player: &PlayerId, conn_id: u64, report: ReconnectReport) {
+        tracing::info!(
+            session = %self.name, %player, conn = conn_id,
+            attempts = report.attempts,
+            silent_ms = report.silent_ms,
+            reconnect_ms = report.reconnect_ms,
+            since_visible_ms = ?report.since_visible_ms,
+            "reconnected"
+        );
+    }
+
+    /// Take a player or bot out of the lobby, between games only.
+    fn kick(&mut self, target: &PlayerId) {
+        if self.game.is_none() {
+            self.lobby.retain(|p| p.id != *target);
+            self.bots.remove(target);
+            self.ready.remove(target);
+            // Removing someone settles it — no held seat should outlive the
+            // decision and put them back.
+            self.away.remove(target);
+            self.broadcast_lobby();
+        }
+    }
+
+    /// What a device says about whether it can think for bots right now —
+    /// the page hiding or coming back.
+    fn set_host_available(&mut self, conn_id: u64, can_compute: bool) {
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            if conn.declared_available != can_compute {
+                tracing::info!(
+                    session = %self.name, conn = conn_id, can_compute,
+                    "compute host availability changed"
+                );
+            }
+            conn.declared_available = can_compute;
+        }
+        self.assign_bots();
+        if can_compute {
+            self.resume_tick();
+        }
+    }
+
+    /// A server-hosted bot joins the lobby, if there is room and no game.
+    fn add_bot(&mut self, difficulty: BotDifficulty) {
+        if self.game.is_none() && self.lobby.len() < MAX_PLAYERS {
+            self.bot_counter += 1;
+            let (name, emoji, colour) = match difficulty {
+                BotDifficulty::Easy => ("cool guy", "🐛", "hsl(95, 45%, 65%)"),
+                BotDifficulty::Medium => ("dude", "🤖", "hsl(210, 50%, 68%)"),
+                BotDifficulty::Hard => ("lad", "🐲", "hsl(275, 45%, 68%)"),
+            };
+            let id = format!("bot-{}", self.bot_counter);
+            self.bots.insert(id.clone(), difficulty);
+            self.lobby.push(PlayerProfile {
+                id,
+                name: name.to_owned(),
+                emoji: emoji.to_owned(),
+                colour: colour.to_owned(),
+            });
+            self.broadcast_lobby();
+        }
+    }
+
+    /// A host's answer for one of its bots: checked against the request it
+    /// claims to answer, counted towards the host's stats and thinking
+    /// window, and — if it is still for the current turn — the bot's move.
+    fn bot_move(
+        &mut self,
+        conn_id: u64,
+        request_id: u64,
+        dir: Dir,
+        proof: u64,
+        tm: &ComputeTelemetry,
+    ) {
+        let Some(pending) = self.pending_compute.remove(&request_id) else {
+            // Not outstanding: either an answer we have already given up
+            // waiting for, or noise. A late answer is worth hearing — it
+            // says this device is trying to do more than it can in the time
+            // it has.
+            self.late_answer(conn_id, request_id, tm);
+            return;
+        };
+        if pending.conn_id != conn_id {
+            // Someone answered a request that wasn't theirs.
+            self.strike(conn_id, "answered another host's request");
+            return;
+        }
+        // Guard, not fortress: the checksum must bind our nonce and request
+        // id to the move. Cheap to verify, impossible to replay. (The
+        // deterministic search keeps full recompute audits on the table if
+        // cheating ever gets real.)
+        if proof != bot::bind_proof(pending.nonce, request_id, dir) {
+            self.strike(conn_id, "bad response checksum");
+            return;
+        }
+        self.record_compute(conn_id, &pending, tm);
+
+        if let Some(game) = &mut self.game {
+            let current = game.turns.last().map(|t| t.turn_number);
+            if current != Some(pending.turn.turn_number) {
+                tracing::info!(
+                    session = %self.name,
+                    bot = %pending.bot_id,
+                    answered_for = pending.turn.turn_number,
+                    now_at = current.unwrap_or(0),
+                    total_ms = tm.total_ms,
+                    queue_ms = tm.queue_ms,
+                    sims = tm.sims,
+                    "compute answer arrived too late to be used"
+                );
+                if let Some(conn) = self.conns.get_mut(&conn_id) {
+                    conn.misses = 0;
+                    // Floor it well above uselessness: a bot given a few
+                    // dozen milliseconds plays at random, which looks worse
+                    // than the occasional late answer it was protecting us
+                    // from.
+                    conn.think_share = (conn.think_share * 0.7).max(0.45);
+                }
+            } else if let Some(conn) = self.conns.get_mut(&conn_id) {
+                conn.misses = 0;
+                conn.think_share = (conn.think_share + 0.05).min(1.0);
+            }
+            if current == Some(pending.turn.turn_number)
+                && game
+                    .turns
+                    .last()
+                    .is_some_and(|t| t.alive.contains(&pending.bot_id))
+            {
+                game.pending.insert(pending.bot_id, dir);
+            }
+        }
+    }
+
+    /// An answer to a request whose tick has already gone. Logged, and it
+    /// costs the host some of its thinking window — once per request.
+    fn late_answer(&mut self, conn_id: u64, request_id: u64, tm: &ComputeTelemetry) {
+        let Some((_, r)) = self
+            .retired_compute
+            .iter_mut()
+            .find(|(id, _)| *id == request_id)
+        else {
+            return;
+        };
+        if r.conn_id != conn_id {
+            return;
+        }
+        let behind = self
+            .game
+            .as_ref()
+            .and_then(|g| g.turns.last())
+            .map_or(0, |t| t.turn_number.saturating_sub(r.turn_number));
+        let round_trip_ms = millis(r.issued_at.elapsed());
+        tracing::info!(
+            session = %self.name, bot = %r.bot_id, conn = conn_id,
+            answered_for = r.turn_number, ticks_behind = behind,
+            total_ms = tm.total_ms, queue_ms = tm.queue_ms,
+            sims = tm.sims,
+            loop_lag_ms = tm.loop_lag_ms,
+            round_trip_ms,
+            wire_ms = round_trip_ms.saturating_sub(u64::from(tm.total_ms)),
+            "compute answer arrived after its tick had gone"
+        );
+        if let Some(conn) = self.conns.get_mut(&conn_id) {
+            conn.misses = 0;
+            if !r.penalised {
+                conn.think_share = (conn.think_share * 0.7).max(0.45);
+            }
+        }
+        // Answers are sent twice for redundancy, so the second copy must not
+        // be read as a second failure and shrink the window all over again.
+        r.penalised = true;
+    }
+
+    /// Fold a checked answer's telemetry into this game's per-host stats
+    /// and the host's speed ranking.
+    fn record_compute(&mut self, conn_id: u64, pending: &PendingCompute, tm: &ComputeTelemetry) {
+        if let Some(game) = &mut self.game {
+            let acc = game.compute.entry(conn_id).or_default();
+            acc.moves += 1;
+            acc.sims += u64::from(tm.sims);
+            acc.wall_ms += u64::from(tm.search_ms.min(60_000));
+            acc.worst_total_ms = acc.worst_total_ms.max(tm.total_ms);
+            acc.worst_queue_ms = acc.worst_queue_ms.max(tm.queue_ms);
+            let round_trip = millis(pending.issued_at.elapsed());
+            let wire = round_trip.saturating_sub(u64::from(tm.total_ms));
+            acc.worst_round_trip_ms = acc.worst_round_trip_ms.max(round_trip);
+            acc.worst_wire_ms = acc.worst_wire_ms.max(wire);
+            acc.wire_ms_total += wire;
+            acc.worst_loop_lag_ms = acc.worst_loop_lag_ms.max(tm.loop_lag_ms);
+            acc.min_sims = acc.min_sims.min(tm.sims);
+            if tm.fallback {
+                acc.fallbacks += 1;
+            }
+        }
+        // Anything that explains a bad-looking bot gets said out loud; the
+        // rest is summarised when the game ends. A move with no slices at
+        // all is a *forced* one — a single legal option, decided without
+        // searching — which is correct, not poor.
+        let forced = tm.slices == 0 && tm.sims == 0;
+        if !forced && (tm.fallback || tm.sims < 800 || tm.total_ms > self.config.tick_ms) {
+            tracing::info!(
+                session = %self.name, conn = conn_id, bot = %pending.bot_id,
+                think_ms = tm.think_ms, queue_ms = tm.queue_ms,
+                search_ms = tm.search_ms, total_ms = tm.total_ms,
+                sims = tm.sims, slices = tm.slices, fallback = tm.fallback,
+                "compute was poor"
+            );
+        }
+        // Ranking signal only: how much thinking this device got done
+        // inside its deadline.
+        if tm.search_ms >= 4
+            && tm.sims > 0
+            && let Some(conn) = self.conns.get_mut(&conn_id)
+        {
+            let rate = u64::from(tm.sims) * 1000 / u64::from(tm.search_ms);
+            let blended = conn
+                .recent_sims_per_sec
+                .map_or(rate, |prev| (u64::from(prev) * 7 + rate * 3) / 10);
+            conn.recent_sims_per_sec = Some(u32::try_from(blended).unwrap_or(u32::MAX));
         }
     }
 
@@ -847,7 +951,7 @@ impl SessionActor {
         }
     }
 
-    async fn start_game(&mut self) {
+    fn start_game(&mut self) {
         if self.game.is_some() || self.lobby.is_empty() {
             return;
         }
@@ -874,7 +978,7 @@ impl SessionActor {
             turn: first.clone(),
             countdown_ms: COUNTDOWN_MS,
         });
-        self.broadcast(frame).await;
+        self.broadcast(&frame);
 
         self.game = Some(RunningGame {
             engine,
@@ -892,9 +996,9 @@ impl SessionActor {
         }
         self.ready.clear();
         self.publish_info();
-        self.next_tick = Some(Instant::now() + Duration::from_millis(COUNTDOWN_MS as u64));
+        self.next_tick = Some(Instant::now() + Duration::from_millis(u64::from(COUNTDOWN_MS)));
         self.assign_bots();
-        self.issue_compute_requests().await;
+        self.issue_compute_requests();
     }
 
     async fn tick(&mut self) {
@@ -933,30 +1037,58 @@ impl SessionActor {
             return;
         }
 
-        // Distributed compute reconciliation: hosts whose requests never
-        // came back get a strike and their bots fail over to the next
-        // phone. (No server fallback — bots without an answer coast.)
-        let current = game.turns.last().unwrap().clone();
-        let mut late_hosts: Vec<u64> = Vec::new();
-        let mut missing: Vec<PlayerId> = Vec::new();
-        for pc in self.pending_compute.values() {
-            if pc.turn.turn_number == current.turn_number
-                && current.alive.contains(&pc.bot_id)
-                && !game.pending.contains_key(&pc.bot_id)
-            {
-                late_hosts.push(pc.conn_id);
+        let Some(current) = game.turns.last().cloned() else {
+            // A game always starts with its first turn, so this can't be;
+            // if it were, there would be nothing to advance from.
+            tracing::error!(session = %self.name, "running game has no turns — stopping its clock");
+            self.next_tick = None;
+            return;
+        };
+        self.note_coasting_bots(&current);
+        self.assign_bots();
+
+        // Hard lock: the server NEVER searches. Bots whose host didn't
+        // answer simply keep their heading this tick (the engine's default).
+        let Some(game) = self.game.as_mut() else {
+            return;
+        };
+
+        let moves = std::mem::take(&mut game.pending);
+        let next = game.engine.next_turn(&current, &moves);
+        let over = next.game_over();
+        game.turns.push(next.clone());
+
+        // Snapshots are datagram-class: unreliable, redundant, single-packet.
+        self.broadcast(&Frame::Snapshot(encode(&ServerMsg::Turn(next)).into()));
+
+        if over {
+            self.finish_game().await;
+        } else {
+            // Fixed cadence from the due time. If we somehow fell more than
+            // a period behind (stall, load), skip forward instead of
+            // machine-gunning catch-up ticks.
+            let period = Duration::from_millis(u64::from(self.config.tick_ms));
+            let mut next = due + period;
+            let now = Instant::now();
+            if next <= now {
+                next = now + period;
             }
-        }
-        for bot_id in self.bots.keys() {
-            if current.alive.contains(bot_id) && !game.pending.contains_key(bot_id) {
-                missing.push(bot_id.clone());
+            self.next_tick = Some(next);
+            if self.bot_hosts.is_empty() {
+                self.assign_bots();
             }
+            self.issue_compute_requests();
         }
-        late_hosts.sort_unstable();
-        late_hosts.dedup();
+    }
+
+    /// Distributed compute reconciliation: every bot still alive without a
+    /// move this tick coasts straight ahead — the visible symptom of a
+    /// compute failure — so say exactly why, and count the tick against
+    /// hosts that never answered. (No server fallback — bots without an
+    /// answer coast.)
+    fn note_coasting_bots(&mut self, current: &Turn) {
+        let Some(game) = &self.game else { return };
         let mut silent: Vec<u64> = Vec::new();
-        // Anything alive without a move this tick coasts straight ahead —
-        // the visible symptom of a compute failure. Say exactly why.
         for bot_id in self.bots.keys() {
             if !current.alive.contains(bot_id) || game.pending.contains_key(bot_id) {
                 continue;
@@ -1002,40 +1134,6 @@ impl SessionActor {
                 }
             }
         }
-        self.assign_bots();
-
-        // Hard lock: the server NEVER searches. Bots whose host didn't
-        // answer simply keep their heading this tick (the engine's default).
-        drop(missing);
-        let game = self.game.as_mut().unwrap();
-
-        let moves = std::mem::take(&mut game.pending);
-        let next = game.engine.next_turn(game.turns.last().unwrap(), &moves);
-        let over = next.game_over();
-        game.turns.push(next.clone());
-
-        // Snapshots are datagram-class: unreliable, redundant, single-packet.
-        self.broadcast(Frame::Snapshot(encode(&ServerMsg::Turn(next)).into()))
-            .await;
-
-        if over {
-            self.finish_game().await;
-        } else {
-            // Fixed cadence from the due time. If we somehow fell more than
-            // a period behind (stall, load), skip forward instead of
-            // machine-gunning catch-up ticks.
-            let period = Duration::from_millis(self.config.tick_ms as u64);
-            let mut next = due + period;
-            let now = Instant::now();
-            if next <= now {
-                next = now + period;
-            }
-            self.next_tick = Some(next);
-            if self.bot_hosts.is_empty() {
-                self.assign_bots();
-            }
-            self.issue_compute_requests().await;
-        }
     }
 
     async fn finish_game(&mut self) {
@@ -1056,7 +1154,7 @@ impl SessionActor {
             .map(|t| t.winners.clone())
             .unwrap_or_default();
 
-        let db = self.db.clone();
+        let db = Arc::clone(&self.db);
         let started = game.started_at_ms;
         let finished = now_ms();
         let saved =
@@ -1066,13 +1164,13 @@ impl SessionActor {
         for (conn_id, acc) in &game.compute {
             tracing::info!(
                 session = %self.name, conn = conn_id, moves = acc.moves,
-                mean_sims = acc.sims / acc.moves.max(1) as u64,
+                mean_sims = acc.sims / u64::from(acc.moves.max(1)),
                 min_sims = if acc.min_sims == u32::MAX { 0 } else { acc.min_sims },
                 worst_total_ms = acc.worst_total_ms,
                 worst_queue_ms = acc.worst_queue_ms,
                 worst_round_trip_ms = acc.worst_round_trip_ms,
                 worst_wire_ms = acc.worst_wire_ms,
-                mean_wire_ms = acc.wire_ms_total / acc.moves.max(1) as u64,
+                mean_wire_ms = acc.wire_ms_total / u64::from(acc.moves.max(1)),
                 worst_loop_lag_ms = acc.worst_loop_lag_ms,
                 fallbacks = acc.fallbacks,
                 "compute summary"
@@ -1085,12 +1183,10 @@ impl SessionActor {
             .iter()
             .filter_map(|(conn_id, acc)| {
                 let conn = self.conns.get(conn_id)?;
-                let name = self
-                    .lobby
-                    .iter()
-                    .find(|p| p.id == conn.player)
-                    .map(|p| format!("{} {}", p.emoji, p.name))
-                    .unwrap_or_else(|| "departed".to_string());
+                let name = self.lobby.iter().find(|p| p.id == conn.player).map_or_else(
+                    || "departed".to_owned(),
+                    |p| format!("{} {}", p.emoji, p.name),
+                );
                 Some((
                     ComputeStat {
                         name,
@@ -1111,33 +1207,24 @@ impl SessionActor {
                 self.last_game_id = Some(id);
                 let stats: Vec<ComputeStat> =
                     compute.iter().map(|(s, _, _, _)| s.clone()).collect();
-                let db = self.db.clone();
+                let db = Arc::clone(&self.db);
                 let rows = compute;
                 tokio::task::spawn_blocking(move || {
                     for (stat, player_id, ip, benchmark) in rows {
-                        if let Err(e) = db.insert_compute_stat(
-                            id,
-                            &player_id,
-                            &stat.name,
-                            &ip,
-                            &stat.device,
-                            benchmark,
-                            stat.moves,
-                            stat.sims,
-                            stat.wall_ms,
-                        ) {
+                        if let Err(e) =
+                            db.insert_compute_stat(id, &stat, &player_id, &ip, benchmark)
+                        {
                             tracing::error!("failed to save compute stat: {e}");
                         }
                     }
                 });
-                self.broadcast(control_frame(&ServerMsg::GameSaved { id, compute: stats }))
-                    .await;
+                self.broadcast(&control_frame(&ServerMsg::GameSaved { id, compute: stats }));
             }
             Ok(Err(e)) => tracing::error!("failed to save game: {e}"),
             Err(e) => tracing::error!("save task panicked: {e}"),
         }
 
-        self.broadcast_lobby().await;
+        self.broadcast_lobby();
     }
 
     /// Spread bots across eligible hosts (benchmarked, un-banned conns),
@@ -1175,7 +1262,7 @@ impl SessionActor {
     fn resume_tick(&mut self) {
         if self.game.is_some() && self.next_tick.is_none() && !self.paused {
             self.next_tick =
-                Some(Instant::now() + Duration::from_millis(self.config.tick_ms as u64));
+                Some(Instant::now() + Duration::from_millis(u64::from(self.config.tick_ms)));
         }
     }
 
@@ -1195,9 +1282,11 @@ impl SessionActor {
 
     /// Kick off next-turn compute on the assigned phones: each request is
     /// (turn, sims, nonce), due back before the next tick.
-    async fn issue_compute_requests(&mut self) {
+    fn issue_compute_requests(&mut self) {
         let Some(game) = &self.game else { return };
-        let turn = game.turns.last().unwrap().clone();
+        let Some(turn) = game.turns.last().cloned() else {
+            return;
+        };
         if turn.game_over() {
             return;
         }
@@ -1254,13 +1343,13 @@ impl SessionActor {
             // point the bot had already been defaulted onto its old heading.
             // Three of those in one game, and one of them was a bot holding
             // Left into a wall with a good move sitting in flight.
-            let mut window = (self.config.tick_ms as f64 * 0.5).max(25.0);
+            let mut window = (f64::from(self.config.tick_ms) * 0.5).max(25.0);
             // Bots on a device think concurrently, one worker each. If they
             // outnumber the threads available, asking each for the full
             // window pins the phone at 100% and makes the whole device feel
             // slow — so share the available thread-time instead.
-            let mine = load.get(&conn_id).copied().unwrap_or(1).max(1) as f64;
-            let threads = (cores.saturating_sub(1)).max(1) as f64;
+            let mine = f64::from(load.get(&conn_id).copied().unwrap_or(1).max(1));
+            let threads = f64::from(cores.saturating_sub(1).max(1));
             if mine > threads {
                 window *= threads / mine;
             }
@@ -1269,7 +1358,7 @@ impl SessionActor {
                 BotDifficulty::Medium => 0.5,
                 BotDifficulty::Hard => 1.0,
             };
-            let think_ms = (window * difficulty_factor * share).clamp(20.0, 2_000.0) as u32;
+            let think_ms = whole_ms(window * difficulty_factor * share);
             let request_id = self.next_request_id;
             self.next_request_id += 1;
             let nonce = rand::random::<u64>();
@@ -1297,7 +1386,7 @@ impl SessionActor {
             // cannot block another datagram. The stream copy still follows
             // as the guarantee, and the client ignores whichever arrives
             // second.
-            let bytes: std::sync::Arc<[u8]> = encode(&ServerMsg::ComputeRequest {
+            let bytes: Arc<[u8]> = encode(&ServerMsg::ComputeRequest {
                 request_id,
                 bot_id: bot_id.clone(),
                 bot_name,
@@ -1307,15 +1396,15 @@ impl SessionActor {
                 nonce,
             })
             .into();
-            requests.push((conn_id, Frame::Snapshot(bytes.clone())));
+            requests.push((conn_id, Frame::Snapshot(Arc::clone(&bytes))));
             requests.push((conn_id, Frame::Control(bytes)));
         }
         for (conn_id, frame) in requests {
-            self.send_to(conn_id, frame).await;
+            self.send_to(conn_id, frame);
         }
     }
 
-    async fn broadcast_lobby(&mut self) {
+    fn broadcast_lobby(&mut self) {
         let state = LobbyState {
             session: self.name.clone(),
             game_running: self.game.is_some(),
@@ -1326,15 +1415,15 @@ impl SessionActor {
             last_game_id: self.last_game_id,
             config_changed_by: self.config_changed_by.clone(),
             config_rev: self.config_rev,
+            food_hand: self.food_hand.clone(),
         };
         self.publish_info();
-        self.broadcast(control_frame(&ServerMsg::Lobby(state)))
-            .await;
+        self.broadcast(&control_frame(&ServerMsg::Lobby(state)));
     }
 
     /// Send a pre-encoded frame to every connection; drop connections whose
     /// buffers are full (they will reconnect into a snapshot).
-    async fn broadcast(&mut self, frame: Frame) {
+    fn broadcast(&mut self, frame: &Frame) {
         let mut dead = Vec::new();
         for (&id, conn) in &self.conns {
             if conn.tx.try_send(frame.clone()).is_err() {
@@ -1347,13 +1436,25 @@ impl SessionActor {
         }
     }
 
-    async fn send_to(&mut self, conn_id: u64, frame: Frame) {
-        if let Some(conn) = self.conns.get(&conn_id) {
-            if conn.tx.try_send(frame).is_err() {
-                self.conns.remove(&conn_id);
-            }
+    fn send_to(&mut self, conn_id: u64, frame: Frame) {
+        if let Some(conn) = self.conns.get(&conn_id)
+            && conn.tx.try_send(frame).is_err()
+        {
+            self.conns.remove(&conn_id);
         }
     }
+}
+
+/// A bot's thinking deadline in whole milliseconds, kept to 20..=2000 so
+/// even a starved host gets long enough to find a move and a slow tick
+/// can't hand out one longer than any device should spend.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped to 20..=2000 first, so it is positive and fits; Rust has no checked float-to-int conversion"
+)]
+const fn whole_ms(ms: f64) -> u32 {
+    ms.clamp(20.0, 2_000.0) as u32
 }
 
 fn control_frame(msg: &ServerMsg) -> Frame {
@@ -1362,6 +1463,12 @@ fn control_frame(msg: &ServerMsg) -> Frame {
 
 /// Per-connection outbound channel, sized so a healthy client never blocks
 /// and a stuck one gets detected.
+#[must_use]
 pub fn conn_channel() -> (mpsc::Sender<Frame>, mpsc::Receiver<Frame>) {
     mpsc::channel(CONN_BUFFER)
+}
+
+/// A fresh hand of foods around `keep`, drawn at random.
+fn deal_food_hand(keep: &str) -> Vec<String> {
+    snek_shared::deal_food_hand(keep, |n| rand::random_range(0..n))
 }

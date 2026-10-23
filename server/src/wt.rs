@@ -12,10 +12,14 @@
 //! QUIC gives us no TCP head-of-line blocking and connection migration
 //! (wifi↔cellular) for free.
 
-use crate::session::{conn_channel, Cmd, Frame, Registry};
-use snek_shared::protocol::{decode, encode, ClientMsg, ServerMsg, PROTOCOL_VERSION};
+use crate::session::{Cmd, Frame, Registry, conn_channel};
+use snek_shared::PlayerProfile;
+use snek_shared::protocol::{ClientMsg, PROTOCOL_VERSION, ProfileInfo, ServerMsg, decode, encode};
+use std::fmt::Write as _;
 use std::sync::Arc;
-use tokio::time::{timeout, Duration};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, timeout};
 use wtransport::endpoint::endpoint_side::Server;
 use wtransport::{Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig};
 
@@ -26,6 +30,12 @@ const SNAPSHOT_ECHO_DELAY: Duration = Duration::from_millis(30);
 /// Frames on the control stream are u32-le length-prefixed; cap them.
 const MAX_CONTROL_FRAME: u32 = 1 << 20;
 
+/// Bind the QUIC endpoint on `port` (0 picks a free one) with the keepalive
+/// and idle timeout that decide how fast a vanished device is noticed.
+///
+/// # Errors
+///
+/// Fails if the timeout is out of QUIC's range or the port can't be bound.
 pub fn build_endpoint(port: u16, identity: &Identity) -> anyhow::Result<Endpoint<Server>> {
     let config = ServerConfig::builder()
         .with_bind_default(port)
@@ -36,6 +46,9 @@ pub fn build_endpoint(port: u16, identity: &Identity) -> anyhow::Result<Endpoint
     Ok(Endpoint::server(config)?)
 }
 
+/// Accept sessions forever, one task each. A session that fails only ends
+/// itself, so its error is logged at debug: a client vanishing mid-join is
+/// routine, not news.
 pub async fn serve(endpoint: Endpoint<Server>, registry: Registry) {
     loop {
         let incoming = endpoint.accept().await;
@@ -56,7 +69,7 @@ async fn handle_session(
     let connection = request.accept().await?;
 
     // The client opens the control stream and speaks first.
-    let (send, mut recv) = timeout(JOIN_TIMEOUT, connection.accept_bi())
+    let (mut send, mut recv) = timeout(JOIN_TIMEOUT, connection.accept_bi())
         .await
         .map_err(|_| anyhow::anyhow!("no control stream"))??;
     let first = timeout(JOIN_TIMEOUT, read_frame(&mut recv))
@@ -74,10 +87,8 @@ async fn handle_session(
             secret,
             profile,
         } => {
-            join_session(
-                connection, send, recv, registry, version, session, secret, profile,
-            )
-            .await
+            let (session, profile) = admit(&mut send, version, &session, &secret, profile).await?;
+            join_session(connection, send, recv, registry, &session, profile).await
         }
         _ => Err(anyhow::anyhow!("first frame was not join/watch")),
     }
@@ -123,8 +134,8 @@ async fn watch_games(
 }
 
 /// Abort a task when dropped.
-fn scopeguard(task: tokio::task::JoinHandle<()>) -> impl Drop {
-    struct Guard(tokio::task::JoinHandle<()>);
+fn scopeguard(task: JoinHandle<()>) -> impl Drop {
+    struct Guard(JoinHandle<()>);
     impl Drop for Guard {
         fn drop(&mut self) {
             self.0.abort();
@@ -137,17 +148,18 @@ fn scopeguard(task: tokio::task::JoinHandle<()>) -> impl Drop {
 // Session traffic
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-async fn join_session(
-    connection: Connection,
-    mut send: SendStream,
-    mut recv: RecvStream,
-    registry: Registry,
+/// Check a `Join` before anything is set up for it: the client speaks our
+/// protocol version, names a usable session and presents a real secret and
+/// profile. A refusal is told to the client on the stream before the error
+/// ends the session; on success, the normalised session name and the
+/// player's profile under their public id.
+async fn admit(
+    send: &mut SendStream,
     version: u16,
-    session: String,
-    secret: String,
-    info: snek_shared::protocol::ProfileInfo,
-) -> anyhow::Result<()> {
+    session: &str,
+    secret: &str,
+    info: ProfileInfo,
+) -> anyhow::Result<(String, PlayerProfile)> {
     if version != PROTOCOL_VERSION {
         tracing::info!(
             client_version = version,
@@ -155,7 +167,7 @@ async fn join_session(
             "turned away a stale client"
         );
         let msg = ServerMsg::Error("protocol version mismatch — refresh the page".into());
-        let _ = write_frame(&mut send, &encode(&msg)).await;
+        let _ = write_frame(send, &encode(&msg)).await;
         // Finish the stream and give it a moment to leave. Bailing straight
         // after the write tears the connection down first, so the client
         // learns nothing and retries forever behind "Joining session…" —
@@ -164,24 +176,36 @@ async fn join_session(
         tokio::time::sleep(Duration::from_millis(250)).await;
         anyhow::bail!("version mismatch");
     }
-    let session = normalize_session(&session).ok_or_else(|| anyhow::anyhow!("bad session"))?;
+    let session = normalize_session(session).ok_or_else(|| anyhow::anyhow!("bad session"))?;
     if !(8..=128).contains(&secret.len()) {
         anyhow::bail!("bad secret");
     }
     // The public identity is a one-way hash of the client's private secret:
     // knowing someone's public id gives you no way to act as them.
-    let profile = snek_shared::PlayerProfile {
-        id: public_id(&secret),
+    let profile = PlayerProfile {
+        id: public_id(secret),
         name: info.name,
         emoji: info.emoji,
         colour: info.colour,
     };
     if !valid_profile(&profile) {
         let msg = ServerMsg::Error("set up your player first".into());
-        let _ = write_frame(&mut send, &encode(&msg)).await;
+        let _ = write_frame(send, &encode(&msg)).await;
         anyhow::bail!("bad profile");
     }
+    Ok((session, profile))
+}
 
+/// An admitted player's connection, for as long as it lasts: plugged into
+/// the session's actor, frames pumped both ways.
+async fn join_session(
+    connection: Connection,
+    mut send: SendStream,
+    mut recv: RecvStream,
+    registry: Registry,
+    session: &str,
+    profile: PlayerProfile,
+) -> anyhow::Result<()> {
     write_frame(
         &mut send,
         &encode(&ServerMsg::Welcome {
@@ -191,13 +215,35 @@ async fn join_session(
     .await?;
 
     let conn_id = registry.new_conn_id();
-    let (tx, mut rx) = conn_channel();
+    let (tx, rx) = conn_channel();
     let ip = connection.remote_address().ip().to_string();
-    let actor = registry.connect(&session, conn_id, profile, ip, tx).await;
+    let actor = registry.connect(session, conn_id, profile, ip, tx).await;
 
-    // Outbound: control frames -> stream; snapshots -> datagram x2.
-    let out_conn = connection.clone();
-    let outbound = tokio::spawn(async move {
+    let outbound = spawn_outbound(connection.clone(), send, rx);
+    let inbound_dgrams = spawn_inbound_datagrams(connection, actor.clone(), conn_id);
+
+    // Inbound control frames until the client goes away.
+    while let Ok(Some(bytes)) = read_frame(&mut recv).await {
+        if let Some(msg) = decode::<ClientMsg>(&bytes)
+            && actor.send(Cmd::Msg { conn_id, msg }).await.is_err()
+        {
+            break;
+        }
+    }
+
+    let _ = actor.send(Cmd::Disconnect { conn_id }).await;
+    outbound.abort();
+    inbound_dgrams.abort();
+    Ok(())
+}
+
+/// Outbound: control frames -> stream; snapshots -> datagram x2.
+fn spawn_outbound(
+    out_conn: Connection,
+    mut send: SendStream,
+    mut rx: mpsc::Receiver<Frame>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         // A snapshot awaiting its delayed second send.
         let mut echo: Option<(Arc<[u8]>, tokio::time::Instant)> = None;
         loop {
@@ -219,8 +265,7 @@ async fn join_session(
                         // (freak clash pile-ups) fall back to the stream.
                         let fits = out_conn
                             .max_datagram_size()
-                            .map(|m| bytes.len() <= m)
-                            .unwrap_or(false);
+                            .is_some_and(|m| bytes.len() <= m);
                         if fits {
                             let _ = out_conn.send_datagram(&bytes);
                             echo = Some((
@@ -233,19 +278,23 @@ async fn join_session(
                     }
                     None => break,
                 },
-                _ = echo_sleep => {
+                () = echo_sleep => {
                     if let Some((bytes, _)) = echo.take() {
                         let _ = out_conn.send_datagram(&bytes);
                     }
                 }
             }
         }
-    });
+    })
+}
 
-    // Inbound datagrams: moves + pings (pong answered directly).
-    let dgram_conn = connection.clone();
-    let dgram_actor = actor.clone();
-    let inbound_dgrams = tokio::spawn(async move {
+/// Inbound datagrams: moves + pings (pong answered directly).
+fn spawn_inbound_datagrams(
+    dgram_conn: Connection,
+    dgram_actor: mpsc::Sender<Cmd>,
+    conn_id: u64,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         while let Ok(datagram) = dgram_conn.receive_datagram().await {
             match decode::<ClientMsg>(&datagram) {
                 Some(ClientMsg::Ping(n)) => {
@@ -275,21 +324,7 @@ async fn join_session(
                 _ => {}
             }
         }
-    });
-
-    // Inbound control frames until the client goes away.
-    while let Ok(Some(bytes)) = read_frame(&mut recv).await {
-        if let Some(msg) = decode::<ClientMsg>(&bytes) {
-            if actor.send(Cmd::Msg { conn_id, msg }).await.is_err() {
-                break;
-            }
-        }
-    }
-
-    let _ = actor.send(Cmd::Disconnect { conn_id }).await;
-    outbound.abort();
-    inbound_dgrams.abort();
-    Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +359,8 @@ async fn read_exact(recv: &mut RecvStream, buf: &mut [u8]) -> anyhow::Result<boo
 }
 
 async fn write_frame(send: &mut SendStream, bytes: &[u8]) -> anyhow::Result<()> {
-    send.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
+    let len = u32::try_from(bytes.len())?;
+    send.write_all(&len.to_le_bytes()).await?;
     send.write_all(bytes).await?;
     Ok(())
 }
@@ -334,13 +370,21 @@ async fn write_frame(send: &mut SendStream, bytes: &[u8]) -> anyhow::Result<()> 
 // ---------------------------------------------------------------------------
 
 /// Public player id: first 12 hex chars of sha256(secret).
+#[must_use]
 pub fn public_id(secret: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(secret.as_bytes());
-    digest[..6].iter().map(|b| format!("{b:02x}")).collect()
+    digest[..6]
+        .iter()
+        .fold(String::with_capacity(12), |mut id, b| {
+            // Writing to a String can't fail.
+            let _ = write!(id, "{b:02x}");
+            id
+        })
 }
 
 /// Session words: lowercase letters/digits/dashes, 1..=24 chars.
+#[must_use]
 pub fn normalize_session(raw: &str) -> Option<String> {
     let s: String = raw
         .trim()
@@ -349,14 +393,10 @@ pub fn normalize_session(raw: &str) -> Option<String> {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .take(24)
         .collect();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
-fn valid_profile(p: &snek_shared::PlayerProfile) -> bool {
+fn valid_profile(p: &PlayerProfile) -> bool {
     !p.id.is_empty()
         && p.id.len() <= 64
         && !p.name.trim().is_empty()
@@ -367,16 +407,18 @@ fn valid_profile(p: &snek_shared::PlayerProfile) -> bool {
 
 /// Load the TLS identity: real certs if the env points at them, otherwise a
 /// self-signed one (dev / tests).
+///
+/// # Errors
+///
+/// Fails if the PEM files can't be read or parsed, or a self-signed
+/// identity can't be generated.
 pub async fn load_identity() -> anyhow::Result<Identity> {
-    match (std::env::var("SNEK_CERT"), std::env::var("SNEK_KEY")) {
-        (Ok(cert), Ok(key)) => {
-            let identity = Identity::load_pemfiles(&cert, &key).await?;
-            tracing::info!("loaded TLS identity from {cert}");
-            Ok(identity)
-        }
-        _ => {
-            tracing::warn!("SNEK_CERT/SNEK_KEY unset — using a self-signed identity");
-            Ok(Identity::self_signed(["localhost", "127.0.0.1"])?)
-        }
+    if let (Ok(cert), Ok(key)) = (std::env::var("SNEK_CERT"), std::env::var("SNEK_KEY")) {
+        let identity = Identity::load_pemfiles(&cert, &key).await?;
+        tracing::info!("loaded TLS identity from {cert}");
+        Ok(identity)
+    } else {
+        tracing::warn!("SNEK_CERT/SNEK_KEY unset — using a self-signed identity");
+        Ok(Identity::self_signed(["localhost", "127.0.0.1"])?)
     }
 }

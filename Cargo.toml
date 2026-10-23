@@ -1,10 +1,51 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["shared", "server", "web"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
+
+# Strict on purpose. Findings get fixed in the code, not silenced: there is no
+# `#[allow]` anywhere (`allow_attributes` denies it), and a genuine exception
+# is an `#[expect(..., reason = "...")]`, which fails the build the moment it
+# stops being needed. CI runs clippy with -D warnings.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unused_qualifications = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unreachable_pub = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+undocumented_unsafe_blocks = "warn"
+clone_on_ref_ptr = "warn"
+rc_buffer = "warn"
+str_to_string = "warn"
+if_then_some_else_none = "warn"
+semicolon_if_nothing_returned = "warn"
+redundant_type_annotations = "warn"
+unnecessary_self_imports = "warn"
+verbose_file_reads = "warn"
+lossy_float_literal = "warn"
+float_cmp_const = "warn"
+mem_forget = "warn"
+rest_pat_in_fully_bound_structs = "warn"
 
 [profile.release]
 opt-level = 3

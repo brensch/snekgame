@@ -1024,3 +1024,12 @@ button.ready-switch.on .yes::before {
   from { transform: scale(0.6); }
   to { transform: scale(1); }
 }
+
+/* Not connected: the page is the server's last word, possibly stale. It
+   stays visible, greyed out, and takes no taps until the server is back. */
+.offline {
+  opacity: 0.45;
+  filter: grayscale(1);
+  pointer-events: none;
+  user-select: none;
+}

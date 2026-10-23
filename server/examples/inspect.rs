@@ -1,11 +1,28 @@
-//! Print turns of a stored game. `inspect [game_id] [from] [to]` — defaults
-//! to the last two turns of the most recent game.
-fn main() {
-    let conn = rusqlite::Connection::open("/home/brensch/snekgame/snek.db").unwrap();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+//! Print turns of a stored game.
+//! `inspect [--db path] [game_id] [from] [to]` — the database defaults to
+//! `./snek.db`, the game to the most recent one, and the turns to its last
+//! two.
+use anyhow::Context;
+use std::io::Write;
+
+fn main() -> anyhow::Result<()> {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let db_path = match args.iter().position(|a| a == "--db") {
+        Some(i) => {
+            let path = args.get(i + 1).context("--db needs a path")?.clone();
+            args.drain(i..=i + 1);
+            path
+        }
+        None => "snek.db".to_owned(),
+    };
+    let conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("failed to open {db_path}"))?;
     let want_game: Option<i64> = args.first().and_then(|a| a.parse().ok());
     let range: Option<(u32, u32)> = match (args.get(1), args.get(2)) {
-        (Some(a), Some(b)) => Some((a.parse().unwrap(), b.parse().unwrap())),
+        (Some(a), Some(b)) => Some((
+            a.parse().with_context(|| format!("bad turn number {a}"))?,
+            b.parse().with_context(|| format!("bad turn number {b}"))?,
+        )),
         _ => None,
     };
     let (id, blob): (i64, Vec<u8>) = match want_game {
@@ -15,23 +32,27 @@ fn main() {
                 [g],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .unwrap(),
+            .with_context(|| format!("no game #{g}"))?,
         None => conn
             .query_row(
                 "SELECT id, record_blob FROM games ORDER BY id DESC LIMIT 1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .unwrap(),
+            .context("no games stored")?,
     };
-    let record: snek_shared::GameRecord = postcard::from_bytes(&blob).unwrap();
-    println!(
+    let record: snek_shared::GameRecord =
+        postcard::from_bytes(&blob).with_context(|| format!("game #{id} doesn't decode"))?;
+
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
         "game #{id}, {} turns, config {:?}",
         record.turns.len(),
         record.config
-    );
+    )?;
     for p in &record.players {
-        println!("  {} = {} {}", p.id, p.emoji, p.name);
+        writeln!(out, "  {} = {} {}", p.id, p.emoji, p.name)?;
     }
     let selected: Vec<&snek_shared::Turn> = match range {
         Some((from, to)) => record
@@ -41,28 +62,26 @@ fn main() {
             .collect(),
         None => record.turns.iter().rev().take(2).rev().collect(),
     };
-    let w = record.config.board_width as i32;
+    let w = u16::from(record.config.board_width);
     for turn in selected {
-        println!(
+        writeln!(
+            out,
             "--- turn {} alive={:?} moves={:?}",
             turn.turn_number, turn.alive, turn.moves
-        );
+        )?;
         for (pid, s) in &turn.snakes {
             // Head as (x, y) too: a wall death is only obvious in coordinates.
             let head = s
                 .first()
-                .map(|p| {
-                    let p = *p as i32;
-                    format!(" head=({},{})", p % w, p / w)
-                })
-                .unwrap_or_default();
-            println!("    snake {pid}:{head} {:?}", s);
+                .map_or_else(String::new, |p| format!(" head=({},{})", p % w, p / w));
+            writeln!(out, "    snake {pid}:{head} {s:?}")?;
         }
         for c in &turn.clashes {
-            println!("    clash @{} {:?} {:?}", c.pos, c.reason, c.players);
+            writeln!(out, "    clash @{} {:?} {:?}", c.pos, c.reason, c.players)?;
         }
         if turn.game_over() {
-            println!("    winners: {:?}", turn.winners);
+            writeln!(out, "    winners: {:?}", turn.winners)?;
         }
     }
+    Ok(())
 }

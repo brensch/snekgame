@@ -4,14 +4,15 @@
 //! The list is pushed by the server over WebTransport the moment it changes
 //! (the route effect in app.rs opens the watch connection).
 
+use crate::num;
 use crate::palette;
-use crate::store::{new_session_id, Store};
+use crate::store::{Store, new_session_id};
 use leptos::prelude::*;
 use snek_shared::protocol::SessionSummary;
 
 const PAGE_SIZE: usize = 6;
 
-pub fn home_page() -> impl IntoView {
+pub(crate) fn home_page() -> impl IntoView {
     let store = Store::use_store();
     let sessions = store.sessions;
     let page = RwSignal::new(0usize);
@@ -29,13 +30,10 @@ pub fn home_page() -> impl IntoView {
         crate::net::ensure_session(store, &id);
         // Fallback: if the join is slow, navigate anyway and let the
         // session page's machinery take over.
-        let fallback_id = id.clone();
+        let fallback_id = id;
         gloo_timers::callback::Timeout::new(3_000, move || {
             if creating.try_get_untracked().flatten() == Some(fallback_id.clone()) {
-                let _ = web_sys::window()
-                    .unwrap()
-                    .location()
-                    .set_hash(&format!("#/s/{fallback_id}"));
+                crate::app::navigate(&format!("#/s/{fallback_id}"));
             }
         })
         .forget();
@@ -46,22 +44,20 @@ pub fn home_page() -> impl IntoView {
         let Some(id) = creating.get() else { return };
         let joined = store
             .lobby
-            .with(|l| l.as_ref().map(|l| l.session == id).unwrap_or(false));
+            .with(|l| l.as_ref().is_some_and(|l| l.session == id));
         if joined {
             creating.set(None);
-            let _ = web_sys::window()
-                .unwrap()
-                .location()
-                .set_hash(&format!("#/s/{id}"));
+            crate::app::navigate(&format!("#/s/{id}"));
         }
     });
 
     // tac's RotatingEmoji: the actionish send list, hopping rather than
     // marching so it feels random. (Reduce in u64 — ms-since-epoch overflows
-    // a 32-bit usize cast on wasm.)
+    // a 32-bit usize on wasm.)
     let rotating = move || {
-        let t = (store.now_ms.get() / 400.0) as u64;
-        let i = (t.wrapping_mul(7) % palette::SEND_EMOJIS.len() as u64) as usize;
+        let t = num::to_u64(store.now_ms.get() / 400.0);
+        let len = u64::try_from(palette::SEND_EMOJIS.len()).unwrap_or(u64::MAX);
+        let i = usize::try_from(t.wrapping_mul(7) % len).unwrap_or(0);
         palette::SEND_EMOJIS[i]
     };
 
@@ -74,51 +70,7 @@ pub fn home_page() -> impl IntoView {
                     // Nothing (or nothing yet): no list section at all.
                     None => ().into_any(),
                     Some(list) if list.is_empty() => ().into_any(),
-                    Some(list) => {
-                        let pages = list.len().div_ceil(PAGE_SIZE).max(1);
-                        let p = page.get().min(pages - 1);
-                        let slice: Vec<SessionSummary> = list
-                            .iter()
-                            .skip(p * PAGE_SIZE)
-                            .take(PAGE_SIZE)
-                            .cloned()
-                            .collect();
-                        let count = list.len();
-                        view! {
-                            <h3 class="games-heading">
-                                "Live games " <span class="count">{count}</span>
-                            </h3>
-                            <ul
-                                class="games"
-                                style=format!("--mine: {};", store.profile.get_untracked().colour)
-                            >
-                                {slice.into_iter().map(game_card).collect_view()}
-                            </ul>
-                            {(pages > 1)
-                                .then(|| {
-                                    view! {
-                                        <div class="row" style="margin-top: 8px;">
-                                            <button
-                                                disabled=p == 0
-                                                on:click=move |_| page.update(|v| *v = v.saturating_sub(1))
-                                            >
-                                                "‹ prev"
-                                            </button>
-                                            <span style="text-align: center;">
-                                                {format!("page {} / {}", p + 1, pages)}
-                                            </span>
-                                            <button
-                                                disabled=p + 1 >= pages
-                                                on:click=move |_| page.update(|v| *v += 1)
-                                            >
-                                                "next ›"
-                                            </button>
-                                        </div>
-                                    }
-                                })}
-                        }
-                            .into_any()
-                    }
+                    Some(list) => live_games(&list, page, store).into_any(),
                 }
             }}
 
@@ -153,14 +105,55 @@ pub fn home_page() -> impl IntoView {
     }
 }
 
+/// The live games, a page at a time.
+fn live_games(list: &[SessionSummary], page: RwSignal<usize>, store: Store) -> impl IntoView {
+    let pages = list.len().div_ceil(PAGE_SIZE).max(1);
+    let p = page.get().min(pages - 1);
+    let count = list.len();
+    view! {
+        <h3 class="games-heading">"Live games " <span class="count">{count}</span></h3>
+        <ul class="games" style=format!("--mine: {};", store.profile.get_untracked().colour)>
+            {list
+                .iter()
+                .skip(p * PAGE_SIZE)
+                .take(PAGE_SIZE)
+                .cloned()
+                .map(game_card)
+                .collect_view()}
+        </ul>
+        {(pages > 1)
+            .then(|| {
+                view! {
+                    <div class="row" style="margin-top: 8px;">
+                        <button
+                            disabled=p == 0
+                            on:click=move |_| page.update(|v| *v = v.saturating_sub(1))
+                        >
+                            "‹ prev"
+                        </button>
+                        <span style="text-align: center;">
+                            {format!("page {} / {}", p + 1, pages)}
+                        </span>
+                        <button
+                            disabled=p + 1 >= pages
+                            on:click=move |_| page.update(|v| *v += 1)
+                        >
+                            "next ›"
+                        </button>
+                    </div>
+                }
+            })}
+    }
+}
+
 /// One game in the list. Whose game it is reads first and biggest; whether
 /// you can still get in, and who's in it, sit quietly underneath; the
 /// button says what joining actually does.
 fn game_card(s: SessionSummary) -> impl IntoView {
-    let href = format!("#/s/{}", s.id);
     // Everyone's face, host first, bots last: who's in it at a glance,
     // without counting. A crowd is cut short rather than wrapped.
     const FACES: usize = 6;
+    let href = format!("#/s/{}", s.id);
     let extra = s.emojis.len().saturating_sub(FACES);
     let faces: String = s.emojis.iter().take(FACES).cloned().collect();
     view! {

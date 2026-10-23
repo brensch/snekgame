@@ -13,6 +13,7 @@
 //! postcard bytes, so there is one encoding in the codebase and no shared
 //! state to get wrong.
 
+use crate::num;
 use futures_channel::oneshot;
 use js_sys::{Object, Reflect, Uint8Array};
 use serde::{Deserialize, Serialize};
@@ -58,10 +59,12 @@ struct JobResult {
 /// its deadline and returns the best move found — MCTS is anytime, so the
 /// clock decides when to stop rather than a predicted simulation count.
 #[wasm_bindgen]
+#[expect(
+    unreachable_pub,
+    reason = "wasm_bindgen only exports `pub` functions; this one is reached \
+              from the worker's JS, which rustc can't see"
+)]
 pub fn snek_bot_compute(job: &[u8]) -> Vec<u8> {
-    let Some(job) = postcard::from_bytes::<Job>(job).ok() else {
-        return Vec::new();
-    };
     // Enough work per slice to keep clock checks negligible, small enough
     // to land close to the deadline.
     // The deadline can only be honoured to the granularity of one slice,
@@ -72,6 +75,9 @@ pub fn snek_bot_compute(job: &[u8]) -> Vec<u8> {
     // queued behind it with time for a single slice — a spiral that gets
     // worse exactly as the board gets crowded.
     const TARGET_SLICE_MS: f64 = 4.0;
+    let Some(job) = postcard::from_bytes::<Job>(job).ok() else {
+        return Vec::new();
+    };
     let began_ms = js_sys::Date::now();
     // This worker only ever thinks for one bot, so last turn's tree is
     // usually a head start on this one (begin_from checks it still fits).
@@ -94,12 +100,12 @@ pub fn snek_bot_compute(job: &[u8]) -> Vec<u8> {
         if search.step(slice) {
             break; // nothing left to search
         }
-        sims += slice as u32;
+        sims = sims.saturating_add(u32::try_from(slice).unwrap_or(u32::MAX));
         slices += 1;
         let took = js_sys::Date::now() - before;
         if took > 0.5 {
-            let scaled = slice as f64 * TARGET_SLICE_MS / took;
-            slice = scaled.clamp(8.0, 2_048.0) as usize;
+            let scaled = num::from_count(slice) * TARGET_SLICE_MS / took;
+            slice = num::to_usize(scaled.clamp(8.0, 2_048.0));
         } else if took == 0.0 {
             slice = (slice * 2).min(2_048);
         }
@@ -109,7 +115,7 @@ pub fn snek_bot_compute(job: &[u8]) -> Vec<u8> {
     }
     let (dir, proof) = search.result();
     LAST_SEARCH.with(|l| *l.borrow_mut() = Some(search));
-    let search_ms = (js_sys::Date::now() - began_ms).max(0.0) as u32;
+    let search_ms = num::to_u32(js_sys::Date::now() - began_ms);
     postcard::to_allocvec(&JobResult {
         dir,
         proof,
@@ -183,8 +189,7 @@ fn bundle_urls() -> Option<(String, String)> {
         .ok()
         .flatten()
         .and_then(|l| l.get_attribute("href"))
-        .map(absolute)
-        .unwrap_or_else(|| glue.replace(".js", "_bg.wasm"));
+        .map_or_else(|| glue.replace(".js", "_bg.wasm"), absolute);
     Some((glue, wasm))
 }
 
@@ -192,7 +197,7 @@ fn spawn_worker() -> Option<web_sys::Worker> {
     let (glue, wasm) = bundle_urls()?;
     // A module worker that boots the same bundle and answers jobs.
     let script = format!(
-        r#"let ready = null;
+        r"let ready = null;
 const boot = async () => {{
   const b = await import('{glue}');
   await b.default({{ module_or_path: '{wasm}' }});
@@ -208,7 +213,7 @@ self.onmessage = async (e) => {{
     // Surface the reason instead of dying silently.
     self.postMessage({{ id: e.data.id, error: String((err && err.stack) || err) }});
   }}
-}};"#
+}};"
     );
     let parts = js_sys::Array::of1(&JsValue::from_str(&script));
     let props = web_sys::BlobPropertyBag::new();
@@ -225,8 +230,8 @@ self.onmessage = async (e) => {{
             let data = ev.data();
             let id = Reflect::get(&data, &"id".into())
                 .ok()
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) as u64;
+                .and_then(|v| u64::try_from(v).ok())
+                .unwrap_or(0);
             if let Some(err) = Reflect::get(&data, &"error".into())
                 .ok()
                 .and_then(|v| v.as_string())
@@ -259,14 +264,14 @@ self.onmessage = async (e) => {{
 
 /// Run one bot search on the worker thread. `None` means no worker is
 /// available here and the caller should fall back to the main thread.
-pub async fn compute(
+pub(crate) async fn compute(
     config: GameConfig,
     turn: Turn,
     bot_id: PlayerId,
     think_ms: u32,
     nonce: u64,
 ) -> Option<(Dir, u64, u32, u32, f64, u32)> {
-    if UNAVAILABLE.with(|u| u.get()) {
+    if UNAVAILABLE.with(Cell::get) {
         return None;
     }
     let Some(worker) = worker_for(&bot_id) else {
@@ -276,7 +281,7 @@ pub async fn compute(
 
     // The clock starts now, when the request arrived — not when a worker
     // happens to get to it.
-    let deadline_ms = js_sys::Date::now() + think_ms as f64;
+    let deadline_ms = js_sys::Date::now() + f64::from(think_ms);
     let job = postcard::to_allocvec(&Job {
         config,
         turn,
@@ -295,7 +300,9 @@ pub async fn compute(
     PENDING.with(|p| p.borrow_mut().insert(id, tx));
 
     let msg = Object::new();
-    let _ = Reflect::set(&msg, &"id".into(), &JsValue::from_f64(id as f64));
+    // A BigInt, so the id survives the round trip whole; the worker only
+    // echoes it back.
+    let _ = Reflect::set(&msg, &"id".into(), &JsValue::from(id));
     let _ = Reflect::set(&msg, &"job".into(), &Uint8Array::from(job.as_slice()));
     if worker.post_message(&msg).is_err() {
         PENDING.with(|p| p.borrow_mut().remove(&id));
@@ -305,18 +312,15 @@ pub async fn compute(
 
     // A worker that goes quiet must not strand the caller forever: time it
     // out and rebuild it on the next request.
-    let bytes = match futures_util::future::select(
+    let futures_util::future::Either::Left((Ok(bytes), _)) = futures_util::future::select(
         rx,
         Box::pin(gloo_timers::future::TimeoutFuture::new(WORKER_TIMEOUT_MS)),
     )
     .await
-    {
-        futures_util::future::Either::Left((Ok(bytes), _)) => bytes,
-        _ => {
-            PENDING.with(|p| p.borrow_mut().remove(&id));
-            WORKERS.with(|w| w.borrow_mut().clear());
-            return None;
-        }
+    else {
+        PENDING.with(|p| p.borrow_mut().remove(&id));
+        WORKERS.with(|w| w.borrow_mut().clear());
+        return None;
     };
     if bytes.is_empty() {
         return None;

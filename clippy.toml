@@ -1,0 +1,7 @@
+# Tests may unwrap, expect and panic: a failed assumption in a test is
+# exactly what should end it, loudly.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = true

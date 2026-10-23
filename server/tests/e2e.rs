@@ -2,8 +2,13 @@
 //! ready up, play a game via datagram snapshots, and the finished game lands
 //! in sqlite and the history API.
 
+// All of this file is test code, rig helpers included, so it gets the test
+// rules from clippy.toml: a failed assumption anywhere here should end the
+// test, loudly.
+#![cfg(test)]
+
 use snek_shared::protocol::*;
-use snek_shared::{Dir, GameConfig};
+use snek_shared::{Dir, GameConfig, PlayerId, Turn};
 use std::time::Duration;
 use wtransport::{ClientConfig, Connection, Endpoint, Identity, RecvStream, SendStream};
 
@@ -17,17 +22,16 @@ struct Client {
 
 fn info(name: &str) -> ProfileInfo {
     ProfileInfo {
-        name: name.to_string(),
-        emoji: "🐍".to_string(),
-        colour: "hsl(120, 85%, 60%)".to_string(),
+        name: name.to_owned(),
+        emoji: "🐍".to_owned(),
+        colour: "hsl(120, 85%, 60%)".to_owned(),
     }
 }
 
 async fn write_frame(send: &mut SendStream, msg: &ClientMsg) {
     let bytes = encode(msg);
-    send.write_all(&(bytes.len() as u32).to_le_bytes())
-        .await
-        .unwrap();
+    let len = u32::try_from(bytes.len()).unwrap();
+    send.write_all(&len.to_le_bytes()).await.unwrap();
     send.write_all(&bytes).await.unwrap();
 }
 
@@ -49,7 +53,7 @@ async fn read_exact(recv: &mut RecvStream, buf: &mut [u8]) {
 }
 
 impl Client {
-    async fn connect(port: u16, session: &str, secret: &str, profile: ProfileInfo) -> Client {
+    async fn connect(port: u16, session: &str, secret: &str, profile: ProfileInfo) -> Self {
         let config = ClientConfig::builder()
             .with_bind_default()
             .with_no_cert_validation()
@@ -64,8 +68,8 @@ impl Client {
             &mut send,
             &ClientMsg::Join {
                 version: PROTOCOL_VERSION,
-                session: session.to_string(),
-                secret: secret.to_string(),
+                session: session.to_owned(),
+                secret: secret.to_owned(),
                 profile,
             },
         )
@@ -84,14 +88,14 @@ impl Client {
         let dgram_conn = conn.clone();
         tokio::spawn(async move {
             while let Ok(dgram) = dgram_conn.receive_datagram().await {
-                if let Some(msg) = decode::<ServerMsg>(&dgram) {
-                    if tx.send(msg).is_err() {
-                        break;
-                    }
+                if let Some(msg) = decode::<ServerMsg>(&dgram)
+                    && tx.send(msg).is_err()
+                {
+                    break;
                 }
             }
         });
-        Client {
+        Self {
             conn,
             seen_requests: std::collections::HashSet::new(),
             send,
@@ -101,6 +105,38 @@ impl Client {
 
     async fn control(&mut self, msg: &ClientMsg) {
         write_frame(&mut self.send, msg).await;
+    }
+
+    /// Answer a compute request the way a healthy phone would: a real (if
+    /// small) search, reported as quick and unremarkable.
+    async fn answer_promptly(
+        &mut self,
+        request_id: u64,
+        bot_id: &PlayerId,
+        config: &GameConfig,
+        turn: &Turn,
+        nonce: u64,
+    ) {
+        let mut search = snek_shared::bot::begin(config, turn, bot_id, 200, nonce);
+        while !search.step(64) {}
+        let (dir, _) = search.result();
+        let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
+        self.control(&ClientMsg::BotMove {
+            request_id,
+            dir,
+            proof,
+            tm: ComputeTelemetry {
+                queue_ms: 0,
+                search_ms: 10,
+                total_ms: 10,
+                think_ms: 100,
+                sims: 200,
+                slices: 3,
+                fallback: false,
+                loop_lag_ms: 0,
+            },
+        })
+        .await;
     }
 
     /// Next message from either the control stream or a datagram.
@@ -116,35 +152,42 @@ impl Client {
                 .await
                 .expect("timed out waiting for server message")
                 .expect("connection closed");
-            if let ServerMsg::ComputeRequest { request_id, .. } = &msg {
-                if !self.seen_requests.insert(*request_id) {
-                    continue;
-                }
+            if let ServerMsg::ComputeRequest { request_id, .. } = &msg
+                && !self.seen_requests.insert(*request_id)
+            {
+                continue;
             }
             return msg;
         }
     }
 }
 
-#[tokio::test]
-async fn two_players_play_a_full_game() {
-    let dir = std::env::temp_dir().join(format!("snek-e2e-{}", std::process::id()));
+/// A fresh server over its own empty database (`snek-<name>-<pid>` in the
+/// temp dir), with WebTransport already listening on an ephemeral UDP port
+/// under a self-signed identity. Returns the HTTP app, for the tests that
+/// serve it, and the WebTransport port.
+fn start_server(name: &str) -> (axum::Router, u16) {
+    let dir = std::env::temp_dir().join(format!("snek-{name}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("test.db");
+    let db_path = dir.join(format!("{name}.db"));
     let _ = std::fs::remove_file(&db_path);
 
-    let (app, registry) = snek_server::build(&db_path);
+    let (app, registry) = snek_server::build(&db_path).unwrap();
+    let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+    (app, wt_port)
+}
+
+#[tokio::test]
+async fn two_players_play_a_full_game() {
+    let (app, wt_port) = start_server("e2e");
 
     // HTTP on an ephemeral port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_port = listener.local_addr().unwrap().port();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    // WebTransport on an ephemeral UDP port with a self-signed identity.
-    let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
 
     let mut alice = Client::connect(wt_port, "e2e-test", "alice-secret-0000", info("alice")).await;
     let mut bob = Client::connect(wt_port, "e2e-test", "bob-secret-000000", info("bob")).await;
@@ -160,11 +203,11 @@ async fn two_players_play_a_full_game() {
     // Both must appear in the lobby.
     let mut seen_both = false;
     for _ in 0..10 {
-        if let ServerMsg::Lobby(l) = bob.next_msg().await {
-            if l.players.len() == 2 {
-                seen_both = true;
-                break;
-            }
+        if let ServerMsg::Lobby(l) = bob.next_msg().await
+            && l.players.len() == 2
+        {
+            seen_both = true;
+            break;
         }
     }
     assert!(seen_both, "lobby never showed both players");
@@ -174,7 +217,7 @@ async fn two_players_play_a_full_game() {
             board_width: 11,
             board_height: 11,
             tick_ms: 250,
-            food_emoji: "🍕".to_string(),
+            food_emoji: "🍕".to_owned(),
         }))
         .await;
     alice.control(&ClientMsg::SetReady(true)).await;
@@ -182,10 +225,10 @@ async fn two_players_play_a_full_game() {
     // Different connections have no cross-ordering: wait until the lobby
     // echoes both ready before starting.
     for _ in 0..10 {
-        if let ServerMsg::Lobby(l) = alice.next_msg().await {
-            if l.ready.len() == 2 {
-                break;
-            }
+        if let ServerMsg::Lobby(l) = alice.next_msg().await
+            && l.ready.len() == 2
+        {
+            break;
         }
     }
     alice.control(&ClientMsg::Start).await;
@@ -240,8 +283,9 @@ async fn two_players_play_a_full_game() {
     // History API serves the finished game.
     let body = http_get(http_port, "/api/history").await;
     assert!(body.contains("alice"), "history list missing players");
-    let blob = http_get_bytes(http_port, &format!("/api/history/{saved_id}")).await;
-    let record: snek_shared::GameRecord = postcard::from_bytes(&blob).expect("decode record");
+    let record_bytes = http_get_bytes(http_port, &format!("/api/history/{saved_id}")).await;
+    let record: snek_shared::GameRecord =
+        postcard::from_bytes(&record_bytes).expect("decode record");
     assert_eq!(record.players.len(), 2);
     let last = record.turns.last().expect("record has turns");
     assert!(last.game_over(), "game never ended");
@@ -264,16 +308,7 @@ async fn two_players_play_a_full_game() {
 
 #[tokio::test]
 async fn watch_games_pushes_list() {
-    let dir = std::env::temp_dir().join(format!("snek-watch-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("watch.db");
-    let _ = std::fs::remove_file(&db_path);
-
-    let (_, registry) = snek_server::build(&db_path);
-    let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+    let (_, wt_port) = start_server("watch");
 
     // Watcher connects first and gets an (empty) list.
     let config = ClientConfig::builder()
@@ -337,16 +372,7 @@ async fn http_get_bytes(port: u16, path: &str) -> Vec<u8> {
 
 #[tokio::test]
 async fn distributed_compute_round_trip() {
-    let dir = std::env::temp_dir().join(format!("snek-dist-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("dist.db");
-    let _ = std::fs::remove_file(&db_path);
-
-    let (_, registry) = snek_server::build(&db_path);
-    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+    let (_, wt_port) = start_server("dist");
 
     let mut alice = Client::connect(wt_port, "dist-test", "alice-secret-0000", info("alice")).await;
     // Fast board so the game resolves quickly.
@@ -355,14 +381,14 @@ async fn distributed_compute_round_trip() {
             board_width: 11,
             board_height: 11,
             tick_ms: 250,
-            food_emoji: "🍕".to_string(),
+            food_emoji: "🍕".to_owned(),
         }))
         .await;
     // Become a compute host, add a bot, go.
     alice
         .control(&ClientMsg::Benchmark {
             sims_per_sec: 50_000,
-            device: "e2e test rig".to_string(),
+            device: "e2e test rig".to_owned(),
             cores: 8,
         })
         .await;
@@ -388,7 +414,8 @@ async fn distributed_compute_round_trip() {
                 compute_requests += 1;
                 // What the browser does: search until the deadline, then
                 // answer with the nonce+request binding checksum.
-                let deadline = std::time::Instant::now() + Duration::from_millis(think_ms as u64);
+                let deadline =
+                    std::time::Instant::now() + Duration::from_millis(u64::from(think_ms));
                 let mut search = snek_shared::bot::begin(&config, &turn, &bot_id, u32::MAX, nonce);
                 let mut sims = 0u32;
                 while !search.step(128) {
@@ -404,7 +431,7 @@ async fn distributed_compute_round_trip() {
                         request_id,
                         dir,
                         proof,
-                        tm: snek_shared::protocol::ComputeTelemetry {
+                        tm: ComputeTelemetry {
                             queue_ms: 0,
                             search_ms: think_ms.max(1),
                             total_ms: think_ms.max(1),
@@ -442,18 +469,9 @@ async fn distributed_compute_round_trip() {
 /// Cadence measurement (ignored by default; run with --ignored): turn
 /// snapshots must arrive on a steady beat, not "period + processing time".
 #[tokio::test]
-#[ignore]
+#[ignore = "timing measurement, too sensitive to machine load to gate on; run with --ignored"]
 async fn tick_cadence_is_steady() {
-    let dir = std::env::temp_dir().join(format!("snek-cadence-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("cadence.db");
-    let _ = std::fs::remove_file(&db_path);
-
-    let (_, registry) = snek_server::build(&db_path);
-    let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+    let (_, wt_port) = start_server("cadence");
 
     let mut alice = Client::connect(wt_port, "cad-test", "alice-secret-0000", info("alice")).await;
     alice
@@ -461,7 +479,7 @@ async fn tick_cadence_is_steady() {
             board_width: 17,
             board_height: 17,
             tick_ms: 500,
-            food_emoji: "🍕".to_string(),
+            food_emoji: "🍕".to_owned(),
         }))
         .await;
     // A bot adds per-tick work (request issuance) without needing a host.
@@ -498,7 +516,7 @@ async fn tick_cadence_is_steady() {
         .windows(2)
         .map(|w| w[1].duration_since(w[0]).as_secs_f64() * 1000.0)
         .collect();
-    let mean = deltas.iter().sum::<f64>() / deltas.len() as f64;
+    let mean = deltas.iter().sum::<f64>() / f64::from(u32::try_from(deltas.len()).unwrap());
     let max_dev = deltas
         .iter()
         .map(|d| (d - 500.0).abs())
@@ -515,16 +533,7 @@ async fn tick_cadence_is_steady() {
 /// the device wakes.
 #[tokio::test]
 async fn sleeping_host_pauses_the_game() {
-    let dir = std::env::temp_dir().join(format!("snek-sleep-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("sleep.db");
-    let _ = std::fs::remove_file(&db_path);
-
-    let (_, registry) = snek_server::build(&db_path);
-    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+    let (_, wt_port) = start_server("sleep");
 
     let mut alice =
         Client::connect(wt_port, "sleep-test", "alice-secret-0000", info("alice")).await;
@@ -533,13 +542,13 @@ async fn sleeping_host_pauses_the_game() {
             board_width: 11,
             board_height: 11,
             tick_ms: 200,
-            food_emoji: "🍕".to_string(),
+            food_emoji: "🍕".to_owned(),
         }))
         .await;
     alice
         .control(&ClientMsg::Benchmark {
             sims_per_sec: 50_000,
-            device: "sleepy phone".to_string(),
+            device: "sleepy phone".to_owned(),
             cores: 8,
         })
         .await;
@@ -562,30 +571,12 @@ async fn sleeping_host_pauses_the_game() {
                 nonce,
                 ..
             }) => {
-                let mut search = snek_shared::bot::begin(&config, &turn, &bot_id, 200, nonce);
-                while !search.step(64) {}
-                let (dir, _) = search.result();
-                let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
                 alice
-                    .control(&ClientMsg::BotMove {
-                        request_id,
-                        dir,
-                        proof,
-                        tm: snek_shared::protocol::ComputeTelemetry {
-                            queue_ms: 0,
-                            search_ms: 10,
-                            total_ms: 10,
-                            think_ms: 100,
-                            sims: 200,
-                            slices: 3,
-                            fallback: false,
-                            loop_lag_ms: 0,
-                        },
-                    })
+                    .answer_promptly(request_id, &bot_id, &config, &turn, nonce)
                     .await;
             }
             Ok(_) => {}
-            Err(_) => panic!("game never got going"),
+            Err(tokio::time::error::Elapsed { .. }) => panic!("game never got going"),
         }
     }
 
@@ -602,10 +593,10 @@ async fn sleeping_host_pauses_the_game() {
     let deadline = std::time::Instant::now() + Duration::from_millis(1_500);
     while std::time::Instant::now() < deadline {
         alice.control(&ClientMsg::Ping(1)).await;
-        match tokio::time::timeout(Duration::from_millis(400), alice.next_msg()).await {
-            Ok(ServerMsg::Turn(_)) => after_sleep += 1,
-            Ok(_) => {}
-            Err(_) => {}
+        if let Ok(ServerMsg::Turn(_)) =
+            tokio::time::timeout(Duration::from_millis(400), alice.next_msg()).await
+        {
+            after_sleep += 1;
         }
     }
     assert!(
@@ -633,30 +624,11 @@ async fn sleeping_host_pauses_the_game() {
                 nonce,
                 ..
             }) => {
-                let mut search = snek_shared::bot::begin(&config, &turn, &bot_id, 200, nonce);
-                while !search.step(64) {}
-                let (dir, _) = search.result();
-                let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
                 alice
-                    .control(&ClientMsg::BotMove {
-                        request_id,
-                        dir,
-                        proof,
-                        tm: snek_shared::protocol::ComputeTelemetry {
-                            queue_ms: 0,
-                            search_ms: 10,
-                            total_ms: 10,
-                            think_ms: 100,
-                            sims: 200,
-                            slices: 3,
-                            fallback: false,
-                            loop_lag_ms: 0,
-                        },
-                    })
+                    .answer_promptly(request_id, &bot_id, &config, &turn, nonce)
                     .await;
             }
-            Ok(_) => {}
-            Err(_) => {}
+            _ => {}
         }
     }
     assert!(resumed, "game never resumed after the device woke up");
@@ -668,16 +640,7 @@ async fn sleeping_host_pauses_the_game() {
 /// requests, produces no other traffic, and the game stays paused forever.
 #[tokio::test]
 async fn a_silent_host_recovers_on_keepalives_alone() {
-    let dir = std::env::temp_dir().join(format!("snek-revive-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("revive.db");
-    let _ = std::fs::remove_file(&db_path);
-
-    let (_, registry) = snek_server::build(&db_path);
-    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+    let (_, wt_port) = start_server("revive");
 
     let mut alice =
         Client::connect(wt_port, "revive-test", "alice-secret-0000", info("alice")).await;
@@ -686,13 +649,13 @@ async fn a_silent_host_recovers_on_keepalives_alone() {
             board_width: 11,
             board_height: 11,
             tick_ms: 200,
-            food_emoji: "🍕".to_string(),
+            food_emoji: "🍕".to_owned(),
         }))
         .await;
     alice
         .control(&ClientMsg::Benchmark {
             sims_per_sec: 50_000,
-            device: "stalling phone".to_string(),
+            device: "stalling phone".to_owned(),
             cores: 8,
         })
         .await;
@@ -707,10 +670,10 @@ async fn a_silent_host_recovers_on_keepalives_alone() {
     let mut turns_seen = 0u32;
     let deadline = std::time::Instant::now() + Duration::from_secs(6);
     while std::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(300), alice.next_msg()).await {
-            Ok(ServerMsg::Turn(_)) => turns_seen += 1,
-            Ok(_) => {}
-            Err(_) => {}
+        if let Ok(ServerMsg::Turn(_)) =
+            tokio::time::timeout(Duration::from_millis(300), alice.next_msg()).await
+        {
+            turns_seen += 1;
         }
     }
     let paused_at = turns_seen;
@@ -730,11 +693,10 @@ async fn a_silent_host_recovers_on_keepalives_alone() {
     let mut resumed = 0u32;
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
     while std::time::Instant::now() < deadline && resumed == 0 {
-        match tokio::time::timeout(Duration::from_millis(300), alice.next_msg()).await {
-            Ok(ServerMsg::Turn(_)) => resumed += 1,
-            Ok(ServerMsg::ComputeRequest { .. }) => resumed += 1,
-            Ok(_) => {}
-            Err(_) => {}
+        if let Ok(ServerMsg::Turn(_) | ServerMsg::ComputeRequest { .. }) =
+            tokio::time::timeout(Duration::from_millis(300), alice.next_msg()).await
+        {
+            resumed += 1;
         }
     }
     assert!(
@@ -750,16 +712,7 @@ async fn a_silent_host_recovers_on_keepalives_alone() {
 /// never shrank, and the device kept being overcommitted every single turn.
 #[tokio::test]
 async fn answering_late_shrinks_the_thinking_window() {
-    let dir = std::env::temp_dir().join(format!("snek-late-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("late.db");
-    let _ = std::fs::remove_file(&db_path);
-
-    let (_, registry) = snek_server::build(&db_path);
-    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+    let (_, wt_port) = start_server("late");
 
     let mut alice = Client::connect(wt_port, "late-test", "alice-secret-0000", info("alice")).await;
     alice
@@ -767,13 +720,13 @@ async fn answering_late_shrinks_the_thinking_window() {
             board_width: 11,
             board_height: 11,
             tick_ms: 200,
-            food_emoji: "🍕".to_string(),
+            food_emoji: "🍕".to_owned(),
         }))
         .await;
     alice
         .control(&ClientMsg::Benchmark {
             sims_per_sec: 50_000,
-            device: "struggling phone".to_string(),
+            device: "struggling phone".to_owned(),
             cores: 8,
         })
         .await;
@@ -788,51 +741,48 @@ async fn answering_late_shrinks_the_thinking_window() {
     let mut answered = 0u32;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline && answered < 6 {
-        match tokio::time::timeout(Duration::from_millis(500), alice.next_msg()).await {
-            Ok(ServerMsg::ComputeRequest {
-                request_id,
-                bot_id,
-                config,
-                turn,
-                think_ms,
-                nonce,
-                ..
-            }) => {
-                if first_window == 0 {
-                    first_window = think_ms;
-                }
-                last_window = think_ms;
-                answered += 1;
-                // A phone that overshoots its deadline every time: the
-                // answer is correct but lands after the tick has gone.
-                let mut search = snek_shared::bot::begin(&config, &turn, &bot_id, 64, nonce);
-                while !search.step(64) {}
-                let (dir, _) = search.result();
-                let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
-                // Overshoot the window by enough that the tick it belonged
-                // to has certainly resolved, whatever cadence the server
-                // settled on.
-                tokio::time::sleep(Duration::from_millis(think_ms as u64 + 700)).await;
-                alice
-                    .control(&ClientMsg::BotMove {
-                        request_id,
-                        dir,
-                        proof,
-                        tm: snek_shared::protocol::ComputeTelemetry {
-                            queue_ms: 300,
-                            search_ms: 50,
-                            total_ms: think_ms + 700,
-                            think_ms,
-                            sims: 64,
-                            slices: 1,
-                            fallback: false,
-                            loop_lag_ms: 0,
-                        },
-                    })
-                    .await;
+        if let Ok(ServerMsg::ComputeRequest {
+            request_id,
+            bot_id,
+            config,
+            turn,
+            think_ms,
+            nonce,
+            ..
+        }) = tokio::time::timeout(Duration::from_millis(500), alice.next_msg()).await
+        {
+            if first_window == 0 {
+                first_window = think_ms;
             }
-            Ok(_) => {}
-            Err(_) => {}
+            last_window = think_ms;
+            answered += 1;
+            // A phone that overshoots its deadline every time: the
+            // answer is correct but lands after the tick has gone.
+            let mut search = snek_shared::bot::begin(&config, &turn, &bot_id, 64, nonce);
+            while !search.step(64) {}
+            let (dir, _) = search.result();
+            let proof = snek_shared::bot::bind_proof(nonce, request_id, dir);
+            // Overshoot the window by enough that the tick it belonged
+            // to has certainly resolved, whatever cadence the server
+            // settled on.
+            tokio::time::sleep(Duration::from_millis(u64::from(think_ms) + 700)).await;
+            alice
+                .control(&ClientMsg::BotMove {
+                    request_id,
+                    dir,
+                    proof,
+                    tm: ComputeTelemetry {
+                        queue_ms: 300,
+                        search_ms: 50,
+                        total_ms: think_ms + 700,
+                        think_ms,
+                        sims: 64,
+                        slices: 1,
+                        fallback: false,
+                        loop_lag_ms: 0,
+                    },
+                })
+                .await;
         }
     }
     assert!(
@@ -855,16 +805,7 @@ async fn answering_late_shrinks_the_thinking_window() {
 /// flight.
 #[tokio::test]
 async fn the_thinking_window_is_at_most_half_the_tick() {
-    let dir = std::env::temp_dir().join(format!("snek-window-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("window.db");
-    let _ = std::fs::remove_file(&db_path);
-
-    let (_, registry) = snek_server::build(&db_path);
-    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+    let (_, wt_port) = start_server("window");
 
     let mut alice =
         Client::connect(wt_port, "window-test", "alice-secret-0000", info("alice")).await;
@@ -874,13 +815,13 @@ async fn the_thinking_window_is_at_most_half_the_tick() {
             board_width: 11,
             board_height: 11,
             tick_ms,
-            food_emoji: "🍕".to_string(),
+            food_emoji: "🍕".to_owned(),
         }))
         .await;
     alice
         .control(&ClientMsg::Benchmark {
             sims_per_sec: 500_000,
-            device: "fast phone".to_string(),
+            device: "fast phone".to_owned(),
             cores: 16,
         })
         .await;
@@ -913,16 +854,7 @@ async fn the_thinking_window_is_at_most_half_the_tick() {
 /// is what the game is played and recorded with.
 #[tokio::test]
 async fn pausing_holds_the_game_and_food_is_recorded() {
-    let dir = std::env::temp_dir().join(format!("snek-pause-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("pause.db");
-    let _ = std::fs::remove_file(&db_path);
-
-    let (_, registry) = snek_server::build(&db_path);
-    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+    let (_, wt_port) = start_server("pause");
 
     let mut alice =
         Client::connect(wt_port, "pause-test", "alice-secret-0000", info("alice")).await;
@@ -931,7 +863,7 @@ async fn pausing_holds_the_game_and_food_is_recorded() {
             board_width: 11,
             board_height: 11,
             tick_ms: 250,
-            food_emoji: "🌮".to_string(),
+            food_emoji: "🌮".to_owned(),
         }))
         .await;
     alice.control(&ClientMsg::SetReady(true)).await;
@@ -947,8 +879,7 @@ async fn pausing_holds_the_game_and_food_is_recorded() {
         match tokio::time::timeout(Duration::from_millis(600), alice.next_msg()).await {
             Ok(ServerMsg::Turn(_)) => turns += 1,
             Ok(ServerMsg::GameStart { config, .. }) => saw_food = Some(config.food_emoji),
-            Ok(_) => {}
-            Err(_) => {}
+            _ => {}
         }
     }
     assert_eq!(
@@ -964,10 +895,10 @@ async fn pausing_holds_the_game_and_food_is_recorded() {
     while std::time::Instant::now() < deadline {
         // Traffic while held must not sneak the clock back on.
         alice.control(&ClientMsg::Ping(3)).await;
-        match tokio::time::timeout(Duration::from_millis(300), alice.next_msg()).await {
-            Ok(ServerMsg::Turn(_)) => while_held += 1,
-            Ok(_) => {}
-            Err(_) => {}
+        if let Ok(ServerMsg::Turn(_)) =
+            tokio::time::timeout(Duration::from_millis(300), alice.next_msg()).await
+        {
+            while_held += 1;
         }
     }
     assert!(
@@ -1016,9 +947,9 @@ fn a_compute_request_fits_in_one_datagram() {
         board_width: 13,
         board_height: 13,
         tick_ms: 500,
-        food_emoji: "🍩".to_string(),
+        food_emoji: "🍩".to_owned(),
     };
-    let ids: Vec<snek_shared::PlayerId> = (0..4).map(|i| format!("bot-{i}")).collect();
+    let ids: Vec<PlayerId> = (0..4).map(|i| format!("bot-{i}")).collect();
     let mut engine = snek_shared::Engine::new(config.clone(), ids.clone(), 7);
     let mut turn = engine.first_turn();
     // Grow everyone to a realistic late-game length.
@@ -1030,7 +961,7 @@ fn a_compute_request_fits_in_one_datagram() {
     let msg = ServerMsg::ComputeRequest {
         request_id: u64::MAX,
         bot_id: ids[0].clone(),
-        bot_name: "a reasonably long bot name".to_string(),
+        bot_name: "a reasonably long bot name".to_owned(),
         config,
         turn,
         think_ms: 250,
@@ -1053,16 +984,7 @@ fn a_compute_request_fits_in_one_datagram() {
 /// went with it, and you rejoined as somebody new.
 #[tokio::test]
 async fn a_dropped_connection_keeps_its_seat() {
-    let dir = std::env::temp_dir().join(format!("snek-seat-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("seat.db");
-    let _ = std::fs::remove_file(&db_path);
-
-    let (_, registry) = snek_server::build(&db_path);
-    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+    let (_, wt_port) = start_server("seat");
 
     let alice_secret = "alice-secret-0000";
     let mut alice = Client::connect(wt_port, "seat-test", alice_secret, info("alice")).await;
@@ -1077,12 +999,10 @@ async fn a_dropped_connection_keeps_its_seat() {
         while std::time::Instant::now() < deadline && found.is_none() {
             if let Ok(ServerMsg::Lobby(lobby)) =
                 tokio::time::timeout(Duration::from_millis(500), bob.next_msg()).await
+                && let Some(p) = lobby.players.iter().find(|p| p.name == "alice")
+                && lobby.ready.contains(&p.id)
             {
-                if let Some(p) = lobby.players.iter().find(|p| p.name == "alice") {
-                    if lobby.ready.contains(&p.id) {
-                        found = Some(p.id.clone());
-                    }
-                }
+                found = Some(p.id.clone());
             }
         }
         found.expect("alice never showed up ready")
@@ -1093,7 +1013,7 @@ async fn a_dropped_connection_keeps_its_seat() {
 
     // Bob keeps watching: alice must still be there, and still ready.
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
-    let mut last: Option<snek_shared::protocol::LobbyState> = None;
+    let mut last: Option<LobbyState> = None;
     while std::time::Instant::now() < deadline {
         if let Ok(ServerMsg::Lobby(lobby)) =
             tokio::time::timeout(Duration::from_millis(500), bob.next_msg()).await
@@ -1135,19 +1055,10 @@ async fn a_dropped_connection_keeps_its_seat() {
 /// session…" is what a stale page did instead.
 #[tokio::test]
 async fn a_stale_client_is_told_to_refresh() {
-    let dir = std::env::temp_dir().join(format!("snek-stale-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("stale.db");
-    let _ = std::fs::remove_file(&db_path);
+    let (_, wt_port) = start_server("stale");
 
-    let (_, registry) = snek_server::build(&db_path);
-    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
-
-    let conn = wtransport::Endpoint::client(
-        wtransport::ClientConfig::builder()
+    let conn = Endpoint::client(
+        ClientConfig::builder()
             .with_bind_default()
             .with_no_cert_validation()
             .build(),
@@ -1161,9 +1072,9 @@ async fn a_stale_client_is_told_to_refresh() {
     write_frame(
         &mut send,
         &ClientMsg::Join {
-            version: snek_shared::protocol::PROTOCOL_VERSION - 1,
-            session: "stale-test".to_string(),
-            secret: "stale-secret-0000".to_string(),
+            version: PROTOCOL_VERSION - 1,
+            session: "stale-test".to_owned(),
+            secret: "stale-secret-0000".to_owned(),
             profile: info("stale"),
         },
     )
@@ -1181,21 +1092,25 @@ async fn a_stale_client_is_told_to_refresh() {
     }
 }
 
+/// Whether `c` is dealt into a game within ten seconds.
+async fn started(c: &mut Client) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if let Ok(ServerMsg::GameStart { .. }) =
+            tokio::time::timeout(Duration::from_millis(500), c.next_msg()).await
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Readying up after a game starts the next one, exactly as it does in the
 /// lobby — the end screen offers the same decision, so it must work the
 /// same way.
 #[tokio::test]
 async fn readying_up_after_a_game_starts_another() {
-    let dir = std::env::temp_dir().join(format!("snek-again-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("again.db");
-    let _ = std::fs::remove_file(&db_path);
-
-    let (_, registry) = snek_server::build(&db_path);
-    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+    let (_, wt_port) = start_server("again");
 
     let mut alice =
         Client::connect(wt_port, "again-test", "alice-secret-0000", info("alice")).await;
@@ -1205,7 +1120,7 @@ async fn readying_up_after_a_game_starts_another() {
             board_width: 7,
             board_height: 7,
             tick_ms: 250,
-            food_emoji: "🍕".to_string(),
+            food_emoji: "🍕".to_owned(),
         }))
         .await;
     alice.control(&ClientMsg::SetReady(true)).await;
@@ -1230,17 +1145,6 @@ async fn readying_up_after_a_game_starts_another() {
     alice.control(&ClientMsg::Start).await;
 
     // Both must be dealt into it.
-    async fn started(c: &mut Client) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if let Ok(ServerMsg::GameStart { .. }) =
-                tokio::time::timeout(Duration::from_millis(500), c.next_msg()).await
-            {
-                return true;
-            }
-        }
-        false
-    }
     assert!(
         started(&mut alice).await,
         "the player who started it wasn't dealt in"
@@ -1251,21 +1155,26 @@ async fn readying_up_after_a_game_starts_another() {
     );
 }
 
+/// Waits for the first lobby that passes `want`.
+async fn lobby_where(c: &mut Client, want: impl Fn(&LobbyState) -> bool) -> LobbyState {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if let Ok(ServerMsg::Lobby(l)) =
+            tokio::time::timeout(Duration::from_millis(500), c.next_msg()).await
+            && want(&l)
+        {
+            return l;
+        }
+    }
+    panic!("no such lobby arrived");
+}
+
 /// The lobby says who last changed the settings, so a ready that silently
 /// flips back to "no" has a name attached. Picking what is already picked
 /// is not a change: it claims nothing and un-readies nobody.
 #[tokio::test]
 async fn the_lobby_says_who_changed_the_settings() {
-    let dir = std::env::temp_dir().join(format!("snek-cfg-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("cfg.db");
-    let _ = std::fs::remove_file(&db_path);
-
-    let (_, registry) = snek_server::build(&db_path);
-    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
-    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
-    let wt_port = endpoint.local_addr().unwrap().port();
-    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+    let (_, wt_port) = start_server("cfg");
 
     let mut alice = Client::connect(wt_port, "cfg-test", "alice-secret-0000", info("alice")).await;
     let mut bob = Client::connect(wt_port, "cfg-test", "bob-secret-000000", info("bob")).await;
@@ -1273,21 +1182,6 @@ async fn the_lobby_says_who_changed_the_settings() {
         ServerMsg::Welcome { your_id } => your_id,
         other => panic!("expected welcome, got {other:?}"),
     };
-
-    // Waits for the first lobby that passes `want`.
-    async fn lobby_where(c: &mut Client, want: impl Fn(&LobbyState) -> bool) -> LobbyState {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if let Ok(ServerMsg::Lobby(l)) =
-                tokio::time::timeout(Duration::from_millis(500), c.next_msg()).await
-            {
-                if want(&l) {
-                    return l;
-                }
-            }
-        }
-        panic!("no such lobby arrived");
-    }
 
     let fresh = lobby_where(&mut alice, |l| l.players.len() == 2).await;
     assert_eq!(fresh.config_changed_by, None);
@@ -1300,7 +1194,7 @@ async fn the_lobby_says_who_changed_the_settings() {
     bob.control(&ClientMsg::Configure(config.clone())).await;
     // Bob changes the food: his name goes on it and alice is un-readied.
     let changed = GameConfig {
-        food_emoji: "🍕".to_string(),
+        food_emoji: "🍕".to_owned(),
         ..config
     };
     bob.control(&ClientMsg::Configure(changed.clone())).await;
