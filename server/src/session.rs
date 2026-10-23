@@ -15,7 +15,8 @@ use snek_shared::protocol::{
     ServerMsg, SessionSummary, encode, valid_game_name,
 };
 use snek_shared::{
-    BotDifficulty, Dir, Engine, GameConfig, GameRecord, PlayerId, PlayerProfile, Turn, Winner, bot,
+    BotDifficulty, CEREBRAL_BOT_MS, Dir, Engine, GameConfig, GameRecord, PlayerId, PlayerProfile,
+    Turn, Winner, bot,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -324,6 +325,10 @@ struct RunningGame {
     /// Per-connection compute contributions this game.
     compute: HashMap<u64, ComputeAccum>,
     started_at_ms: i64,
+    /// When the turn on the board started taking moves: the end of the
+    /// countdown, the end of a resume, or the last tick. A cerebral turn
+    /// never goes before it, and gives its bots a second from it.
+    opened: Instant,
 }
 
 struct SessionActor {
@@ -623,11 +628,15 @@ impl SessionActor {
             ClientMsg::SetPaused(true) => self.pause(player),
             ClientMsg::SetPaused(false) => self.unpause(&player),
             ClientMsg::Start => self.start_game(),
-            ClientMsg::Move(dir) => {
+            ClientMsg::Move { dir, after } => {
+                let cerebral = self.config.cerebral;
                 if let Some(game) = &mut self.game
-                    && game.turns.last().is_some_and(|t| t.alive.contains(&player))
+                    && game.turns.last().is_some_and(|t| {
+                        t.alive.contains(&player) && (!cerebral || t.turn_number == after)
+                    })
                 {
                     game.pending.insert(player, dir);
+                    self.go_when_everyone_has_moved();
                 }
             }
             ClientMsg::AddBot(difficulty) => self.add_bot(difficulty),
@@ -904,7 +913,42 @@ impl SessionActor {
                     .is_some_and(|t| t.alive.contains(&pending.bot_id))
             {
                 game.pending.insert(pending.bot_id, dir);
+                self.go_when_everyone_has_moved();
             }
+        }
+    }
+
+    /// A cerebral turn goes as soon as everyone has chosen: every living
+    /// player with a connection (nobody waits on a phone that's gone), and
+    /// every living bot, or once the bots' second is up. Never before the
+    /// turn opened, and never later than its clock already says.
+    fn go_when_everyone_has_moved(&mut self) {
+        let Some(game) = &self.game else { return };
+        let Some(turn) = game.turns.last() else {
+            return;
+        };
+        let Some(due) = self.next_tick else {
+            // Held (paused, or nobody to play): not ours to start.
+            return;
+        };
+        if !self.config.cerebral {
+            return;
+        }
+        let here: HashSet<&PlayerId> = self.conns.values().map(|c| &c.player).collect();
+        let (bots, people): (Vec<&PlayerId>, Vec<&PlayerId>) =
+            turn.alive.iter().partition(|p| self.bots.contains_key(*p));
+        let moved = |p: &&PlayerId| game.pending.contains_key(*p);
+        if !people.iter().filter(|p| here.contains(**p)).all(moved) {
+            return;
+        }
+        let at = if bots.iter().all(moved) {
+            game.opened
+        } else {
+            game.opened + Duration::from_millis(u64::from(CEREBRAL_BOT_MS))
+        }
+        .max(Instant::now());
+        if at < due {
+            self.next_tick = Some(at);
         }
     }
 
@@ -1038,7 +1082,11 @@ impl SessionActor {
         }
         tracing::info!(session = %self.name, %player, "resumed");
         self.paused_by = None;
-        self.next_tick = Some(Instant::now() + Duration::from_millis(u64::from(RESUME_MS)));
+        let opens = Instant::now() + Duration::from_millis(u64::from(RESUME_MS));
+        self.next_tick = Some(opens);
+        if let Some(game) = &mut self.game {
+            game.opened = opens;
+        }
         self.broadcast_hold(Some(RESUME_MS));
     }
 
@@ -1085,6 +1133,7 @@ impl SessionActor {
         });
         self.broadcast(&frame);
 
+        let opens = Instant::now() + Duration::from_millis(u64::from(COUNTDOWN_MS));
         self.game = Some(RunningGame {
             engine,
             players,
@@ -1092,6 +1141,7 @@ impl SessionActor {
             pending: BTreeMap::new(),
             compute: HashMap::new(),
             started_at_ms: now_ms(),
+            opened: opens,
         });
         // Never let one bad game poison the next: trust resets, and the
         // budget restarts from a modest value it can climb from.
@@ -1109,7 +1159,7 @@ impl SessionActor {
             .collect();
         self.broadcast_hold(None);
         self.publish_info();
-        self.next_tick = Some(Instant::now() + Duration::from_millis(u64::from(COUNTDOWN_MS)));
+        self.next_tick = Some(opens);
         self.assign_bots();
         self.issue_compute_requests();
     }
@@ -1170,6 +1220,7 @@ impl SessionActor {
         let next = game.engine.next_turn(&current, &moves);
         let over = next.game_over();
         game.turns.push(next.clone());
+        game.opened = Instant::now();
 
         // Snapshots are datagram-class: unreliable, redundant, single-packet.
         self.broadcast(&Frame::Snapshot(encode(&ServerMsg::Turn(next)).into()));
@@ -1179,7 +1230,8 @@ impl SessionActor {
         } else {
             // Fixed cadence from the due time. If we somehow fell more than
             // a period behind (stall, load), skip forward instead of
-            // machine-gunning catch-up ticks.
+            // machine-gunning catch-up ticks. (A cerebral turn that went
+            // early was due when it went, so its next waits the full time.)
             let period = Duration::from_millis(u64::from(self.tick_ms_now()));
             let mut next = due + period;
             let now = Instant::now();
@@ -1469,7 +1521,14 @@ impl SessionActor {
             // point the bot had already been defaulted onto its old heading.
             // Three of those in one game, and one of them was a bot holding
             // Left into a wall with a good move sitting in flight.
-            let mut window = (f64::from(self.tick_ms_now()) * 0.5).max(25.0);
+            //
+            // A cerebral turn waits a second for its bots, however long the
+            // people take: most of that second is thinking.
+            let mut window = if self.config.cerebral {
+                f64::from(CEREBRAL_BOT_MS) * 0.8
+            } else {
+                (f64::from(self.tick_ms_now()) * 0.5).max(25.0)
+            };
             // Bots on a device think concurrently, one worker each. If they
             // outnumber the threads available, asking each for the full
             // window pins the phone at 100% and makes the whole device feel
@@ -2272,8 +2331,22 @@ mod tests {
             snek_shared::clockwise_start_dir(&s.config, turn.snakes[id][0])
         };
         let alice_dir = heading(&s, &alice.id);
-        say(&mut s, &alice, ClientMsg::Move(alice_dir));
-        say(&mut s, &carol, ClientMsg::Move(Dir::Up));
+        say(
+            &mut s,
+            &alice,
+            ClientMsg::Move {
+                dir: alice_dir,
+                after: 0,
+            },
+        );
+        say(
+            &mut s,
+            &carol,
+            ClientMsg::Move {
+                dir: Dir::Up,
+                after: 0,
+            },
+        );
         s.tick().await;
         let turn = carol
             .msgs()
@@ -2564,6 +2637,86 @@ mod tests {
             ClientMsg::HostAvailable { can_compute: true },
         );
         assert!(s.next_tick.is_some());
+    }
+
+    /// A cerebral turn waits for everyone's move and goes the moment the
+    /// last is in; the bots get a second, and a move for a turn already
+    /// gone doesn't count towards the next.
+    #[tokio::test]
+    async fn a_cerebral_turn_goes_when_everyone_has_moved() {
+        let mut s = session();
+        let mut alice = join(&mut s, "alice");
+        let bob = join(&mut s, "bob");
+        benchmark(&mut s, &alice, 8);
+        say(&mut s, &alice, ClientMsg::AddBot(BotDifficulty::Hard));
+        let cerebral = GameConfig {
+            cerebral: true,
+            ..GameConfig::default()
+        };
+        say(&mut s, &alice, ClientMsg::Configure(cerebral));
+        start(&mut s, &[&alice, &bob]);
+        let shown = |s: &SessionActor| s.game.as_ref().unwrap().turns.last().unwrap().turn_number;
+        let mv = |after| ClientMsg::Move {
+            dir: Dir::Up,
+            after,
+        };
+        let wait = |s: &SessionActor| {
+            s.next_tick
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+        };
+
+        // Moves during the countdown don't cut it short.
+        let first = shown(&s);
+        for p in [&alice, &bob] {
+            say(&mut s, p, mv(first));
+        }
+        assert_eq!(s.next_tick, Some(s.game.as_ref().unwrap().opened));
+        s.tick().await;
+
+        // The next turn: five seconds on the clock, and the bot asked to
+        // think for most of its second. (The last request is this turn's;
+        // the first was the countdown's.)
+        let now = shown(&s);
+        assert!(wait(&s) > Duration::from_millis(4_500));
+        let request = alice.requests().pop().unwrap();
+        assert_eq!(request.turn.turn_number, now);
+        assert!(request.think_ms <= CEREBRAL_BOT_MS, "{}", request.think_ms);
+
+        // A repeat of last turn's move, arriving late, isn't this turn's.
+        say(&mut s, &alice, mv(first));
+        assert!(s.game.as_ref().unwrap().pending.is_empty());
+        say(&mut s, &alice, mv(now));
+        assert!(wait(&s) > Duration::from_millis(4_500), "bob hasn't moved");
+        say(&mut s, &bob, mv(now));
+        // People done, the bot not: it gets the rest of its second.
+        let w = wait(&s);
+        assert!(
+            w <= Duration::from_millis(u64::from(CEREBRAL_BOT_MS)),
+            "{w:?}"
+        );
+        assert!(w > Duration::from_millis(500), "{w:?}");
+        say(&mut s, &alice, request.answer());
+        assert_eq!(wait(&s), Duration::ZERO, "everyone's in: go now");
+    }
+
+    /// A timed game keeps its beat however quickly everyone moves.
+    #[tokio::test]
+    async fn a_timed_turn_keeps_its_beat() {
+        let mut s = session();
+        let alice = join(&mut s, "alice");
+        start(&mut s, &[&alice]);
+        s.tick().await;
+        let due = s.next_tick;
+        say(
+            &mut s,
+            &alice,
+            ClientMsg::Move {
+                dir: Dir::Up,
+                after: 1,
+            },
+        );
+        assert_eq!(s.next_tick, due);
     }
 
     /// With nobody watching, the game waits; the first one back restarts it.

@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 21;
+pub const PROTOCOL_VERSION: u16 = 22;
 
 /// The client-editable part of a profile.
 ///
@@ -66,7 +66,14 @@ pub enum ClientMsg {
     /// Start the game now.
     Start,
     /// Steer: applied at the next tick, if it arrives in time.
-    Move(Dir),
+    Move {
+        /// Which way.
+        dir: Dir,
+        /// The turn on the sender's screen when it went: in a cerebral
+        /// game, a move for a turn that's already gone (a repeat still in
+        /// flight) mustn't count as the next turn's choice.
+        after: u32,
+    },
     /// Add a server-hosted bot to the lobby.
     AddBot(BotDifficulty),
     /// Remove a player (or bot) from the lobby (anyone can kick, like tac).
@@ -467,7 +474,7 @@ mod tests {
             ClientMsg::Rename(_) => 4,
             ClientMsg::Leave => 5,
             ClientMsg::Start => 6,
-            ClientMsg::Move(_) => 7,
+            ClientMsg::Move { .. } => 7,
             ClientMsg::AddBot(_) => 8,
             ClientMsg::Kick(_) => 9,
             ClientMsg::Ping(_) => 10,
@@ -558,7 +565,10 @@ mod tests {
             ClientMsg::Rename("the friday grudge match".to_owned()),
             ClientMsg::Leave,
             ClientMsg::Start,
-            ClientMsg::Move(Dir::Up),
+            ClientMsg::Move {
+                dir: Dir::Up,
+                after: 4,
+            },
             ClientMsg::AddBot(BotDifficulty::Hard),
             ClientMsg::Kick("bot-1".to_owned()),
             ClientMsg::Ping(9),
@@ -710,7 +720,7 @@ mod tests {
         let print = fingerprint(bytes);
         assert_eq!(
             (PROTOCOL_VERSION, print),
-            (21, 0xbc5d_5b0d_37d5_18ef),
+            (22, 0x44a2_da94_3ea9_0090),
             "the wire format changed: bump PROTOCOL_VERSION and record its new fingerprint"
         );
     }

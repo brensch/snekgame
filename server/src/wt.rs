@@ -313,7 +313,7 @@ fn spawn_inbound_datagrams(
                 // and bot answers alike. Duplicates are harmless — the
                 // session drops any request id it has already retired.
                 Some(
-                    msg @ (ClientMsg::Move(_)
+                    msg @ (ClientMsg::Move { .. }
                     | ClientMsg::BotMove { .. }
                     | ClientMsg::ComputeFailed { .. }),
                 ) => {

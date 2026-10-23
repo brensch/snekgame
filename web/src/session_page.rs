@@ -14,6 +14,19 @@ pub(crate) const BOARD_SIZES: &[(&str, u8)] = &[("Small", 11), ("Medium", 13), (
 /// speeds up as it goes (`GameConfig::tick_ms_at`), so the name is all the
 /// lobby shows.
 pub(crate) const SPEEDS: &[(&str, u32)] = &[("Chill", 2000), ("Normal", 1000), ("Fast", 500)];
+/// The speed with no clock: every turn waits for everyone's move.
+const CEREBRAL: &str = "Cerebral";
+
+/// What a game's speed is called.
+pub(crate) fn speed_name(config: &GameConfig) -> &'static str {
+    if config.cerebral {
+        return CEREBRAL;
+    }
+    SPEEDS
+        .iter()
+        .find(|(_, ms)| *ms == config.tick_ms)
+        .map_or("Custom", |(name, _)| name)
+}
 
 pub(crate) fn session_page(_session: String) -> impl IntoView {
     let store = Store::use_store();
@@ -218,8 +231,7 @@ fn open_finished_game(store: Store, id: i64) {
 /// Picking from it changes the lobby's food for everyone.
 fn food_picker(config: &GameConfig) -> impl IntoView + use<> {
     let store = Store::use_store();
-    let current_width = config.board_width;
-    let current_tick = config.tick_ms;
+    let settings = config.clone();
     let picked = config.food_emoji.clone();
     let for_shuffle = picked.clone();
     view! {
@@ -244,20 +256,16 @@ fn food_picker(config: &GameConfig) -> impl IntoView + use<> {
                         .into_iter()
                         .map(|f| {
                             let is_picked = f == picked;
-                            let send = f.clone();
+                            let with_food = GameConfig {
+                                food_emoji: f.clone(),
+                                ..settings.clone()
+                            };
                             view! {
                                 <div
                                     class="pick"
                                     class:selected=is_picked
                                     on:click=move |_| {
-                                        net::send(
-                                            &ClientMsg::Configure(GameConfig {
-                                                board_width: current_width,
-                                                board_height: current_width,
-                                                tick_ms: current_tick,
-                                                food_emoji: send.clone(),
-                                            }),
-                                        );
+                                        net::send(&ClientMsg::Configure(with_food.clone()));
                                     }
                                 >
                                     {f}
@@ -274,9 +282,9 @@ fn food_picker(config: &GameConfig) -> impl IntoView + use<> {
 /// Board size and speed.
 fn config_row(config: &GameConfig) -> impl IntoView + use<> {
     let current_width = config.board_width;
-    let current_tick = config.tick_ms;
-    let food_for_board = config.food_emoji.clone();
-    let food_for_speed = config.food_emoji.clone();
+    let current_speed = speed_name(config);
+    let for_board = config.clone();
+    let for_speed = config.clone();
     view! {
         <div class="row">
             <label>
@@ -286,8 +294,7 @@ fn config_row(config: &GameConfig) -> impl IntoView + use<> {
                     net::send(&ClientMsg::Configure(GameConfig {
                         board_width: val,
                         board_height: val,
-                        tick_ms: current_tick,
-                        food_emoji: food_for_board.clone(),
+                        ..for_board.clone()
                     }));
                 }>
                     {BOARD_SIZES
@@ -305,24 +312,34 @@ fn config_row(config: &GameConfig) -> impl IntoView + use<> {
             <label>
                 "Speed"
                 <select on:change=move |ev| {
-                    let val: u32 = event_target_value(&ev).parse().unwrap_or(1000);
-                    net::send(&ClientMsg::Configure(GameConfig {
-                        board_width: current_width,
-                        board_height: current_width,
-                        tick_ms: val,
-                        food_emoji: food_for_speed.clone(),
-                    }));
+                    let picked = event_target_value(&ev);
+                    let config = if picked == CEREBRAL {
+                        GameConfig {
+                            cerebral: true,
+                            ..for_speed.clone()
+                        }
+                    } else {
+                        GameConfig {
+                            tick_ms: picked.parse().unwrap_or(1000),
+                            cerebral: false,
+                            ..for_speed.clone()
+                        }
+                    };
+                    net::send(&ClientMsg::Configure(config));
                 }>
                     {SPEEDS
                         .iter()
                         .map(|(label, ms)| {
                             view! {
-                                <option value=ms.to_string() selected=*ms == current_tick>
+                                <option value=ms.to_string() selected=*label == current_speed>
                                     {*label}
                                 </option>
                             }
                         })
                         .collect_view()}
+                    <option value=CEREBRAL selected=current_speed == CEREBRAL>
+                        {CEREBRAL}
+                    </option>
                 </select>
             </label>
         </div>
@@ -459,10 +476,7 @@ fn settings_summary(config: &GameConfig) -> impl IntoView + use<> {
         .iter()
         .find(|(_, w)| *w == config.board_width)
         .map_or("Custom", |(name, _)| name);
-    let speed = SPEEDS
-        .iter()
-        .find(|(_, ms)| *ms == config.tick_ms)
-        .map_or("Custom", |(name, _)| name);
+    let speed = speed_name(config);
     view! {
         <span class="food">{config.food_emoji.clone()}</span>
         <span class="values">"size " <b>{board}</b> <br /> "speed " <b>{speed}</b></span>
@@ -587,9 +601,22 @@ fn emoji_rain(emoji: &str) -> impl IntoView + use<> {
 }
 
 /// On-screen d-pad — the primary controller on touch screens. The selected
-/// direction lights up in the player's colour.
+/// direction lights up in the player's colour. In a cerebral game the
+/// choice is for this turn only, and once it's made an hourglass in the
+/// middle says the board is waiting on everyone else.
 fn dpad() -> impl IntoView {
     let store = Store::use_store();
+    let waiting = move || {
+        store.selected_dir.get().is_some()
+            && store.game.with(|g| {
+                g.as_ref().is_some_and(|g| {
+                    g.config.cerebral
+                        && g.turns
+                            .last()
+                            .is_some_and(|t| !t.game_over() && t.alive.contains(&store.me.get()))
+                })
+            })
+    };
     // pointerdown, not click: click waits for the release, and on a touch
     // screen that wait is most of what makes a control feel sluggish. The
     // move goes the instant the thumb lands.
@@ -617,6 +644,7 @@ fn dpad() -> impl IntoView {
             <button class="d-down" style=style(Dir::Down) on:pointerdown=press(Dir::Down)>
                 <span class="tri"></span>
             </button>
+            {move || waiting().then(|| view! { <span class="d-wait" aria-label="waiting for the others">"⏳"</span> })}
         </div>
     }
 }

@@ -5,7 +5,7 @@
 //! their own look in inline styles or no longer build against current
 //! web-sys, and all this needs is a list, a timer and a CSS animation.
 
-use crate::session_page::{BOARD_SIZES, SPEEDS};
+use crate::session_page::{BOARD_SIZES, speed_name};
 use crate::store::Store;
 use gloo_timers::callback::Timeout;
 use leptos::prelude::*;
@@ -123,11 +123,8 @@ fn changes(old: &GameConfig, new: &GameConfig) -> Vec<String> {
             label(BOARD_SIZES, &new.board_width, &new.board_width.to_string())
         ));
     }
-    if old.tick_ms != new.tick_ms {
-        out.push(format!(
-            "speed to {}",
-            label(SPEEDS, &new.tick_ms, &format!("{}ms", new.tick_ms))
-        ));
+    if speed_name(old) != speed_name(new) {
+        out.push(format!("speed to {}", speed_name(new)));
     }
     if old.food_emoji != new.food_emoji {
         out.push(format!("food to {}", new.food_emoji));

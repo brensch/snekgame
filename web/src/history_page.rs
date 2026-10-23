@@ -194,13 +194,19 @@ fn advance_frames(
                 return;
             }
             // The game's own pace at this point in it: games speed up as
-            // they go, and so does the replay.
+            // they go, and so does the replay. A cerebral game had no pace
+            // (each turn took as long as its players did), so it replays at
+            // a Normal game's.
             let shown = frame.get_untracked();
             let tick_ms = record
                 .with_untracked(|r| {
                     r.as_ref().map(|r| {
-                        r.config
-                            .tick_ms_at(u32::try_from(shown).unwrap_or(u32::MAX))
+                        if r.config.cerebral {
+                            1000
+                        } else {
+                            r.config
+                                .tick_ms_at(u32::try_from(shown).unwrap_or(u32::MAX))
+                        }
                     })
                 })
                 .unwrap_or(1000);

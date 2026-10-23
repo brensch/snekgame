@@ -223,29 +223,28 @@ fn clashes_svg(grid: Grid, turn: &Turn) -> String {
 
 /// The spotlight, as its own layer (`.spot`, shown only while the board
 /// is `.spotlit`): a white veil over everything drawn so far, my snek
-/// (`mine`) on top of it, a red box around my head and "you!" over it
-/// (under it if the head is near the top and there's no room above).
-/// The view stops at the walls, so on an edge cell the box is pulled in
-/// on that side and the label slides along to stay whole.
+/// (`mine`) on top of it, a red border just inside my head's cell (in the
+/// margin the head's emoji leaves, so it never covers it) and "you!" over
+/// it (under it if the head is near the top and there's no room above).
+/// The view stops at the walls, so on an edge cell the label slides along
+/// to stay whole.
 fn spotlight_svg(grid: Grid, head: Pos, mine: &str) -> String {
-    // The box stands this far out from the cell, its stroke this thick.
-    const OUT: f64 = 0.18;
-    const STROKE: f64 = 0.14;
+    // The border, inside the cell: the head's emoji (0.8 of it) leaves 0.1
+    // either side.
+    const STROKE: f64 = 0.08;
     // Half the label's width (four letters of the mono font at 0.8).
     const HALF_LABEL: f64 = 1.1;
     let (x, y) = (f64::from(grid.x(head)), f64::from(grid.y(head)));
-    // The view: from 1 to the far wall, either way.
-    let (right, bottom) = (f64::from(grid.w - 1), f64::from(grid.h - 1));
-    let inside = 1.0 + STROKE / 2.0;
-    let (bx, by) = ((x - OUT).max(inside), (y - OUT).max(inside));
-    let bw = (x + 1.0 + OUT).min(right - STROKE / 2.0) - bx;
-    let bh = (y + 1.0 + OUT).min(bottom - STROKE / 2.0) - by;
+    let right = f64::from(grid.w - 1);
     let label_y = if y <= 2.0 { y + 1.75 } else { y - 0.55 };
     let tx = (x + 0.5).clamp(1.0 + HALF_LABEL, right - HALF_LABEL);
     format!(
-        r##"<g class="spot"><rect x="0" y="0" width="{w}" height="{h}" fill="#fff" opacity="0.72"/>{mine}<rect x="{bx}" y="{by}" width="{bw}" height="{bh}" fill="none" stroke="#e00" stroke-width="{STROKE}"/><text x="{tx}" y="{label_y}" font-size="0.8" font-weight="bold" font-family="snek mono, monospace" fill="#e00" stroke="#fff" stroke-width="0.12" paint-order="stroke" text-anchor="middle">you!</text></g>"##,
+        r##"<g class="spot"><rect x="0" y="0" width="{w}" height="{h}" fill="#fff" opacity="0.72"/>{mine}<rect x="{bx}" y="{by}" width="{side}" height="{side}" fill="none" stroke="#e00" stroke-width="{STROKE}"/><text x="{tx}" y="{label_y}" font-size="0.8" font-weight="bold" font-family="snek mono, monospace" fill="#e00" stroke="#fff" stroke-width="0.12" paint-order="stroke" text-anchor="middle">you!</text></g>"##,
         w = grid.w,
         h = grid.h,
+        bx = x + STROKE / 2.0,
+        by = y + STROKE / 2.0,
+        side = 1.0 - STROKE,
     )
 }
 

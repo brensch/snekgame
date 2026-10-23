@@ -218,6 +218,7 @@ async fn two_players_play_a_full_game() {
             board_height: 11,
             tick_ms: 250,
             food_emoji: "🍕".to_owned(),
+            cerebral: false,
         }))
         .await;
     alice.control(&ClientMsg::SetReady(true)).await;
@@ -244,8 +245,14 @@ async fn two_players_play_a_full_game() {
     assert!(started, "game never started");
 
     // Moves go up as datagrams.
-    let _ = alice.conn.send_datagram(encode(&ClientMsg::Move(Dir::Up)));
-    let _ = bob.conn.send_datagram(encode(&ClientMsg::Move(Dir::Down)));
+    let _ = alice.conn.send_datagram(encode(&ClientMsg::Move {
+        dir: Dir::Up,
+        after: 0,
+    }));
+    let _ = bob.conn.send_datagram(encode(&ClientMsg::Move {
+        dir: Dir::Down,
+        after: 0,
+    }));
     // Datagram pings get datagram pongs.
     let _ = alice.conn.send_datagram(encode(&ClientMsg::Ping(7)));
 
@@ -382,6 +389,7 @@ async fn distributed_compute_round_trip() {
             board_height: 11,
             tick_ms: 250,
             food_emoji: "🍕".to_owned(),
+            cerebral: false,
         }))
         .await;
     // Become a compute host, add a bot, go.
@@ -480,6 +488,7 @@ async fn tick_cadence_is_steady() {
             board_height: 17,
             tick_ms: 500,
             food_emoji: "🍕".to_owned(),
+            cerebral: false,
         }))
         .await;
     // A bot adds per-tick work (request issuance) without needing a host.
@@ -510,7 +519,9 @@ async fn tick_cadence_is_steady() {
             10..=14 => Dir::Left,
             _ => Dir::Up,
         };
-        let _ = alice.conn.send_datagram(encode(&ClientMsg::Move(dir)));
+        let _ = alice
+            .conn
+            .send_datagram(encode(&ClientMsg::Move { dir, after: 0 }));
     }
     let deltas: Vec<f64> = arrivals
         .windows(2)
@@ -543,6 +554,7 @@ async fn sleeping_host_pauses_the_game() {
             board_height: 11,
             tick_ms: 200,
             food_emoji: "🍕".to_owned(),
+            cerebral: false,
         }))
         .await;
     alice
@@ -650,6 +662,7 @@ async fn a_silent_host_recovers_on_keepalives_alone() {
             board_height: 11,
             tick_ms: 200,
             food_emoji: "🍕".to_owned(),
+            cerebral: false,
         }))
         .await;
     alice
@@ -721,6 +734,7 @@ async fn answering_late_shrinks_the_thinking_window() {
             board_height: 11,
             tick_ms: 200,
             food_emoji: "🍕".to_owned(),
+            cerebral: false,
         }))
         .await;
     alice
@@ -816,6 +830,7 @@ async fn the_thinking_window_is_at_most_half_the_tick() {
             board_height: 11,
             tick_ms,
             food_emoji: "🍕".to_owned(),
+            cerebral: false,
         }))
         .await;
     alice
@@ -864,6 +879,7 @@ async fn pausing_holds_the_game_and_food_is_recorded() {
             board_height: 11,
             tick_ms: 250,
             food_emoji: "🌮".to_owned(),
+            cerebral: false,
         }))
         .await;
     alice.control(&ClientMsg::SetReady(true)).await;
@@ -948,6 +964,7 @@ fn a_compute_request_fits_in_one_datagram() {
         board_height: 13,
         tick_ms: 500,
         food_emoji: "🍩".to_owned(),
+        cerebral: false,
     };
     let ids: Vec<PlayerId> = (0..4).map(|i| format!("bot-{i}")).collect();
     let mut engine = snek_shared::Engine::new(config.clone(), ids.clone(), 7);
@@ -1121,6 +1138,7 @@ async fn readying_up_after_a_game_starts_another() {
             board_height: 7,
             tick_ms: 250,
             food_emoji: "🍕".to_owned(),
+            cerebral: false,
         }))
         .await;
     alice.control(&ClientMsg::SetReady(true)).await;

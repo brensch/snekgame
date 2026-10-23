@@ -37,7 +37,16 @@ pub struct GameConfig {
     /// What the food looks like this game. Chosen in the lobby and stored
     /// with the record, so a replay shows what the players actually ate.
     pub food_emoji: String,
+    /// Cerebral: no clock pushing anyone along. Every turn waits for each
+    /// player to choose a move, up to [`CEREBRAL_TURN_MS`], and goes the
+    /// moment they all have; `tick_ms` is ignored.
+    pub cerebral: bool,
 }
+
+/// The longest a cerebral turn waits for its players.
+pub const CEREBRAL_TURN_MS: u32 = 5_000;
+/// The longest a cerebral turn waits for its bots.
+pub const CEREBRAL_BOT_MS: u32 = 1_000;
 
 /// What food was before it was choosable, and what every game played up to
 /// then is stamped with.
@@ -51,6 +60,7 @@ impl Default for GameConfig {
             board_height: 13,
             food_emoji: DEFAULT_FOOD.to_owned(),
             tick_ms: 1000,
+            cerebral: false,
         }
     }
 }
@@ -71,9 +81,13 @@ impl GameConfig {
     /// from the starting interval down to the floor at [`RAMP_TURNS`], and
     /// it stays there. The floor is [`FASTEST_TICK_MS`] for every speed (or
     /// the start, should a game start quicker). Integer arithmetic, so every
-    /// machine agrees to the millisecond.
+    /// machine agrees to the millisecond. A cerebral game's turns wait
+    /// the same [`CEREBRAL_TURN_MS`] at most, however long it runs.
     #[must_use]
     pub fn tick_ms_at(&self, turns_played: u32) -> u32 {
+        if self.cerebral {
+            return CEREBRAL_TURN_MS;
+        }
         let floor = FASTEST_TICK_MS.min(self.tick_ms);
         let ramp = u64::from(self.tick_ms - floor);
         let done = u64::from(turns_played.min(RAMP_TURNS));

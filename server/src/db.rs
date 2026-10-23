@@ -13,6 +13,85 @@ use std::sync::Mutex;
 /// Most history entries one page may ask for.
 const MAX_PAGE: usize = 50;
 
+/// The stored records' format, kept as the database's `user_version`:
+/// 0 before games could be cerebral, 1 since.
+const RECORD_FORMAT: i64 = 1;
+
+/// Records as they were stored before games could be cerebral.
+mod v0 {
+    use serde::{Deserialize, Serialize};
+    use snek_shared::{PlayerProfile, Turn};
+
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct GameConfig {
+        pub board_width: u8,
+        pub board_height: u8,
+        pub tick_ms: u32,
+        pub food_emoji: String,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub(super) struct GameRecord {
+        pub config: GameConfig,
+        pub players: Vec<PlayerProfile>,
+        pub seed: u64,
+        pub turns: Vec<Turn>,
+    }
+
+    impl GameRecord {
+        /// The same game in today's format: it wasn't cerebral.
+        pub(super) fn upgrade(self) -> snek_shared::GameRecord {
+            snek_shared::GameRecord {
+                config: snek_shared::GameConfig {
+                    board_width: self.config.board_width,
+                    board_height: self.config.board_height,
+                    tick_ms: self.config.tick_ms,
+                    food_emoji: self.config.food_emoji,
+                    cerebral: false,
+                },
+                players: self.players,
+                seed: self.seed,
+                turns: self.turns,
+            }
+        }
+    }
+}
+
+/// Bring every stored record up to [`RECORD_FORMAT`], once: all of them
+/// or none, in one transaction. A record that can't be read as the old
+/// format is left as it is (it couldn't be read before either).
+fn migrate_records(conn: &Connection) -> rusqlite::Result<()> {
+    let format: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if format >= RECORD_FORMAT {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let stored: Vec<(i64, Vec<u8>)> = tx
+        .prepare("SELECT id, record_blob FROM games")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut upgraded = 0_usize;
+    for (id, blob) in stored {
+        let record = postcard::from_bytes::<v0::GameRecord>(&blob)
+            .ok()
+            .map(v0::GameRecord::upgrade)
+            .and_then(|r| postcard::to_allocvec(&r).ok());
+        if let Some(record) = record {
+            tx.execute(
+                "UPDATE games SET record_blob = ?2 WHERE id = ?1",
+                params![id, record],
+            )?;
+            upgraded += 1;
+        } else {
+            tracing::warn!(game = id, "stored record unreadable; left as it was");
+        }
+    }
+    tx.pragma_update(None, "user_version", RECORD_FORMAT)?;
+    tx.commit()?;
+    tracing::info!(upgraded, format = RECORD_FORMAT, "stored records upgraded");
+    Ok(())
+}
+
 /// The history database: one connection, shared by every request and
 /// session.
 ///
@@ -87,6 +166,7 @@ impl Db {
         )?;
         // Lobby names never existed. Shed the column from older databases.
         let _ = conn.execute_batch("ALTER TABLE games DROP COLUMN session;");
+        migrate_records(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -321,6 +401,58 @@ mod tests {
         assert_eq!(meta.players, players);
         assert_eq!(meta.winners, record.turns.last().unwrap().winners);
         assert_eq!(meta.winners.len(), 2, "both players ranked");
+    }
+
+    /// Games stored before cerebral games existed come back as the games
+    /// they were, not cerebral, and the upgrade happens once.
+    #[test]
+    fn older_records_are_upgraded_once() {
+        let path = temp_path("v0.db");
+        let players = [profile("a1", "alice"), profile("b2", "bob")];
+        let record = finished_game(&players);
+        let id = Db::open(&path)
+            .unwrap()
+            .insert_game(1_000, 2_000, &record)
+            .unwrap();
+        // Store it as an older server did, and forget it was ever upgraded.
+        let old = v0::GameRecord {
+            config: v0::GameConfig {
+                board_width: record.config.board_width,
+                board_height: record.config.board_height,
+                tick_ms: record.config.tick_ms,
+                food_emoji: record.config.food_emoji.clone(),
+            },
+            players: record.players.clone(),
+            seed: record.seed,
+            turns: record.turns.clone(),
+        };
+        let blob = postcard::to_allocvec(&old).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE games SET record_blob = ?2 WHERE id = ?1",
+            params![id, blob],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO games VALUES (99, 0, 0, 0, '[]', '[]', x'ff')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        drop(conn);
+
+        let db = Db::open(&path).unwrap();
+        let blob = db.get_game_blob(id).unwrap().unwrap();
+        assert_eq!(postcard::from_bytes::<GameRecord>(&blob).unwrap(), record);
+        assert_eq!(
+            db.get_game_blob(99).unwrap().unwrap(),
+            vec![0xff],
+            "left alone"
+        );
+        // Upgraded already: opening again changes nothing.
+        drop(db);
+        let again = Db::open(&path).unwrap().get_game_blob(id).unwrap().unwrap();
+        assert_eq!(again, blob);
     }
 
     #[test]

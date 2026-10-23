@@ -638,6 +638,7 @@ mod tests {
             board_height: 13,
             tick_ms: 1000,
             food_emoji: DEFAULT_FOOD.to_owned(),
+            cerebral: false,
         }
     }
 

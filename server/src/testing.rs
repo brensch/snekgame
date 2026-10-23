@@ -48,6 +48,7 @@ pub fn finished_game(players: &[PlayerProfile]) -> GameRecord {
         board_height: 7,
         tick_ms: 250,
         food_emoji: "🍕".to_owned(),
+        cerebral: false,
     };
     let ids = players.iter().map(|p| p.id.clone()).collect();
     let mut engine = Engine::new(config.clone(), ids, 7);

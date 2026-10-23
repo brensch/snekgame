@@ -365,7 +365,19 @@ pub(crate) fn send_move(store: Store, dir: Dir) {
         return;
     }
     store.selected_dir.set(Some(dir));
-    send_datagram(&ClientMsg::Move(dir));
+    send_datagram(&ClientMsg::Move {
+        dir,
+        after: shown_turn(store),
+    });
+}
+
+/// The latest turn this phone has: what a move is chosen against.
+fn shown_turn(store: Store) -> u32 {
+    store.game.with_untracked(|g| {
+        g.as_ref()
+            .and_then(|g| g.turns.last())
+            .map_or(0, |t| t.turn_number)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -701,7 +713,10 @@ fn move_repeater(store: Store) -> Interval {
                 .is_some_and(|t| !t.game_over() && t.alive.contains(&store.me.get_untracked()))
         });
         if live && let Some(dir) = store.selected_dir.get_untracked() {
-            send_datagram(&ClientMsg::Move(dir));
+            send_datagram(&ClientMsg::Move {
+                dir,
+                after: shown_turn(store),
+            });
         }
     })
 }
@@ -867,6 +882,7 @@ async fn benchmark_sims_per_sec(generation: u64) -> Option<u32> {
         board_height: 13,
         tick_ms: 1000,
         food_emoji: snek_shared::DEFAULT_FOOD.to_owned(),
+        cerebral: false,
     };
     let a: PlayerId = "bench-a".into();
     let mut engine = Engine::new(config.clone(), vec![a.clone(), "bench-b".into()], 1);
@@ -1108,10 +1124,13 @@ fn on_game_start(
     // And the lobby's popups belong to the lobby: back from the game, it
     // starts closed.
     store.popup.set(None);
+    // Not in a cerebral game, though: there a lit key is a move chosen,
+    // and nobody has chosen yet.
     store.selected_dir.set(
         turn.snakes
             .get(&me)
             .and_then(|s| s.first())
+            .filter(|_| !config.cerebral)
             .map(|&head| snek_shared::clockwise_start_dir(&config, head)),
     );
     store.game.set(Some(GameView {
@@ -1145,9 +1164,10 @@ fn on_turn(store: Store, turn: Turn) {
         if let Some(g) = g {
             let last = g.turns.last().map_or(0, |t| t.turn_number);
             if turn.turn_number > last {
-                if let Some(&dir) = turn.moves.get(&me) {
-                    store.selected_dir.set(Some(dir));
-                }
+                // The key stays lit on the way you're going, except in a
+                // cerebral game, where each turn is a fresh choice.
+                let dir = turn.moves.get(&me).copied().filter(|_| !g.config.cerebral);
+                store.selected_dir.set(dir);
                 g.turns.push(turn);
             }
         }
