@@ -18,7 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 
-pub const COUNTDOWN_MS: u32 = 3000;
+/// Three seconds of "this one's you", then ready, steady, go.
+pub const COUNTDOWN_MS: u32 = 6000;
 const MAX_PLAYERS: usize = 8;
 /// Outbound frames buffered per connection before we call the client dead.
 const CONN_BUFFER: usize = 256;
@@ -318,6 +319,8 @@ struct SessionActor {
     away: HashMap<PlayerId, Instant>,
     last_winners: Vec<Winner>,
     last_game_id: Option<i64>,
+    config_changed_by: Option<PlayerId>,
+    config_rev: u32,
 }
 
 impl SessionActor {
@@ -346,6 +349,8 @@ impl SessionActor {
             away: HashMap::new(),
             last_winners: Vec::new(),
             last_game_id: None,
+            config_changed_by: None,
+            config_rev: 0,
         };
         tokio::spawn(actor.run());
         tx
@@ -363,6 +368,18 @@ impl SessionActor {
             id: self.name.clone(),
             host_name: host.map(|p| p.name.clone()).unwrap_or_default(),
             host_emoji: host.map(|p| p.emoji.clone()).unwrap_or_default(),
+            host_colour: host.map(|p| p.colour.clone()).unwrap_or_default(),
+            emojis: host
+                .into_iter()
+                .chain(
+                    self.lobby
+                        .iter()
+                        .filter(|p| host.map(|h| h.id != p.id).unwrap_or(true))
+                        .filter(|p| !self.bots.contains_key(&p.id)),
+                )
+                .chain(self.lobby.iter().filter(|p| self.bots.contains_key(&p.id)))
+                .map(|p| p.emoji.clone())
+                .collect(),
             players: humans as u32,
             bots: self.bots.len() as u32,
             playing: self.game.is_some(),
@@ -556,8 +573,12 @@ impl SessionActor {
                 self.broadcast_lobby().await;
             }
             ClientMsg::Configure(config) => {
-                if self.game.is_none() && config.valid() {
+                // Picking what is already picked changes nothing, so it
+                // shouldn't un-ready anyone or claim the settings either.
+                if self.game.is_none() && config.valid() && config != self.config {
                     self.config = config;
+                    self.config_changed_by = Some(player);
+                    self.config_rev = self.config_rev.wrapping_add(1);
                     // Changing the deal un-readies everyone.
                     self.ready.clear();
                     self.broadcast_lobby().await;
@@ -1303,6 +1324,8 @@ impl SessionActor {
             ready: self.ready.iter().cloned().collect(),
             last_winners: self.last_winners.clone(),
             last_game_id: self.last_game_id,
+            config_changed_by: self.config_changed_by.clone(),
+            config_rev: self.config_rev,
         };
         self.publish_info();
         self.broadcast(control_frame(&ServerMsg::Lobby(state)))

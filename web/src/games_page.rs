@@ -83,51 +83,17 @@ pub fn home_page() -> impl IntoView {
                             .take(PAGE_SIZE)
                             .cloned()
                             .collect();
+                        let count = list.len();
                         view! {
-                            <table class="games">
-                                <tbody>
-                                    {slice
-                                        .into_iter()
-                                        .map(|s| {
-                                            let href = format!("#/s/{}", s.id);
-                                            view! {
-                                                // Two-line row: big host emoji spans both lines,
-                                                // counts and status stack, Join fills the height.
-                                                <tr>
-                                                    <td class="host-emoji">{s.host_emoji}</td>
-                                                    <td>
-                                                        <b>{s.host_name} "'s"<br />"game"</b>
-                                                    </td>
-                                                    <td class="right">
-                                                        <div>"🧑 " {s.players}</div>
-                                                        {(s.bots > 0)
-                                                            .then(|| {
-                                                                view! { <div>"🤖 " {s.bots}</div> }
-                                                            })}
-                                                    </td>
-                                                    <td class="right">
-                                                        "in"<br />
-                                                        {if s.playing { "game" } else { "lobby" }}
-                                                    </td>
-                                                    <td class="right join-cell">
-                                                        <a href=href>
-                                                            <button
-                                                                class="join"
-                                                                style=format!(
-                                                                    "background: {};",
-                                                                    store.profile.get_untracked().colour,
-                                                                )
-                                                            >
-                                                                "Join"
-                                                            </button>
-                                                        </a>
-                                                    </td>
-                                                </tr>
-                                            }
-                                        })
-                                        .collect_view()}
-                                </tbody>
-                            </table>
+                            <h3 class="games-heading">
+                                "Live games " <span class="count">{count}</span>
+                            </h3>
+                            <ul
+                                class="games"
+                                style=format!("--mine: {};", store.profile.get_untracked().colour)
+                            >
+                                {slice.into_iter().map(game_card).collect_view()}
+                            </ul>
                             {(pages > 1)
                                 .then(|| {
                                     view! {
@@ -184,5 +150,37 @@ pub fn home_page() -> impl IntoView {
                 <p>"A game by Brendo"</p>
             </div>
         </div>
+    }
+}
+
+/// One game in the list. Whose game it is reads first and biggest; whether
+/// you can still get in, and who's in it, sit quietly underneath; the
+/// button says what joining actually does.
+fn game_card(s: SessionSummary) -> impl IntoView {
+    let href = format!("#/s/{}", s.id);
+    // Everyone's face, host first, bots last: who's in it at a glance,
+    // without counting. A crowd is cut short rather than wrapped.
+    const FACES: usize = 6;
+    let extra = s.emojis.len().saturating_sub(FACES);
+    let faces: String = s.emojis.iter().take(FACES).cloned().collect();
+    view! {
+        <li class="game-card" class:playing=s.playing>
+            <a href=href>
+                <span class="host-tile" style=format!("background: {};", s.host_colour)>
+                    {s.host_emoji}
+                </span>
+                <span class="game-main">
+                    <span class="game-title">{s.host_name} "'s game"</span>
+                    <span class="game-meta">
+                        <span class="status">{if s.playing { "playing" } else { "lobby" }}</span>
+                        <span class="faces">
+                            {faces}
+                            {(extra > 0).then(|| format!(" +{extra}"))}
+                        </span>
+                    </span>
+                </span>
+                <span class="join">{if s.playing { "watch" } else { "join" }}</span>
+            </a>
+        </li>
     }
 }

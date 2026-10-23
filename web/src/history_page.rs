@@ -3,7 +3,6 @@
 //! produced — decoded with the shared types.
 
 use crate::board::board_view;
-use crate::store::Store;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use snek_shared::protocol::HistoryEntry;
@@ -178,15 +177,18 @@ pub fn history_page() -> impl IntoView {
     }
 }
 
+/// How much faster than real time each labelled replay speed actually runs.
+const SPEED_SCALE: u32 = 8;
+
 pub fn replay_page(id: i64) -> impl IntoView {
-    let store = Store::use_store();
     let record = RwSignal::new(Option::<GameRecord>::None);
     let meta = RwSignal::new(Option::<HistoryEntry>::None);
     let failed = RwSignal::new(false);
     let frame = RwSignal::new(0usize);
     let playing = RwSignal::new(true);
-    // Playback multiplier over the game's real tick rate. Watching at real
-    // speed is a slog, so default to 2x.
+    // Playback multiplier as labelled (1x, 2x, 4x). Each is really
+    // SPEED_SCALE times that over the game's real tick rate: watching a game
+    // back at anything like the pace it was played is a slog.
     let speed = RwSignal::new(2u32);
 
     spawn_local(async move {
@@ -211,25 +213,50 @@ pub fn replay_page(id: i64) -> impl IntoView {
         }
     });
 
-    // Advance the frame using the shared coarse clock so we don't need our
-    // own timer: step when enough game-time has elapsed.
-    let last_step = RwSignal::new(0.0f64);
-    Effect::new(move |_| {
-        let now = store.now_ms.get();
-        let Some(r) = record.get() else { return };
-        if !playing.get_untracked() {
-            return;
-        }
-        let step_ms = (r.config.tick_ms as f64 / speed.get_untracked() as f64).max(120.0);
-        if now - last_step.get_untracked() >= step_ms {
-            last_step.set(now);
+    // Advance the frame on our own fast timer: the shared clock only ticks
+    // five times a second, far too coarse for the faster speeds. Frames owed
+    // are counted from the real time elapsed, so a late timer catches up
+    // rather than slowing the replay down.
+    let last_step = StoredValue::new(0.0f64);
+    let timer = set_interval_with_handle(
+        move || {
+            let now = crate::net::now();
+            let Some(len) = record.with_untracked(|r| r.as_ref().map(|r| r.turns.len())) else {
+                return;
+            };
+            if !playing.get_untracked() {
+                last_step.set_value(now);
+                return;
+            }
+            let tick_ms = record
+                .with_untracked(|r| r.as_ref().map(|r| r.config.tick_ms))
+                .unwrap_or(1000);
+            let step_ms = (tick_ms as f64 / (speed.get_untracked() * SPEED_SCALE) as f64).max(15.0);
+            let owed = ((now - last_step.get_value()) / step_ms).floor();
+            if owed < 1.0 {
+                return;
+            }
+            // After a pause (or a backgrounded tab) start afresh rather than
+            // jumping ahead by everything that was missed.
+            let owed = if owed > 8.0 { 1 } else { owed as usize };
+            last_step.set_value(if owed == 1 {
+                now
+            } else {
+                last_step.get_value() + owed as f64 * step_ms
+            });
             frame.update(|f| {
-                if *f + 1 < r.turns.len() {
-                    *f += 1;
-                } else {
+                *f = (*f + owed).min(len - 1);
+                if *f + 1 >= len {
                     playing.set(false);
                 }
             });
+        },
+        std::time::Duration::from_millis(16),
+    )
+    .ok();
+    on_cleanup(move || {
+        if let Some(t) = timer {
+            t.clear();
         }
     });
 
@@ -249,7 +276,7 @@ pub fn replay_page(id: i64) -> impl IntoView {
                 let max = r.turns.len() - 1;
                 view! {
                     <div>
-                        {board_view(r.config, r.players.clone(), &turn, String::new(), |_| {})}
+                        {board_view(r.config, r.players.clone(), &turn, String::new(), false, |_| {})}
                         <div class="replay-controls">
                             <button
                                 class="icon"

@@ -545,7 +545,7 @@ async fn sleeping_host_pauses_the_game() {
     // Play normally for a few turns, answering compute like a browser would.
     let mut turns = 0u32;
     while turns < 3 {
-        match tokio::time::timeout(Duration::from_secs(5), alice.next_msg()).await {
+        match tokio::time::timeout(Duration::from_secs(10), alice.next_msg()).await {
             Ok(ServerMsg::Turn(_)) => turns += 1,
             Ok(ServerMsg::ComputeRequest {
                 request_id,
@@ -1242,4 +1242,63 @@ async fn readying_up_after_a_game_starts_another() {
         started(&mut bob).await,
         "the other player was left behind in the lobby"
     );
+}
+
+/// The lobby says who last changed the settings, so a ready that silently
+/// flips back to "no" has a name attached. Picking what is already picked
+/// is not a change: it claims nothing and un-readies nobody.
+#[tokio::test]
+async fn the_lobby_says_who_changed_the_settings() {
+    let dir = std::env::temp_dir().join(format!("snek-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("cfg.db");
+    let _ = std::fs::remove_file(&db_path);
+
+    let (_, registry) = snek_server::build(&db_path);
+    let identity = wtransport::Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+    let endpoint = snek_server::wt::build_endpoint(0, &identity).unwrap();
+    let wt_port = endpoint.local_addr().unwrap().port();
+    tokio::spawn(snek_server::wt::serve(endpoint, registry));
+
+    let mut alice = Client::connect(wt_port, "cfg-test", "alice-secret-0000", info("alice")).await;
+    let mut bob = Client::connect(wt_port, "cfg-test", "bob-secret-000000", info("bob")).await;
+    let bob_id = match bob.next_msg().await {
+        ServerMsg::Welcome { your_id } => your_id,
+        other => panic!("expected welcome, got {other:?}"),
+    };
+
+    // Waits for the first lobby that passes `want`.
+    async fn lobby_where(c: &mut Client, want: impl Fn(&LobbyState) -> bool) -> LobbyState {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(ServerMsg::Lobby(l)) =
+                tokio::time::timeout(Duration::from_millis(500), c.next_msg()).await
+            {
+                if want(&l) {
+                    return l;
+                }
+            }
+        }
+        panic!("no such lobby arrived");
+    }
+
+    let fresh = lobby_where(&mut alice, |l| l.players.len() == 2).await;
+    assert_eq!(fresh.config_changed_by, None);
+    let config = fresh.config.clone();
+
+    alice.control(&ClientMsg::SetReady(true)).await;
+    lobby_where(&mut alice, |l| l.ready.len() == 1).await;
+
+    // Bob re-picks what is already picked: nothing happens.
+    bob.control(&ClientMsg::Configure(config.clone())).await;
+    // Bob changes the food: his name goes on it and alice is un-readied.
+    let changed = GameConfig {
+        food_emoji: "🍕".to_string(),
+        ..config
+    };
+    bob.control(&ClientMsg::Configure(changed.clone())).await;
+    let after = lobby_where(&mut alice, |l| l.config == changed).await;
+    assert_eq!(after.config_changed_by.as_ref(), Some(&bob_id));
+    assert_eq!(after.config_rev, fresh.config_rev + 1, "the no-op counted");
+    assert!(after.ready.is_empty(), "a real change keeps everyone ready");
 }

@@ -61,48 +61,67 @@ fn ready_panel(lobby: &LobbyState) -> impl IntoView {
         .cloned()
         .collect();
     let i_am_in = humans.iter().any(|p| p.id == me);
-    // Our own press counts immediately; the server is the truth but a
-    // reconnect in flight hasn't heard us yet.
-    let i_am_ready = lobby.ready.contains(&me) || store.want_ready.get();
-    let all_ready = !humans.is_empty() && humans.iter().all(|p| lobby.ready.contains(&p.id));
+    // Our own tap counts the moment it lands. The server is the truth, but
+    // a phone that has just woken up is still reconnecting and hasn't told
+    // it yet; until it has, the screen goes with what we said, not with
+    // what the server last heard — which made us wait on ourselves.
+    let i_am_ready = store
+        .want_ready
+        .get()
+        .unwrap_or_else(|| lobby.ready.contains(&me));
+    let is_ready = |id: &str| {
+        if id == me {
+            i_am_ready
+        } else {
+            lobby.ready.iter().any(|r| r == id)
+        }
+    };
+    let all_ready = !humans.is_empty() && humans.iter().all(|p| is_ready(&p.id));
     let my_colour = store.profile.get_untracked().colour;
     let not_ready: Vec<String> = humans
         .iter()
-        .filter(|p| !lobby.ready.contains(&p.id))
+        .filter(|p| !is_ready(&p.id))
         .map(|p| p.name.clone())
         .collect();
 
-    let button = if !all_ready {
-        view! {
-            <button
-                class="big"
-                style=format!("background: {my_colour};")
-                disabled=i_am_ready || !i_am_in
-                on:click=move |_| {
-                    store.want_ready.set(true);
-                    net::send(&ClientMsg::SetReady(true));
-                }
-            >
-                {if i_am_ready { "Waiting" } else { "I'm ready!" }}
-            </button>
-        }
-        .into_any()
-    } else {
-        view! {
-            <button
-                class="big shake"
-                style=format!("background: {my_colour};")
-                on:click=move |_| net::send(&ClientMsg::Start)
-            >
-                "Start game"
-            </button>
-        }
-        .into_any()
+    let toggle = move |_| {
+        let ready = !i_am_ready;
+        store.want_ready.set(Some(ready));
+        net::send(&ClientMsg::SetReady(ready));
     };
 
     view! {
         <div>
-            {button}
+            // A question and a switch with both answers on it, so which one
+            // you've given is never in doubt.
+            <div class="ready-row">
+                <span class="ready-q">"Ready?"</span>
+                <button
+                    class="ready-switch"
+                    class:on=i_am_ready
+                    role="switch"
+                    aria-checked=if i_am_ready { "true" } else { "false" }
+                    aria-label="ready"
+                    style=format!("--mine: {my_colour};")
+                    disabled=!i_am_in
+                    on:click=toggle
+                >
+                    <span class="no">"no"</span>
+                    <span class="yes">"yes"</span>
+                </button>
+            </div>
+            {all_ready
+                .then(|| {
+                    view! {
+                        <button
+                            class="big shake"
+                            style=format!("margin-top: 12px; background: {my_colour};")
+                            on:click=move |_| net::send(&ClientMsg::Start)
+                        >
+                            "Start game"
+                        </button>
+                    }
+                })}
             {(i_am_ready && !not_ready.is_empty())
                 .then(|| {
                     view! {
@@ -114,6 +133,50 @@ fn ready_panel(lobby: &LobbyState) -> impl IntoView {
         </div>
     }
 }
+
+/// Who last touched the settings. Changing them un-readies everyone, so
+/// whoever did it is worth knowing — and the moment it happens the name
+/// flashes, so a toggle flipping back to "no" never comes out of nowhere.
+fn settings_by(lobby: &LobbyState) -> impl IntoView {
+    let store = Store::use_store();
+    let who = lobby.config_changed_by.as_ref().map(|id| {
+        lobby
+            .players
+            .iter()
+            .find(|p| &p.id == id)
+            .map(|p| (format!("{} {}", p.emoji, p.name), p.colour.clone()))
+            .unwrap_or_else(|| ("someone who left".to_string(), "#fff".to_string()))
+    });
+    // The lobby is rebuilt whenever anything in it changes, so the flash
+    // picks up where it is rather than starting again from the top.
+    let since = net::now() - store.settings_flash_at.get_untracked();
+    let flashing = since < SETTINGS_FLASH_MS;
+    view! {
+        <div class="changed-by">
+            {match who {
+                None => view! { <span class="footnote">"nobody's touched these yet"</span> }.into_any(),
+                Some((name, colour)) => {
+                    view! {
+                        <span class="footnote">"last changed by"</span>
+                        <span
+                            class="who"
+                            class:flash=flashing
+                            style=format!(
+                                "background: {colour}; animation-delay: -{:.0}ms;",
+                                since.max(0.0),
+                            )
+                        >
+                            {name}
+                        </span>
+                    }
+                        .into_any()
+                }
+            }}
+        </div>
+    }
+}
+
+const SETTINGS_FLASH_MS: f64 = 1800.0;
 
 fn lobby_view(lobby: LobbyState) -> impl IntoView {
     let store = Store::use_store();
@@ -330,6 +393,7 @@ fn lobby_view(lobby: LobbyState) -> impl IntoView {
             <h3 style="margin-top: 24px;">"Players"</h3>
             {roster}
             <h3 style="margin-top: 24px;">"Settings"</h3>
+            {settings_by(&lobby)}
             {config_row}
             {move || store.show_bot_picker.get().then(bot_picker)}
             <p class="footnote" style="margin-top: 18px;">
@@ -448,17 +512,32 @@ fn game_view(game: GameView) -> impl IntoView {
     let last_turn = game.turns.last().unwrap().clone();
     let over = last_turn.game_over();
 
-    // Countdown overlay before the first tick. Read the clock *inside* a
-    // closure: otherwise this whole view (board SVG included) re-renders
-    // five times a second with the shared clock.
+    // Before the first tick: the board spotlights you (see board_view) for
+    // a few seconds, then "ready", "steady", "spagheddi!" a second each.
+    // Read the clock *inside* a closure: otherwise this whole view (board
+    // SVG included) re-renders five times a second with the shared clock.
     let show_countdown = !over && turn_count == 1;
-    let countdown = move || {
+    // A memo, so the word's card is only rebuilt (and pops in) when the
+    // word changes, not on every tick of the clock.
+    let word = Memo::new(move |_| {
         if !show_countdown {
             return None;
         }
-        let remaining = store.countdown_ends.get() - store.now_ms.get();
-        (remaining > 0.0).then(|| {
-            view! { <div class="overlay">{format!("{:.0}", (remaining / 1000.0).ceil())}</div> }
+        match store.countdown_ends.get() - store.now_ms.get() {
+            r if r > 3000.0 => None,
+            r if r > 2000.0 => Some("ready"),
+            r if r > 1000.0 => Some("steady"),
+            r if r > 0.0 => Some("spagheddi!"),
+            _ => None,
+        }
+    });
+    let countdown = move || {
+        word.get().map(|word| {
+            view! {
+                <div class="overlay countdown">
+                    <span>{word}</span>
+                </div>
+            }
         })
     };
 
@@ -636,7 +715,7 @@ fn game_view(game: GameView) -> impl IntoView {
                 };
                 note.map(|n| view! { <p class="play-note">{n}</p> })
             }}
-            {board_view(game.config, game.players.clone(), &turn, me.clone(), on_cell)}
+            {board_view(game.config, game.players.clone(), &turn, me.clone(), show_countdown, on_cell)}
             {scrub}
             // One bottom half, whichever state the game is in. Two layouts
             // meant two sets of rules for the same board, and the board

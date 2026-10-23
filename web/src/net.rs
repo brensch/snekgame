@@ -176,7 +176,7 @@ fn ensure(store: Store, mode: Mode) {
         store.saved_id.set(None);
         store.view_turn.set(None);
         store.selected_dir.set(None);
-        store.want_ready.set(false);
+        store.want_ready.set(None);
     }
     if need_new {
         open(store, mode, BACKOFF_START_MS);
@@ -231,7 +231,7 @@ pub fn disconnect(store: Store) {
         }
     });
     store.conn.set(ConnStatus::Idle);
-    store.want_ready.set(false);
+    store.want_ready.set(None);
     store.lobby.set(None);
     store.game.set(None);
     store.saved_id.set(None);
@@ -736,8 +736,8 @@ fn apply(store: Store, msg: ServerMsg) {
             // that never got through. Ready is the only such intent, and
             // repeating it is harmless — the server holds a set, not a
             // counter.
-            if store.want_ready.get_untracked() {
-                send(&ClientMsg::SetReady(true));
+            if let Some(ready) = store.want_ready.get_untracked() {
+                send(&ClientMsg::SetReady(ready));
             }
         }
         ServerMsg::Sessions(list) => store.sessions.set(Some(list)),
@@ -759,8 +759,19 @@ fn apply(store: Store, msg: ServerMsg) {
                     store.selected_dir.set(None);
                 }
             }
-            if lobby.ready.contains(&store.me.get_untracked()) {
-                store.want_ready.set(false);
+            let me_ready = lobby.ready.contains(&store.me.get_untracked());
+            if store.want_ready.get_untracked() == Some(me_ready) {
+                store.want_ready.set(None);
+            }
+            // A settings change by anyone (us included) flashes who made it.
+            // The first lobby of a session is not a change.
+            let changed = store.lobby.with_untracked(|old| {
+                old.as_ref()
+                    .map(|old| old.session == lobby.session && old.config_rev != lobby.config_rev)
+                    .unwrap_or(false)
+            });
+            if changed {
+                store.settings_flash_at.set(now());
             }
             store.lobby.set(Some(lobby));
         }
@@ -788,7 +799,7 @@ fn apply(store: Store, msg: ServerMsg) {
             let me = store.me.get_untracked();
             // A fresh game always runs; never inherit the last one's hold.
             store.paused.set(false);
-            store.want_ready.set(false);
+            store.want_ready.set(None);
             store.selected_dir.set(
                 turn.snakes
                     .get(&me)

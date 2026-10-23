@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bump when messages change incompatibly; the server rejects mismatches so
 /// stale cached frontends reload instead of misdecoding frames.
-pub const PROTOCOL_VERSION: u16 = 17;
+pub const PROTOCOL_VERSION: u16 = 18;
 
 /// The client-editable part of a profile. The public player id is derived
 /// server-side (a hash of the client's private secret), so a client can never
@@ -105,6 +105,11 @@ pub struct LobbyState {
     pub last_winners: Vec<Winner>,
     /// History id of the last finished game, if saved.
     pub last_game_id: Option<i64>,
+    /// Who last changed the settings (None until somebody does).
+    pub config_changed_by: Option<PlayerId>,
+    /// Bumped on every settings change, so a client can tell a fresh change
+    /// from the same lobby being sent again for some other reason.
+    pub config_rev: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,6 +178,9 @@ pub struct SessionSummary {
     pub id: String,
     pub host_name: String,
     pub host_emoji: String,
+    pub host_colour: String,
+    /// Everyone in it, host first, bots last.
+    pub emojis: Vec<String>,
     pub players: u32,
     pub bots: u32,
     pub playing: bool,

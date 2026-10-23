@@ -196,30 +196,122 @@ td.kick {
   width: 40px;
 }
 
-/* home games list: quiet two-line rows, no dividers */
-table.games td {
-  border-bottom: none;
-  padding: 8px 8px 8px 0;
-  vertical-align: middle;
-  font-size: 15px;
+/* home games list: one card per game. Whose game it is reads first and
+   biggest; how it's going and who's in it sit quieter underneath; the whole
+   card is the tap target, with what tapping does spelled out on the right. */
+.games-heading {
+  margin: 22px 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
-table.games td.host-emoji {
-  font-size: 36px;
-  line-height: 1;
-  width: 48px;
-  padding-right: 6px;
+.games-heading .count {
+  font-size: 13px;
+  border: 2px solid #000;
+  padding: 1px 7px;
 }
 
-/* Join hugs the right edge, exactly under Start new game, two lines tall */
-table.games td.join-cell {
-  padding-right: 0;
-  width: 1%;
+ul.games {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.game-card a {
+  display: flex;
+  align-items: stretch;
+  min-height: 68px;
+  border: 2px solid #000;
+  text-decoration: none;
+  color: #000;
+  background: #fff;
+  transition: transform 60ms ease, box-shadow 60ms ease;
+}
+
+.game-card a:hover,
+.game-card a:focus-visible {
+  outline: none;
+  box-shadow: 4px 4px 0 #000;
+}
+
+.game-card a:active {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 #000;
+}
+
+.host-tile {
+  flex: 0 0 64px;
+  display: grid;
+  place-items: center;
+  font-size: 32px;
+  border-right: 2px solid #000;
+}
+
+.game-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  padding: 8px 12px;
+}
+
+.game-title {
+  font-size: 18px;
+  font-weight: bold;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-table.games button.join {
-  height: 58px;
+.game-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Lobby or playing, as a small tag: the one fact that decides whether
+   you'll get a game out of tapping it. */
+.game-card .status {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: bold;
+  border: 1px solid #000;
+  padding: 0 6px;
+}
+
+.game-card.playing .status {
+  background: #000;
+  color: #fff;
+}
+
+.faces {
+  font-size: 16px;
+  letter-spacing: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.game-card .join {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 72px;
+  border-left: 2px solid #000;
+  font-size: 16px;
+  font-weight: bold;
+  background: var(--mine, #fff);
+}
+
+/* A game already underway is one to watch, not join: quieter button. */
+.game-card.playing .join {
+  background: #fff;
 }
 
 /* players roster: one framed block, uniform 1px separators inside */
@@ -807,4 +899,128 @@ button.icon-btn:focus-visible {
 .results .row button {
   flex: 1 1 0;
   text-align: center;
+}
+
+/* --- ready? ------------------------------------------------------------
+   The question on the left, a two-sided switch on the right with both
+   answers written on it. The answer you've given is the filled side: "no"
+   in black, "yes" in your colour. One tap anywhere on it flips it. */
+.ready-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 70px;
+}
+
+.ready-q {
+  font-size: 30px;
+  font-weight: bold;
+}
+
+button.ready-switch {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  width: 190px;
+  height: 64px;
+  padding: 0;
+  border-width: 3px;
+  font-size: 24px;
+  box-shadow: 3px 3px 0 #000;
+}
+
+button.ready-switch:hover:not(:disabled),
+button.ready-switch:focus-visible {
+  box-shadow: 5px 5px 0 #000;
+}
+
+button.ready-switch span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  height: 100%;
+  transition: background 90ms ease, color 90ms ease;
+}
+
+button.ready-switch .no {
+  border-right: 3px solid #000;
+  background: #000;
+  color: #fff;
+}
+
+button.ready-switch.on .no {
+  background: #fff;
+  color: #999;
+}
+
+button.ready-switch .yes {
+  color: #999;
+}
+
+button.ready-switch.on .yes {
+  background: var(--mine, #000);
+  color: #000;
+}
+
+button.ready-switch.on .yes::before {
+  content: "✓";
+  margin-right: 4px;
+}
+
+/* --- who last changed the settings ------------------------------------ */
+.changed-by {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  border: 2px dashed #000;
+  padding: 6px 10px;
+  margin: 4px 0 12px;
+}
+
+.changed-by .who {
+  border: 2px solid #000;
+  padding: 2px 8px;
+  font-size: 15px;
+}
+
+/* Lights up and shakes off when somebody changes something. Played from
+   a negative delay, so a lobby redrawn mid-flash carries on from where it
+   was instead of starting over. */
+.changed-by .who.flash {
+  animation: who-flash 1800ms ease-out both;
+}
+
+@keyframes who-flash {
+  0%, 30%, 60% { box-shadow: 0 0 0 4px #000; transform: scale(1.12); }
+  15%, 45%, 75% { box-shadow: 0 0 0 0 #000; transform: scale(1); }
+  100% { box-shadow: none; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .changed-by .who.flash { animation: none; }
+}
+
+/* "ready", "steady", "spagheddi!": the board stays visible behind it (it
+   is already greyed out around your snek), so no veil, just the word on a
+   card that pops in fresh each second. */
+.overlay.countdown {
+  background: none;
+}
+
+.overlay.countdown span {
+  background: #fff;
+  border: 3px solid #000;
+  box-shadow: 5px 5px 0 #000;
+  padding: 10px 22px;
+  font-size: 40px;
+  font-weight: bold;
+  animation: countdown-pop 220ms ease-out;
+}
+
+@keyframes countdown-pop {
+  from { transform: scale(0.6); }
+  to { transform: scale(1); }
 }

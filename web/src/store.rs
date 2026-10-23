@@ -53,10 +53,15 @@ pub struct Store {
     /// Set once we have evidence the network passes TCP but not UDP —
     /// which is a firewall eating QUIC, not a broken site.
     pub quic_blocked: RwSignal<bool>,
-    /// "I said I was ready." Kept until the server is seen to agree, so a
-    /// press that lands on a dead connection isn't simply lost — the
-    /// intent outlives the socket it was sent on.
-    pub want_ready: RwSignal<bool>,
+    /// "I said I was ready" (or wasn't). Kept until the server is seen to
+    /// agree, so a press that lands on a dead connection isn't simply lost —
+    /// the intent outlives the socket it was sent on, and the screen shows
+    /// it from the moment of the tap rather than after the reconnect.
+    pub want_ready: RwSignal<Option<bool>>,
+    /// When the lobby's settings last changed under us (ms), so the "last
+    /// changed by" box can flash — and keep flashing across the lobby being
+    /// redrawn for some other reason partway through.
+    pub settings_flash_at: RwSignal<f64>,
     /// Someone has held the game. Server-owned: we only ever mirror what it
     /// tells us, so every screen agrees on whether the clock is running.
     pub paused: RwSignal<bool>,
@@ -90,7 +95,8 @@ impl Store {
                 snek_shared::DEFAULT_FOOD,
             )),
             quic_blocked: RwSignal::new(false),
-            want_ready: RwSignal::new(false),
+            want_ready: RwSignal::new(None),
+            settings_flash_at: RwSignal::new(0.0),
             paused: RwSignal::new(false),
             selected_dir: RwSignal::new(None),
             saved_id: RwSignal::new(None),
