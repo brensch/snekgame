@@ -199,26 +199,60 @@ fn snek_svg(grid: Grid, snake: &[Pos], hp: u8, colour: &str, emoji: &str) -> Str
     out
 }
 
-/// The dead: a grey square and a skull on every cell they left behind.
-/// The head is gone with them (it went into whatever killed them), so
-/// there's nothing to say whose they were but the space they took up.
-fn clashes_svg(grid: Grid, turn: &Turn) -> String {
-    let mut clashes = String::new();
+/// The dead, in two layers. Where they lie: a grey square and a skull on
+/// every cell, drawn over everything (`over`). Where they hit someone who
+/// lived (a body, or the winner of a head-on): that snek stays, and the
+/// ground goes grey under it (`under`), or, on a head that fills its cell,
+/// a grey border inside it. A head-on nobody won is a corpse cell like any
+/// other.
+struct Dead {
+    under: String,
+    over: String,
+}
+
+fn dead_svg(grid: Grid, turn: &Turn) -> Dead {
+    let mut dead = Dead {
+        under: String::new(),
+        over: String::new(),
+    };
+    let living = |pos: Pos| {
+        turn.snakes.values().find_map(|s| {
+            let i = s.iter().position(|&p| p == pos)?;
+            Some(i == 0)
+        })
+    };
     for clash in &turn.clashes {
-        let _ = write!(
-            clashes,
-            r##"<rect x="{x}" y="{y}" width="1" height="1" fill="#d3d3d3" opacity="0.8"/>"##,
-            x = grid.x(clash.pos),
-            y = grid.y(clash.pos),
-        );
-        clashes.push_str(&emoji_text(
-            grid.cx(clash.pos),
-            grid.cy(clash.pos),
-            0.8,
-            "💀",
-        ));
+        let (x, y) = (grid.x(clash.pos), grid.y(clash.pos));
+        match living(clash.pos) {
+            Some(true) => {
+                let _ = write!(
+                    dead.over,
+                    r##"<rect x="{bx}" y="{by}" width="0.88" height="0.88" fill="none" stroke="#9a9a9a" stroke-width="0.12"/>"##,
+                    bx = f64::from(x) + 0.06,
+                    by = f64::from(y) + 0.06,
+                );
+            }
+            Some(false) => {
+                let _ = write!(
+                    dead.under,
+                    r##"<rect x="{x}" y="{y}" width="1" height="1" fill="#d3d3d3" opacity="0.8"/>"##,
+                );
+            }
+            None => {
+                let _ = write!(
+                    dead.over,
+                    r##"<rect x="{x}" y="{y}" width="1" height="1" fill="#d3d3d3" opacity="0.8"/>"##,
+                );
+                dead.over.push_str(&emoji_text(
+                    grid.cx(clash.pos),
+                    grid.cy(clash.pos),
+                    0.8,
+                    "💀",
+                ));
+            }
+        }
     }
-    clashes
+    dead
 }
 
 /// The spotlight, as its own layer (`.spot`, shown only while the board
@@ -336,7 +370,7 @@ pub(crate) fn board_svg(
         sneks.push_str(&drawn);
     }
 
-    let clashes = clashes_svg(grid, turn);
+    let Dead { under, over } = dead_svg(grid, turn);
 
     // A red ring round one cell, for pointing something out (the rules).
     let ring = ring.map_or_else(String::new, |pos| {
@@ -352,7 +386,7 @@ pub(crate) fn board_svg(
     // Crop the view to the playable interior — the walls sit just off-screen.
     let svg = format!(
         r#"<svg viewBox="1 1 {vw} {vh}" xmlns="http://www.w3.org/2000/svg" style="display:block;width:100%;height:100%;">
-            {field}{food}{sneks}{clashes}{ring}{spot}
+            {field}{under}{food}{sneks}{over}{ring}{spot}
         </svg>"#,
         vw = grid.w - 2,
         vh = grid.h - 2,

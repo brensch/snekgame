@@ -343,6 +343,14 @@ fn config_row(config: &GameConfig) -> impl IntoView + use<> {
                 </select>
             </label>
         </div>
+        {(current_speed == CEREBRAL)
+            .then(|| {
+                view! {
+                    <p class="setting-note">
+                        "have a good think about each move. max timeout 5 seconds though. progresses as soon as everyone selects a move."
+                    </p>
+                }
+            })}
     }
 }
 

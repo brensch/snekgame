@@ -935,17 +935,12 @@ button.ready-switch {
   font-size: 24px;
 }
 
-/* Flat until you're ready: the shadow is part of saying yes. */
+/* Flat, ready or not: the lit half says which. A tap presses it in like
+   any button. */
 button.ready-switch,
 button.ready-switch:hover:not(:disabled),
 button.ready-switch:focus-visible {
   box-shadow: none;
-}
-
-button.ready-switch.on,
-button.ready-switch.on:hover:not(:disabled),
-button.ready-switch.on:focus-visible {
-  box-shadow: 4px 4px 0 #000;
 }
 
 button.ready-switch span {
@@ -1391,4 +1386,11 @@ button.step-arrow {
   font-size: 24px;
   max-width: 90%;
   text-align: center;
+}
+
+/* What a setting means, under it in the settings popup. */
+.setting-note {
+  margin: 8px 0 0;
+  font-size: 15px;
+  color: #555;
 }
